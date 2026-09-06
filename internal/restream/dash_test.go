@@ -39,15 +39,12 @@ func mpdAttr(t *testing.T, m, name string) string {
 	return rest[:strings.IndexByte(rest, '"')]
 }
 
-// A VOD still downloading must stay dynamic (a static MPD would be fetched
-// once, snapshotting the partial timeline), yet every spooled segment must be
-// playable right away: the spool outruns the wall clock, so with AST at the
-// real start a player's availability math (AST + t + d ≤ now) would hide most
-// of what is on disk and playback would never start. AST is therefore
-// back-dated by a constant and no timeShiftBufferDepth is advertised.
+// A VOD still downloading is presented like a live channel: dynamic, with
+// availabilityStartTime at the real run start so every player's wall-clock
+// live-edge math lands inside the spool, and no timeShiftBufferDepth so t=0
+// stays seekable. Back-dating AST (tried once) made dash.js seek ~24h in.
 func TestDASHManifestVODGrowing(t *testing.T) {
 	pub, vs, as := dashPub(t, false)
-	// Spool far more media than wall time has elapsed — the real failure mode.
 	feed(vs, 900, 6.0)
 	feed(as, 900, 6.0)
 	// no End: the source is still downloading
@@ -55,58 +52,100 @@ func TestDASHManifestVODGrowing(t *testing.T) {
 	m := string(pub.DASHManifest())
 	for _, want := range []string{
 		`type="dynamic"`,
-		"minimumUpdatePeriod=",
+		`minimumUpdatePeriod="PT6S"`,
+		`suggestedPresentationDelay="PT18S"`,
 		`startNumber="0"`,
-		`<S t="0" d="6000" r="899"/>`, // full timeline from t=0, untrimmed
+		`<S t="0" d="6000" r="899"/>`, // full spooled timeline from t=0
 	} {
 		if !strings.Contains(m, want) {
 			t.Fatalf("growing VOD MPD missing %q\n%s", want, m)
 		}
 	}
-	if strings.Contains(m, "mediaPresentationDuration") {
-		t.Fatalf("growing VOD MPD must not be a fixed-duration snapshot\n%s", m)
+	for _, bad := range []string{"mediaPresentationDuration", "timeShiftBufferDepth"} {
+		if strings.Contains(m, bad) {
+			t.Fatalf("growing VOD MPD must not carry %s\n%s", bad, m)
+		}
 	}
-	if strings.Contains(m, "timeShiftBufferDepth") {
-		t.Fatalf("growing VOD MPD must not bound the DVR window (a depth from a back-dated AST expires early segments)\n%s", m)
-	}
-
 	ast, err := time.Parse(isoTime, mpdAttr(t, m, "availabilityStartTime"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	pub2, err := time.Parse(isoTime, mpdAttr(t, m, "publishTime"))
-	if err != nil {
-		t.Fatal(err)
+	if d := ast.Sub(pub.start.UTC().Truncate(time.Second)); d != 0 {
+		t.Fatalf("availabilityStartTime must be the run start (a back-dated AST breaks dash.js): off by %v", d)
 	}
-	// Wall-clock gate: first and last listed segments (t+d) must already be
-	// available at publishTime even though 5400s of media spooled in ~0s.
-	if first := ast.Add(6 * time.Second); first.After(pub2) {
-		t.Fatalf("first segment not yet available: AST+d=%v > publishTime %v", first, pub2)
-	}
-	if last := ast.Add(900 * 6 * time.Second); last.After(pub2) {
-		t.Fatalf("last spooled segment gated by wall clock: AST+t+d=%v > publishTime %v", last, pub2)
-	}
+}
 
-	// AST must be a constant: a manifest refresh moments later re-anchors
-	// nothing.
-	time.Sleep(15 * time.Millisecond)
-	if again := mpdAttr(t, string(pub.DASHManifest()), "availabilityStartTime"); again != ast.Format(isoTime) {
-		t.Fatalf("availabilityStartTime moved between refreshes: %s -> %s", ast.Format(isoTime), again)
-	}
-
-	// Completion flips to a plain static VOD.
+// Completion is the DASH-IF live-to-VOD transition: the MPD stays dynamic
+// (a static MPD mid-session makes dash.js end at its buffered position), gains
+// mediaPresentationDuration and drops minimumUpdatePeriod so sessions stop
+// refreshing. Only once the wall clock has passed the end — no live session can
+// remain — does it turn into a plain static VOD for late joiners.
+func TestDASHManifestVODCompletionPhases(t *testing.T) {
+	pub, vs, as := dashPub(t, false)
+	clock := pub.start
+	pub.now = func() time.Time { return clock }
+	feed(vs, 10, 6.0)
+	feed(as, 10, 6.0)
 	pub.End()
-	m = string(pub.DASHManifest())
-	if !strings.Contains(m, `type="static"`) || !strings.Contains(m, `mediaPresentationDuration="PT5400.000S"`) {
-		t.Fatalf("ended VOD MPD should be static with full duration\n%s", m)
+
+	// 30s after start, 60s of media: the broadcast is still running. Served
+	// exactly like the growing phase — dynamic, minimumUpdatePeriod kept, and
+	// crucially NO mediaPresentationDuration (a static flip freezes mid-session
+	// dash.js; ffmpeg refuses a dynamic MPD carrying a duration).
+	clock = pub.start.Add(30 * time.Second)
+	m := string(pub.DASHManifest())
+	for _, want := range []string{`type="dynamic"`, `availabilityStartTime=`, `minimumUpdatePeriod="PT6S"`, `<S t="0" d="6000" r="9"/>`} {
+		if !strings.Contains(m, want) {
+			t.Fatalf("just-completed VOD MPD missing %q\n%s", want, m)
+		}
 	}
-	if strings.Contains(m, "availabilityStartTime") || strings.Contains(m, "minimumUpdatePeriod") {
-		t.Fatalf("static MPD must not carry dynamic attributes\n%s", m)
+	for _, bad := range []string{"mediaPresentationDuration", "timeShiftBufferDepth"} {
+		if strings.Contains(m, bad) {
+			t.Fatalf("just-completed VOD MPD must not carry %s\n%s", bad, m)
+		}
+	}
+
+	// Past the end: static, fully seekable.
+	clock = pub.start.Add(61 * time.Second)
+	m = string(pub.DASHManifest())
+	if !strings.Contains(m, `type="static"`) || !strings.Contains(m, `mediaPresentationDuration="PT60.000S"`) {
+		t.Fatalf("aired VOD MPD should be static with full duration\n%s", m)
+	}
+	for _, bad := range []string{"availabilityStartTime", "minimumUpdatePeriod", "publishTime", "suggestedPresentationDelay"} {
+		if strings.Contains(m, bad) {
+			t.Fatalf("static MPD must not carry %s\n%s", bad, m)
+		}
+	}
+}
+
+// The first manifest request waits for every track's first segment: a
+// Representation with an empty SegmentTimeline wedges dash.js for good.
+func TestManifestWaitsForFirstSegments(t *testing.T) {
+	pub, vs, as := dashPub(t, false)
+	h := NewServer(pub).DASHHandler()
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		feed(vs, 1, 6.0)
+		feed(as, 1, 6.0)
+	}()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/live.mpd", nil))
+	if !strings.Contains(rec.Body.String(), `<S t="0" d="6000"/>`) {
+		t.Fatalf("MPD served before the first segments were published:\n%s", rec.Body)
+	}
+	// An ended-but-empty track must not stall requests.
+	pub2, _, _ := dashPub(t, false)
+	pub2.End()
+	begin := time.Now()
+	NewServer(pub2).DASHHandler().ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/live.mpd", nil))
+	if time.Since(begin) > time.Second {
+		t.Fatal("manifest request stalled on an ended, empty presentation")
 	}
 }
 
 func TestDASHManifestVOD(t *testing.T) {
 	pub, vs, as := dashPub(t, false)
+	pub.now = func() time.Time { return pub.start.Add(time.Hour) } // long since aired
 	feed(vs, 4, 4.0)
 	feed(as, 4, 4.0)
 	pub.End()
@@ -179,6 +218,7 @@ func TestDASHTimelineRunLengthSplits(t *testing.T) {
 	vs.Segment(engine.SegmentInfo{Duration: 4}, []byte("b"))
 	vs.Segment(engine.SegmentInfo{Duration: 2}, []byte("c")) // shorter → new run
 	pub.End()
+	pub.now = func() time.Time { return pub.start.Add(time.Hour) }
 
 	m := string(pub.DASHManifest())
 	if !strings.Contains(m, `<S t="0" d="4000" r="1"/>`) {

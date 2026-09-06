@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"time"
 
 	"github.com/mohamed/m314dl/internal/manifest"
 )
@@ -19,43 +18,40 @@ import (
 //
 // A dynamic (live) MPD advertises minimumUpdatePeriod so players re-fetch it;
 // a static (VOD) MPD lists the whole timeline and a mediaPresentationDuration.
-// A VOD still downloading must be dynamic — a static MPD is fetched once, so a
-// player would snapshot the partial timeline and stop there — with its
-// availabilityStartTime back-dated (see vodAvailabilityBackdate) and no
-// timeShiftBufferDepth, so every spooled segment is playable and seekable the
-// moment the timeline lists it; it flips to static once the source completes.
-// DASH segments are fMP4 — a TS source must be remuxed first (a later phase),
-// which the coordinator enforces before choosing this output.
+// A finite source that is still downloading is presented the way a live channel
+// is: dynamic, availabilityStartTime at the run start, no timeShiftBufferDepth
+// (so the whole spool stays seekable back to t=0). The wall clock gates
+// availability exactly as for live, so every player's default live-edge math
+// (now − AST − delay) lands inside the spooled timeline. Back-dating AST to make
+// the spool "available" instantly was tried and broke dash.js outright: its DVR
+// window is wall-clock derived by default, so it sought ~24h in and never
+// played. Once the download completes the MPD stays dynamic, gains a
+// mediaPresentationDuration and drops minimumUpdatePeriod — the DASH-IF
+// live-to-VOD transition; a static MPD handed to a mid-session dash.js makes it
+// end playback at whatever it has buffered — and turns static only once the
+// wall clock has passed the end, for late joiners who then get a fully seekable
+// VOD. DASH segments are fMP4 — a TS source must be remuxed first (a later
+// phase), which the coordinator enforces before choosing this output.
 
 const isoTime = "2006-01-02T15:04:05Z"
-
-// vodAvailabilityBackdate is how far before the run started a growing VOD's
-// availabilityStartTime is placed. A dynamic MPD gates each segment behind the
-// wall clock — segment N is playable only once AST + N×duration has passed —
-// but a VOD spools to disk far faster than real time, so anchored at the real
-// start a compliant player sees almost everything on disk as "not yet
-// available" and never starts. Back-dating by more than any asset's length
-// makes AST + t + d ≤ now hold for every segment the timeline can list, and
-// the SegmentTimeline (which lists only spooled segments) stays the sole
-// limiter on what exists. The value is a fixed offset from p.start, never from
-// now: a moving AST is a spec violation and re-anchors players every refresh.
-// ponytail: a 24h constant covers any real VOD; thread the source's own
-// duration through if a longer asset ever appears.
-const vodAvailabilityBackdate = 24 * time.Hour
 
 // DASHManifest renders the presentation as an MPD.
 func (p *Publisher) DASHManifest() []byte {
 	live := p.isLive()
 	done := p.allEnded()
 	td := p.maxTargetDur()
-	now := time.Now().UTC()
+	now := p.now().UTC()
+	total := p.totalDur()
+	// aired: a completed finite source whose wall-clock "broadcast" is over —
+	// no session can still be playing it as live, so it may go static.
+	aired := done && now.Sub(p.start).Seconds() >= total
 
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 
 	profile := "urn:mpeg:dash:profile:isoff-on-demand:2011"
 	typ := "static"
-	if live || !done {
+	if live || !aired {
 		profile = "urn:mpeg:dash:profile:isoff-live:2011"
 		typ = "dynamic"
 	}
@@ -65,19 +61,25 @@ func (p *Publisher) DASHManifest() []byte {
 	case live:
 		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" timeShiftBufferDepth="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
 			p.start.UTC().Format(isoTime), now.Format(isoTime), td, td*float64(windowSize), td*3)
-	case !done:
-		// VOD mid-download: dynamic so players keep re-fetching and the timeline
-		// keeps growing; availabilityStartTime back-dated by a constant so the
-		// wall clock never gates a spooled segment (see vodAvailabilityBackdate).
-		// No timeShiftBufferDepth: absent means infinite, so nothing from t=0 on
-		// ever ages out of the seekable range — a finite depth measured from a
-		// back-dated AST would instead expire every early segment. Players clamp
-		// the live edge to the last listed segment, so the untrimmed timeline is
-		// both the start point and the full seek range.
+	case !aired:
+		// Finite source that has not yet "aired" out in wall-clock time —
+		// whether still downloading or fully spooled — is served exactly like a
+		// live channel: dynamic, availabilityStartTime at the run start,
+		// minimumUpdatePeriod so players keep refreshing, no timeShiftBufferDepth
+		// (absent = infinite, so t=0 stays seekable). No mediaPresentationDuration
+		// yet, for two reasons: a static flip mid-session freezes dash.js where
+		// it buffered (its "media finished" flag), and ffmpeg's demuxer refuses a
+		// dynamic MPD that carries a duration ("Unable to read to manifest").
+		// A player's live edge tracks now−AST (wall clock), not the fully spooled
+		// timeline, so a from-the-start session plays 1:1 and arrives at the end
+		// just as the broadcast airs and the static MPD below takes over.
 		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
-			p.start.Add(-vodAvailabilityBackdate).UTC().Format(isoTime), now.Format(isoTime), td, td*3)
+			p.start.UTC().Format(isoTime), now.Format(isoTime), td, td*3)
 	default:
-		fmt.Fprintf(&b, ` mediaPresentationDuration="PT%.3fS"`, p.totalDur())
+		// Aired: the wall clock has passed the end, so no session can still be
+		// playing it live. Become a plain static VOD — late joiners start at 0
+		// and get the whole seekable timeline.
+		fmt.Fprintf(&b, ` mediaPresentationDuration="PT%.3fS"`, total)
 	}
 	b.WriteString(">\n")
 	b.WriteString(`  <Period id="0" start="PT0S">` + "\n")

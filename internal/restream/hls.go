@@ -14,6 +14,7 @@
 package restream
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -47,10 +48,11 @@ type Publisher struct {
 	tracks []*Track
 	byID   map[string]*Track
 	start  time.Time
+	now    func() time.Time // wall clock; tests substitute
 }
 
 func NewPublisher() *Publisher {
-	return &Publisher{byID: map[string]*Track{}, start: time.Now()}
+	return &Publisher{byID: map[string]*Track{}, start: time.Now(), now: time.Now}
 }
 
 // AddTrack registers a track and returns the engine.Sink that feeds it. Call
@@ -90,6 +92,23 @@ func (p *Publisher) Ready() bool {
 		}
 	}
 	return len(p.tracks) > 0
+}
+
+// WaitReady blocks until Ready (or every track has ended, or ctx/timeout
+// expire). A manifest published before a track has its first segment carries
+// an empty SegmentTimeline, and dash.js never recovers from initializing on
+// one — it neither errors nor refreshes — so the first manifest request holds
+// for the second or two the first segments take instead.
+// ponytail: 100ms polling; a broadcast channel if request volume ever matters.
+func (p *Publisher) WaitReady(ctx context.Context, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for !p.Ready() && !p.allEnded() && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // Stats is a per-track liveness snapshot for the status line.

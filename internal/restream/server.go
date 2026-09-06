@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Server exposes a Publisher over HTTP as a live HLS origin:
@@ -49,14 +50,27 @@ const (
 	mimeMPD  = "application/dash+xml"
 )
 
+// readyTimeout bounds how long a manifest request waits for the first segment
+// of every track. Under every common player's manifest timeout (dash.js 10s,
+// Shaka 30s); past it the manifest is served as is.
+const readyTimeout = 8 * time.Second
+
 func (s *Server) mpd(w http.ResponseWriter, r *http.Request) {
+	s.pub.WaitReady(r.Context(), readyTimeout)
 	cors(w)
 	w.Header().Set("Content-Type", mimeMPD)
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.Write(s.pub.DASHManifest())
+	// ServeContent (not a bare Write) so the response carries Content-Length and
+	// answers Range requests: ffmpeg's DASH demuxer sends "Range: bytes=0-" and
+	// cannot finalize a chunked, length-less manifest reply ("Unable to read to
+	// manifest"). Browsers (dash.js, Shaka) tolerate the bare write; ffmpeg does
+	// not. modtime zero disables Last-Modified/caching, which the no-store header
+	// already forbids.
+	http.ServeContent(w, r, "live.mpd", time.Time{}, bytes.NewReader(s.pub.DASHManifest()))
 }
 
 func (s *Server) master(w http.ResponseWriter, r *http.Request) {
+	s.pub.WaitReady(r.Context(), readyTimeout)
 	writePlaylist(w, s.pub.masterPlaylist())
 }
 
