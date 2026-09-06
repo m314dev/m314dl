@@ -665,7 +665,11 @@ func commitInOrder(cfg Config, live bool, state *resumeState, results <-chan res
 			if failed == nil {
 				failed = fmt.Errorf("segment %d (%s): %w", r.it.idx, r.it.url, r.err)
 			}
-			cfg.Verbose("segment failed: %s: %v", r.it.url, r.err)
+			// A stopped run cancels every in-flight fetch at once; dozens of
+			// "segment failed: context canceled" lines are noise, not failures.
+			if !errors.Is(r.err, context.Canceled) {
+				cfg.Verbose("segment failed: %s: %v", r.it.url, r.err)
+			}
 			if live {
 				// live: the segment is gone; a hole keeps the stream moving
 				pending[r.it.idx] = pend{hole: true}
