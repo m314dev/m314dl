@@ -155,8 +155,14 @@ func parseDurationSeconds(v string) (float64, error) {
 	return d.Seconds(), nil
 }
 
-func (e *Expr) match(st *manifest.Stream) bool {
+// match reports whether st passes every filter. With relax set, the
+// height/width bounds are skipped: they are a quality preference, and when they
+// exclude everything the caller falls back to the nearest rendition.
+func (e *Expr) match(st *manifest.Stream, relax bool) bool {
 	for _, f := range e.filters {
+		if relax && isDimKey(f.key) {
+			continue
+		}
 		var val string
 		switch f.key {
 		case "id":
@@ -237,9 +243,12 @@ func (e *Expr) Apply(streams []*manifest.Stream) []*manifest.Stream {
 	}
 	var pool []*manifest.Stream
 	for _, st := range streams {
-		if e.match(st) {
+		if e.match(st, false) {
 			pool = append(pool, st)
 		}
+	}
+	if len(pool) == 0 {
+		pool = e.nearest(streams)
 	}
 	switch e.take {
 	case "all":
@@ -255,6 +264,63 @@ func (e *Expr) Apply(streams []*manifest.Stream) []*manifest.Stream {
 		}
 		return pool
 	}
+}
+
+func isDimKey(k string) bool {
+	return k == "hmin" || k == "hmax" || k == "wmin" || k == "wmax"
+}
+
+// nearest handles a height/width bound that excluded every stream — hmax=720
+// against a source that only publishes 1080p. Failing there turns a quality
+// preference into a dead channel, so fall back to the single rendition closest
+// to the bound. Filters other than the bounds still apply.
+func (e *Expr) nearest(streams []*manifest.Stream) []*manifest.Stream {
+	var bounds []filter
+	for _, f := range e.filters {
+		if isDimKey(f.key) {
+			bounds = append(bounds, f)
+		}
+	}
+	if len(bounds) == 0 {
+		return nil
+	}
+	dist := func(st *manifest.Stream) float64 {
+		worst := 0.0
+		for _, f := range bounds {
+			size := float64(st.Height)
+			if f.key == "wmin" || f.key == "wmax" {
+				size = float64(st.Width)
+			}
+			if size <= 0 {
+				continue // unknown dimension: nothing to measure against
+			}
+			d := 0.0
+			switch f.key {
+			case "hmax", "wmax":
+				d = size - f.num
+			case "hmin", "wmin":
+				d = f.num - size
+			}
+			if d > worst {
+				worst = d
+			}
+		}
+		return worst
+	}
+	var best *manifest.Stream
+	var bestDist float64
+	for _, st := range streams {
+		if !e.match(st, true) {
+			continue
+		}
+		if d := dist(st); best == nil || d < bestDist {
+			best, bestDist = st, d
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	return []*manifest.Stream{best}
 }
 
 // Select applies the three expressions with HLS group awareness: when the

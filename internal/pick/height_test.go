@@ -75,3 +75,39 @@ func TestIsNoneOnlyForAnExplicitNone(t *testing.T) {
 		t.Fatal("a real selection reported itself as none; a failed match would look deliberate")
 	}
 }
+
+// A bound that excludes every rendition must fall back to the nearest one:
+// a quality preference should not take a 1080-only channel off the air.
+func TestBoundFallsBackToNearest(t *testing.T) {
+	only1080 := []*manifest.Stream{
+		{Type: manifest.Video, Height: 1080, Width: 1920, Bandwidth: 3000000},
+	}
+	e, err := ParseExpr("hmax=720:for=best")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := e.Apply(only1080)
+	if len(got) != 1 || got[0].Height != 1080 {
+		t.Fatalf("hmax=720 on a 1080-only source: got %v, want the 1080 rendition", got)
+	}
+
+	ladder := []*manifest.Stream{
+		{Type: manifest.Video, Height: 1080, Width: 1920},
+		{Type: manifest.Video, Height: 900, Width: 1600},
+	}
+	Sort(ladder)
+	if got := e.Apply(ladder); len(got) != 1 || got[0].Height != 900 {
+		t.Fatalf("hmax=720 with 1080/900: got %v, want 900 (nearest)", got)
+	}
+
+	// A bound that does match must not be overridden by the fallback.
+	withA720 := []*manifest.Stream{
+		{Type: manifest.Video, Height: 1080, Width: 1920},
+		{Type: manifest.Video, Height: 720, Width: 1280},
+		{Type: manifest.Video, Height: 360, Width: 640},
+	}
+	Sort(withA720)
+	if got := e.Apply(withA720); len(got) != 1 || got[0].Height != 720 {
+		t.Fatalf("hmax=720 with a real 720: got %v, want 720", got)
+	}
+}
