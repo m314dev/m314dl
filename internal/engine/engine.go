@@ -317,9 +317,11 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 		// elapsed/count, not a percentage, so there is no bar to run backwards.
 		fresh := 0
 		var batch []item
+		curKeys := make(map[string]struct{}, len(cur.Segments))
 		for i := range cur.Segments {
 			seg := &cur.Segments[i]
 			key := seg.URL + rangeKey(seg.Range)
+			curKeys[key] = struct{}{}
 			if seen[key] {
 				continue
 			}
@@ -343,6 +345,18 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 		for i := range batch {
 			if !emit(batch[i]) {
 				return fresh, false
+			}
+		}
+		// Prune seen to the segments the source still lists. Without this the map
+		// grows by one URL per segment for the life of the run — unbounded on a
+		// live channel that refreshes forever. A segment that has left the
+		// source's window is not re-listed, so forgetting it is safe; a looping
+		// source that re-lists one costs a single harmless re-download.
+		if len(seen) > len(curKeys) {
+			for k := range seen {
+				if _, ok := curKeys[k]; !ok {
+					delete(seen, k)
+				}
 			}
 		}
 		return fresh, true

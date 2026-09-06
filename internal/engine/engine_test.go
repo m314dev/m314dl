@@ -526,3 +526,83 @@ func min2(a, b int) int {
 	}
 	return b
 }
+
+// recordingSink captures each emitted segment's bytes (the test origin echoes
+// the request path), so a test can assert exactly which segments were delivered.
+type recordingSink struct {
+	mu   sync.Mutex
+	body []string
+}
+
+func (s *recordingSink) Init([]byte) error { return nil }
+func (s *recordingSink) Segment(_ SegmentInfo, data []byte) error {
+	s.mu.Lock()
+	s.body = append(s.body, string(data))
+	s.mu.Unlock()
+	return nil
+}
+
+// TestLiveSeenMapPrunedNoReEmit drives a live stream whose window slides forward
+// over many refreshes. The feeder's dedup map is pruned to the current window
+// each refresh (so it can't grow unbounded on a 24/7 channel); this asserts the
+// pruning never causes a segment still to be re-emitted or dropped — each is
+// delivered exactly once, in order.
+func TestLiveSeenMapPrunedNoReEmit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s", r.URL.Path) // echo path so the sink knows the segment
+	}))
+	defer srv.Close()
+
+	const total = 30 // more than any single window: forces the map to prune
+	const win = 3
+	seg := func(i int) manifest.Segment {
+		return manifest.Segment{URL: fmt.Sprintf("%s/s%d", srv.URL, i), Seq: int64(i), Duration: 0.01}
+	}
+	// window(n) is the sliding view [n, n+win); Refresh tiny so the loop spins.
+	window := func(n int, live bool) *manifest.Stream {
+		st := &manifest.Stream{ID: "t", Type: manifest.Video, Live: live, Refresh: time.Millisecond}
+		for i := n; i < n+win && i < total; i++ {
+			st.Segments = append(st.Segments, seg(i))
+		}
+		return st
+	}
+
+	var next int32 = 1 // first refresh returns window starting at 1
+	refresh := func(context.Context) (*manifest.Stream, error) {
+		n := int(atomic.AddInt32(&next, 1)) - 2 + 1 // 1,2,3,...
+		start := n
+		live := start+win < total
+		return window(start, live), nil
+	}
+
+	sink := &recordingSink{}
+	err := DownloadStream(context.Background(),
+		Config{Client: mustClient(t), Threads: 4, Sink: sink, FromStart: true},
+		window(0, true), filepath.Join(t.TempDir(), "o"), refresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]int{}
+	for _, b := range sink.body {
+		seen[b]++
+	}
+	for i := 0; i < total; i++ {
+		p := fmt.Sprintf("/s%d", i)
+		if seen[p] != 1 {
+			t.Fatalf("segment %s delivered %d times, want exactly 1 (map prune must not re-emit or drop)", p, seen[p])
+		}
+	}
+	if len(seen) != total {
+		t.Fatalf("delivered %d distinct segments, want %d", len(seen), total)
+	}
+}
+
+func mustClient(t *testing.T) *httpx.Client {
+	t.Helper()
+	c, err := httpx.New(httpx.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
