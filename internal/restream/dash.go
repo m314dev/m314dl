@@ -82,8 +82,26 @@ func (p *Publisher) DASHManifest() []byte {
 		fmt.Fprintf(&b, ` mediaPresentationDuration="PT%.3fS"`, total)
 	}
 	b.WriteString(">\n")
-	b.WriteString(`  <Period id="0" start="PT0S">` + "\n")
+	// The Period body (adaptation sets + timelines) is the O(segments) part and
+	// depends only on the tracks, not on the wall clock, so it is cached; the
+	// header above carries the per-request publishTime and live/aired phase.
+	b.Write(p.dashBody())
+	b.WriteString("</MPD>\n")
+	return []byte(b.String())
+}
 
+// dashBody renders (and caches) the <Period> body, rebuilding only when a
+// segment is added, an init arrives, or the stream ends. Many pollers on a long
+// growing VOD then share one render instead of each re-walking every segment.
+func (p *Publisher) dashBody() []byte {
+	v := p.ver.Load()
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+	if p.dashCache != nil && p.dashVer == v {
+		return p.dashCache
+	}
+	var b strings.Builder
+	b.WriteString(`  <Period id="0" start="PT0S">` + "\n")
 	// One AdaptationSet per media type, in a stable order (video, then audio).
 	var video, audio []*Track
 	for _, t := range p.tracks {
@@ -100,9 +118,9 @@ func (p *Publisher) DASHManifest() []byte {
 	for _, t := range audio {
 		writeAdaptationSet(&b, t, "audio", "audio/mp4")
 	}
-
-	b.WriteString("  </Period>\n</MPD>\n")
-	return []byte(b.String())
+	b.WriteString("  </Period>\n")
+	p.dashCache, p.dashVer = []byte(b.String()), v
+	return p.dashCache
 }
 
 func (p *Publisher) isLive() bool {

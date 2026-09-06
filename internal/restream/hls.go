@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mohamed/m314dl/internal/engine"
@@ -49,6 +50,14 @@ type Publisher struct {
 	byID   map[string]*Track
 	start  time.Time
 	now    func() time.Time // wall clock; tests substitute
+
+	// ver bumps on every segment/init/end across all tracks; the DASH manifest
+	// body and each track's media playlist are cached and rebuilt only when it
+	// changes, so many pollers on a long VOD never each re-walk every segment.
+	ver       atomic.Int64
+	cacheMu   sync.Mutex
+	dashCache []byte
+	dashVer   int64
 }
 
 func NewPublisher() *Publisher {
@@ -58,6 +67,7 @@ func NewPublisher() *Publisher {
 // AddTrack registers a track and returns the engine.Sink that feeds it. Call
 // before serving; the returned sink is written by exactly one download stream.
 func (p *Publisher) AddTrack(t *Track) engine.Sink {
+	t.ver = &p.ver
 	p.tracks = append(p.tracks, t)
 	p.byID[t.ID] = t
 	return t
@@ -77,6 +87,7 @@ func (p *Publisher) End() {
 		t.ended = true
 		t.mu.Unlock()
 	}
+	p.ver.Add(1)
 }
 
 // Ready reports whether every track has published at least one segment, i.e.
@@ -174,15 +185,21 @@ type Track struct {
 	spoolDir   string // VOD only: where segment files live (the run's tmpDir)
 	segExt     string // "ts" | "m4s"
 
+	ver *atomic.Int64 // shared publisher version; bumped per segment/init/end
+
 	mu          sync.RWMutex
 	init        []byte
 	initAt      time.Time
 	segs        []*segment
+	byName      map[string]*segment // name -> segment, so lookup is O(1) not a scan
 	targetDur   float64
 	seq         int64 // output media sequence of the next segment (monotonic; never reset)
 	nextStartMS int64 // running presentation time in ms for the next segment (DASH timeline)
 	published   int64 // total ever published (for stats)
 	ended       bool
+
+	plCache []byte // media playlist cached by plVer
+	plVer   int64
 }
 
 type segment struct {
@@ -237,7 +254,15 @@ func (t *Track) Init(data []byte) error {
 	t.init = buf
 	t.initAt = time.Now()
 	t.mu.Unlock()
+	t.bumpVer()
 	return nil
+}
+
+// bumpVer invalidates the cached playlist/manifest bodies after a change.
+func (t *Track) bumpVer() {
+	if t.ver != nil {
+		t.ver.Add(1)
+	}
 }
 
 // Segment implements engine.Sink: appends one segment (rolling in-memory
@@ -280,10 +305,15 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 	if t.live {
 		seg.data = append([]byte(nil), data...)
 	}
+	if t.byName == nil {
+		t.byName = make(map[string]*segment)
+	}
+	t.byName[name] = seg
 	t.segs = append(t.segs, seg)
 	t.seq++
 	t.nextStartMS += int64(math.Round(dur * 1000))
 	t.published++
+	t.bumpVer()
 
 	// Live: trim beyond window+tail; the tail keeps just-evicted segments
 	// fetchable a moment longer for clients mid-download of the oldest visible
@@ -301,6 +331,7 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 // releasing them for GC. Caller holds t.mu.
 func (t *Track) evictOldestLocked(n int) {
 	for i := 0; i < n; i++ {
+		delete(t.byName, t.segs[i].name)
 		t.segs[i] = nil
 	}
 	t.segs = t.segs[n:]
@@ -321,15 +352,14 @@ func (t *Track) visibleLocked() []*segment {
 func (t *Track) segmentByName(name string) (data []byte, path string, modtime time.Time, ok bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	for _, s := range t.segs {
-		if s.name == name {
-			if t.live {
-				return s.data, "", s.at, true
-			}
-			return nil, t.spoolPath(name), s.at, true
-		}
+	s := t.byName[name]
+	if s == nil {
+		return nil, "", time.Time{}, false
 	}
-	return nil, "", time.Time{}, false
+	if t.live {
+		return s.data, "", s.at, true
+	}
+	return nil, t.spoolPath(name), s.at, true
 }
 
 // initSegment returns the fMP4 init bytes and modtime.
@@ -361,8 +391,15 @@ func (t *Track) bitrateLocked() int64 {
 
 // mediaPlaylist renders this track's live media playlist (RFC 8216).
 func (t *Track) mediaPlaylist() []byte {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	v := int64(0)
+	if t.ver != nil {
+		v = t.ver.Load()
+	}
+	if t.plCache != nil && t.plVer == v {
+		return t.plCache
+	}
 
 	visible := t.visibleLocked()
 	var b strings.Builder
@@ -401,7 +438,8 @@ func (t *Track) mediaPlaylist() []byte {
 	if t.ended {
 		b.WriteString("#EXT-X-ENDLIST\n")
 	}
-	return []byte(b.String())
+	t.plCache, t.plVer = []byte(b.String()), v
+	return t.plCache
 }
 
 // ─── master playlist ─────────────────────────────────────────────────────────
