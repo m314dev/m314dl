@@ -316,6 +316,11 @@ func run() error {
 				return err
 			}
 		}
+		if kind == "dash" {
+			if err := source.ExpandIndexed(ctx, client, st, logv); err != nil {
+				return err
+			}
+		}
 		if st.Live {
 			live = true
 		}

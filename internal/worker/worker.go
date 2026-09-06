@@ -320,7 +320,7 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		cancel()
 		return nil, err
 	}
-	selected, err := selectAndExpand(ctx, client, kind, master, ve, ae, se, keys)
+	selected, err := selectAndExpand(ctx, client, kind, master, ve, ae, se, keys, w.logv)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -473,9 +473,10 @@ func parseSelection(sv, sa, ss string) (ve, ae, se *pick.Expr, err error) {
 }
 
 // selectAndExpand selects the requested streams and, for HLS, fetches each
-// media playlist (mirrors run()'s expansion). It fails fast on a CENC track
+// media playlist; for DASH, splits on-demand (SegmentBase) files by their sidx
+// (mirrors run()'s expansion). It fails fast on a CENC track
 // with no key so a misconfigured channel reports the reason at start.
-func selectAndExpand(ctx context.Context, client *httpx.Client, kind string, master *manifest.Master, ve, ae, se *pick.Expr, keys map[[16]byte][]byte) ([]*manifest.Stream, error) {
+func selectAndExpand(ctx context.Context, client *httpx.Client, kind string, master *manifest.Master, ve, ae, se *pick.Expr, keys map[[16]byte][]byte, logv func(string, ...any)) ([]*manifest.Stream, error) {
 	selected := pick.Select(master.Streams, ve, ae, se)
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("no streams matched the selection")
@@ -497,6 +498,11 @@ func selectAndExpand(ctx context.Context, client *httpx.Client, kind string, mas
 			}
 			st.PlaylistURL = finalURL
 			if err := hls.ParseMedia(body, finalURL, st); err != nil {
+				return nil, err
+			}
+		}
+		if kind == "dash" {
+			if err := source.ExpandIndexed(ctx, client, st, logv); err != nil {
 				return nil, err
 			}
 		}

@@ -72,6 +72,10 @@ type Segment struct {
 	Init          *InitMap
 	Seq           int64 // media sequence / $Number$; IV fallback + ordering
 	Discontinuity bool
+	// Index, when set, marks a placeholder: the segment is a whole on-demand
+	// media file whose SegmentIndexBox lives at this byte range. It is split
+	// into real subsegments (source.ExpandIndexed) before download.
+	Index *ByteRange
 }
 
 // Stream is one downloadable track (video variant, audio rendition, subtitle).

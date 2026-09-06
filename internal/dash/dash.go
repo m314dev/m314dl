@@ -47,6 +47,10 @@ type adaptXML struct {
 	Lang              string    `xml:"lang,attr"`
 	Codecs            string    `xml:"codecs,attr"`
 	FrameRate         string    `xml:"frameRate,attr"`
+	Width             int       `xml:"width,attr"`
+	Height            int       `xml:"height,attr"`
+	MaxWidth          int       `xml:"maxWidth,attr"`
+	MaxHeight         int       `xml:"maxHeight,attr"`
 	BaseURL           []string  `xml:"BaseURL"`
 	SegmentTemplate   *tmplXML  `xml:"SegmentTemplate"`
 	SegmentList       *listXML  `xml:"SegmentList"`
@@ -252,11 +256,14 @@ func buildStream(as *adaptXML, rep *repXML, ai, ri int) *manifest.Stream {
 	st := &manifest.Stream{
 		ID:        fmt.Sprintf("%s.%d.%d", firstNonEmpty(rep.ID, "r"), ai, ri),
 		Bandwidth: rep.Bandwidth,
-		Width:     rep.Width,
-		Height:    rep.Height,
-		Codecs:    firstNonEmpty(rep.Codecs, as.Codecs),
-		Language:  firstNonEmpty(rep.Lang, as.Lang),
-		Name:      rep.ID,
+		// width/height are per-Representation, but some packagers (shaka
+		// on-demand) put them only on the AdaptationSet; inherit as a fallback
+		// so the restream output and picker still know the resolution.
+		Width:    firstNonZero(rep.Width, as.Width, as.MaxWidth),
+		Height:   firstNonZero(rep.Height, as.Height, as.MaxHeight),
+		Codecs:   firstNonEmpty(rep.Codecs, as.Codecs),
+		Language: firstNonEmpty(rep.Lang, as.Lang),
+		Name:     rep.ID,
 	}
 	st.FrameRate = parseFrameRate(firstNonEmpty(rep.FrameRate, as.FrameRate))
 	if len(rep.AudioChannels) > 0 {
@@ -311,20 +318,24 @@ func buildSegments(c segCtx) ([]manifest.Segment, *manifest.InitMap, error) {
 	case list != nil:
 		return segmentsFromList(c, list)
 	case c.rep.SegmentBase != nil:
-		// Whole file as one segment, no sidx split. But split off the init header
+		// One media file per representation. Split off the init header
 		// (<Initialization range="0-N">) as a separate init item so a CENC stream
 		// can read its tenc/KID — without it the decryptor never runs and every
 		// encrypted SegmentBase track dies with "stream is CENC-protected". The
-		// media segment then starts AFTER the init range, so the header isn't
-		// downloaded twice (the engine writes the init item, then the segment).
+		// rest is a placeholder for the whole file, carrying the sidx location
+		// (@indexRange) so it can be split into real subsegments before download
+		// — as one blob a feature film is read into RAM whole and OOM-kills the
+		// process (the engine writes the init item, then the segments).
 		seg := manifest.Segment{URL: c.base, Duration: c.periodDur}
 		var init *manifest.InitMap
-		if sb := c.rep.SegmentBase; sb.Initialization != nil {
+		sb := c.rep.SegmentBase
+		if sb.Initialization != nil {
 			if r := parseRange(sb.Initialization.Range); r != nil {
 				init = &manifest.InitMap{URL: c.base, Range: r}
 				seg.Range = &manifest.ByteRange{Start: r.End + 1, End: -1}
 			}
 		}
+		seg.Index = parseRange(sb.IndexRange)
 		return []manifest.Segment{seg}, init, nil
 	default:
 		return []manifest.Segment{{URL: c.base, Duration: c.periodDur}}, nil, nil
@@ -626,6 +637,15 @@ func defaultKID(lists ...[]cpXML) [16]byte {
 		}
 	}
 	return zero
+}
+
+func firstNonZero(vals ...int) int {
+	for _, v := range vals {
+		if v != 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 func firstNonEmpty(vals ...string) string {
