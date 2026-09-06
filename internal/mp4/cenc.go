@@ -281,6 +281,7 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 	// trun that omits data_offset continues where the previous one ended.
 	i := 0
 	var pos int64
+	iv := make([]byte, 16) // reused per sample; decryptSample copies it before use
 	for k, t := range truns {
 		if k == 0 || t.hasOff {
 			pos = base + t.dataOff - mdatBase
@@ -294,7 +295,7 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 				return fmt.Errorf("mp4: sample %d overruns mdat", i)
 			}
 			sample := mdatData[pos:end]
-			iv := sampleIV(ivs, i, info)
+			fillSampleIV(iv, ivs, i, info)
 			var ss []subsample
 			if i < len(subs) {
 				ss = subs[i]
@@ -309,17 +310,19 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 	return nil
 }
 
-// sampleIV returns the 16-byte IV/counter for sample i.
-func sampleIV(ivs [][]byte, i int, info *InitInfo) []byte {
-	iv := make([]byte, 16)
+// fillSampleIV writes the 16-byte IV/counter for sample i into iv (reused across
+// samples; decryptSample's cipher constructors copy it, so reuse is safe).
+func fillSampleIV(iv []byte, ivs [][]byte, i int, info *InitInfo) {
+	for j := range iv {
+		iv[j] = 0
+	}
 	if i < len(ivs) && len(ivs[i]) > 0 {
 		copy(iv, ivs[i]) // 8-byte IVs left-align, low bytes stay zero
-		return iv
+		return
 	}
 	if len(info.ConstantIV) > 0 {
 		copy(iv, info.ConstantIV)
 	}
-	return iv
 }
 
 // decryptSample decrypts one sample in place per the active scheme.

@@ -419,12 +419,12 @@ func decryptESSparse(es []byte, block cipher.Block, ivStart []byte) {
 	}
 	iv := make([]byte, 16)
 	copy(iv, ivStart)
+	tmp := make([]byte, 16) // reused each block instead of allocating per 16 bytes
 	esLen := len(newES)
 	pos := 0
 	counter := 0
 	for esLen > 0 {
 		ctrInc(iv)
-		tmp := make([]byte, 16)
 		copy(tmp, iv)
 		if esLen <= 16 || counter%10 == 0 {
 			block.Encrypt(tmp, tmp)
