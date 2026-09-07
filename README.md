@@ -1,410 +1,556 @@
-# m314dl — fast HLS & DASH video downloader with native CENC decryption
+# m314dl
 
-**m314dl** is a fast, reliable **HLS (`.m3u8`) and DASH (`.mpd`) video stream
-downloader** in a single static Go binary — with **native, in-process CENC /
-Widevine-style decryption**. No `mp4decrypt`, no `shaka-packager`, no external
-tools on the download path.
+A fast HLS, DASH and Microsoft Smooth Streaming downloader written in Go.
 
-If you have reached for [N_m3u8DL-RE](https://github.com/nilaoda/N_m3u8DL-RE),
-[vsd](https://github.com/clitic/vsd), `youtube-dl`/`yt-dlp` or `ffmpeg` to grab
-an `m3u8` or `mpd` stream, m314dl is a single-binary alternative that is
-faster on every benchmark below and decrypts DRM-protected fMP4 in the same pass
-it downloads it — no second `mp4decrypt` step.
+m314dl downloads VOD and live streams, handles track selection, subtitles, retries and resume, and can decrypt supported encrypted streams while they are being downloaded when you provide the content key.
 
-```sh
-m314dl -o out.mp4 https://example.com/master.m3u8            # download an HLS stream
-m314dl -key KID:KEY -o out.mp4 https://example.com/video.mpd # download + decrypt a DASH stream
+It can also run as a restreamer, remote download server, or multi-channel streaming worker.
+
+The project started as a downloader, but over time I ended up adding most of the things I wanted around the actual download pipeline instead of relying on several different tools.
+
+## Quick start
+
+Download an HLS stream:
+
+```bash
+m314dl -o video.mp4 https://example.com/master.m3u8
 ```
 
-![m314dl recording a live DASH stream](docs/screenshot.png)
+DASH works the same way:
 
-## Why I built it
-
-For about a year, my go-to tool was
-[N_m3u8DL-RE](https://github.com/nilaoda/N_m3u8DL-RE) — it's excellent, and it's
-what got me deep enough into this space to write my own downloader. Big
-shout-out to it. 🙏
-
-I started m314dl because no single tool I tried covered *everything* I needed at
-once: download and decrypt in one pass, run as a server, and re-broadcast a live
-stream — all from one static binary. If your needs are simpler, N_m3u8DL-RE is
-still a great pick; m314dl is what you reach for when you want it all in one
-place.
-
-## Benchmarks
-
-Wall-clock to download **+ decrypt + mux** a 5-minute 1080p stream (~150 MB, 75
-segments/track), served from localhost with a simulated 50 ms CDN round-trip,
-best-of-3, all outputs verified full-length (155 MB). Lower is better.
-
-| Case | **m314dl** | vsd 0.5.0 | N_m3u8DL-RE 0.6.0 |
-|---|---|---|---|
-| HLS TS (VOD) | **0.95 s** | 1.60 s | 1.12 s |
-| HLS fMP4 (VOD) | **0.96 s** | 1.62 s | 1.08 s |
-| DASH clear (VOD) | **0.91 s** | 1.85 s | 1.45 s |
-| DASH CENC — AES-CTR | **0.98 s** | 1.95 s | 2.69 s |
-| DASH cbcs — AES-CBC pattern | **0.99 s** | 1.88 s | 1.82 s |
-
-Three things to notice:
-
-- **m314dl is flat.** Encryption adds ~0.07 s, because segments are decrypted
-  in memory *as they download* — the decrypt overlaps the next fetch and never
-  touches disk. Competitors pay ~1 s or more for the same content because they
-  decrypt in a separate pass (N_m3u8DL-RE shells out to `mp4decrypt` after the
-  merge; see below), or download streams strictly one at a time (vsd).
-- **Concurrency auto-tunes.** With no `-t` flag, m314dl ramps its in-flight
-  request count to fit the network (AIMD, 4→64) and backs off from rate-limited
-  servers (honoring `Retry-After`) — hiding round-trip time without a knob to
-  guess. `-t N` uses exactly N and holds it (matching `--thread-count`), backing
-  off only on real rate-limit pressure, then climbing straight back.
-- **The numbers are reproducible.** The corpus generator, the throttling
-  server, and the exact commands live in [`bench/`](bench/). Re-run them on your
-  own hardware — don't trust a copied table.
-
-Decryption throughput on its own is **1.4 GB/s (CTR)** / **1.05 GB/s (CBC)**
-single-threaded (`go test -bench . ./internal/mp4/`) — ~100× typical network
-bandwidth, across every worker thread. Decryption is free; the network is the
-only bottleneck.
-
-## Decryption is in-process and on the fly
-
-Most tools treat DRM as a post-processing step: download the whole encrypted
-file, then run `mp4decrypt`/`shaka-packager` over it. m314dl decrypts each
-fragment in the download worker, in RAM, the moment it arrives — the same place
-it handles AES-128. Consequences:
-
-- no encrypted temp file, no second full pass over the data, no subprocess spawn
-  per segment;
-- decryption is concurrent across all threads and overlapped with I/O, so it
-  costs effectively nothing (see the flat benchmark row);
-- **CENC** (`cenc` AES-CTR), **cbcs** (AES-CBC + crypt/skip pattern, constant
-  IV), plus `cens`/`cbc1` are implemented from the ISO/IEC 23001-7 boxes
-  (`tenc`, `senc`, `saiz`/`saio`, `trun`) — verified **byte-exact against
-  `mp4decrypt`** and by hermetic round-trip tests.
-
-You supply the content key; m314dl does not include a Widevine/PlayReady CDM
-(neither does vsd's or N_m3u8DL-RE's default download path — key extraction is a
-separate concern):
-
-```sh
-# KID:KEY in hex (KID dashes optional); repeatable for multi-key manifests
-m314dl -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
-       -o out.mp4 https://example.com/manifest.mpd
+```bash
+m314dl -o video.mp4 https://example.com/manifest.mpd
 ```
 
-## Features
+List the available streams before downloading:
 
-- **HLS** (TS + fMP4): master/media playlists, rendition groups (`AUDIO=`/`SUBTITLES=` honored — best audio belongs to the picked variant), byte ranges, `EXT-X-MAP` changes mid-stream, AES-128 (in-process, `data:` key URIs supported), audio-only variant detection
-- **DASH**: SegmentTemplate (`$Number$`/`$Time$` + `%0Nd`), SegmentTimeline (negative `@r`), SegmentList, SegmentBase, multi-period (merged with discontinuity markers), namespace-agnostic lenient XML, `cenc:default_KID`
-- **Smooth Streaming (MSS)**: `.ism/Manifest` (VOD and live), `{bitrate}`/`{start time}` URL templates, `<c t d r>` timelines, H.264 + AAC (init segments are synthesized from `CodecPrivateData` — the presentation ships none), PIFF fragments normalized for players, PlayReady KID read from the `ProtectionHeader` and decrypted with `-key`
-- **Native CENC / cbcs / cens / cbc1 decryption** — no `mp4decrypt`, no `shaka-packager`; per-fragment, in memory, byte-exact vs the reference tools. HLS **SAMPLE-AES** (AAC + H.264) is decrypted too, with a supplied key
-- **Live recording** for both protocols: starts at the live edge (`-live-from-start` for the whole DVR window), refresh failures retried forever, segment dedupe across refreshes, `-live-duration` limit, **Ctrl-C finishes the recording gracefully and muxes** — you never lose what you already recorded
-- **Adaptive concurrency**: with no `-t`, in-flight requests auto-tune to the network (AIMD, 4→64) and back off from 429/5xx (honoring `Retry-After`) — no thread count to guess, and no hammering rate-limited CDNs; `-t N` pins exactly N (held, still backs off on rate limits)
-- **One TCP connection per in-flight request (HTTP/1.1)**: a CDN offering HTTP/2 would make Go multiplex every concurrent segment onto a single TCP connection, and one flow can't fill a real network's pipe (RTT- and loss-bound) — so downloads run over many independent HTTP/1.1 connections, the way `N_m3u8DL-RE`/`aria2`/`yt-dlp` do, for full aggregate throughput
-- **One download pipeline** for VOD and live (feeder → worker pool → ordered writer): no duplicated code paths; segments stream to disk (one part file per in-flight segment, decrypted and appended in order) so peak memory is one segment, not one per thread — even for huge segments
-- **Resume that survives a kill, not just a clean exit**: segments stream to part files with HTTP byte-range resume, and the checkpoint is written on every commit — so an interrupted (or hard-killed, e.g. a TUI where Ctrl-C is a keypress) VOD download continues byte-exact, losing at most the one segment being written. Works even when a whole movie is a handful of tens-of-MB segments; a failed segment is never silently skipped
-- **Retries with exponential backoff + jitter** that cover mid-body read failures, not just connection setup; status-aware (404 fails fast, 5xx/429 retry)
-- **Subtitles**: WebVTT (concatenated segments deduped), TTML→SRT (lenient regex parsing — survives non-compliant XML), stpp-in-fMP4 extracted natively (no ffmpeg TTML gap), muxed with correct ISO 639-2 language tags — or written as sidecar files with `-sub-external`
-- **Flexible input**: an HTTP(S) URL (first *or* last argument), a local `.m3u8`/`.mpd` file or `file://` path (for manifests signed per request and never published), or a web page to scrape
-- **Page scraping**: point it at a web page; it finds `.m3u8`/`.mpd` URLs (inline JSON and one iframe level included)
-- **Plain files too** (like aria2c): point it at a direct file URL (`.mp4`, `.mkv`, `.zip`, anything) and it downloads over many byte-range connections at once, with the same resume/retry; single connection when the server won't do ranges
-- **Automation-friendly**: plain-line progress on non-TTY (no ANSI garbage in logs), real exit codes, quiet machine-readable output
-- Ad-segment skipping by regex (`-ad-keyword`, applied on live refreshes too), custom headers (sent verbatim), Netscape `cookies.txt`, HTTP/SOCKS proxy with auth
-- **Paste a curl command** (`-curl`): for a URL that needs specific headers, hand it a browser's "Copy as cURL" and it takes the URL + all headers for you, instead of typing each `-H`. Pass it as a **file** or on **stdin** — a browser's curl has quotes the shell mangles inline:
-  ```sh
-  m314dl -curl - -o out.mp4 <<'CURL'
-  curl 'https://host/master.m3u8' -H 'referer: https://site/' -H 'user-agent: …'
-  CURL
-  ```
-- **Update check**: once a day it checks GitHub for a newer release and prints a one-line notice if you're behind (never blocks the download; `-no-update-check` or `M314DL_NO_UPDATE_CHECK=1` turns it off)
-
-**Scope of decryption.** m314dl decrypts when you provide the key. It does not
-run a license/CDM handshake, and HLS SAMPLE-AES and HLS-CMAF CENC key parsing
-are not wired up yet (DASH CENC/cbcs is). TLS verification is on by default and
-only skipped with an explicit `-insecure`.
-
-## Install
-
-**Docker** (ffmpeg bundled, nothing else to install):
-
-```sh
-docker build -t m314dl .
-docker run --rm -v "$PWD:/data" m314dl -o out.mp4 https://example.com/master.m3u8
+```bash
+m314dl -list https://example.com/manifest.mpd
 ```
 
-Downloads land in the current directory (that's the `-v "$PWD:/data"` mount).
+For encrypted DASH, if you already have the content key:
 
-**From source:**
+```bash
+m314dl -key KID:KEY -o video.mp4 https://example.com/manifest.mpd
+```
 
-```sh
+m314dl does not obtain DRM licenses or content keys. It only handles the media decryption when a key is supplied.
+
+## What it supports
+
+The main formats are:
+
+* HLS (`m3u8`), both MPEG-TS and fragmented MP4
+* MPEG-DASH (`mpd`)
+* Microsoft Smooth Streaming (`.ism/Manifest`)
+* VOD and live streams
+* ordinary HTTP files
+
+For HLS, this includes master/media playlists, alternate audio and subtitle renditions, byte ranges, changing `EXT-X-MAP` init segments, AES-128 and supported SAMPLE-AES streams.
+
+For DASH, m314dl handles `SegmentTemplate`, `$Number$`, `$Time$`, `SegmentTimeline`, `SegmentList`, `SegmentBase`, multi-period manifests and the usual fMP4 layouts.
+
+Smooth Streaming support includes VOD and live manifests, H.264/AAC tracks and PlayReady-encrypted fragments when the required key is provided.
+
+## Download pipeline
+
+One of the main things I wanted from m314dl was for downloading and processing to happen as one pipeline.
+
+Segments are fetched concurrently and written in playback order:
+
+```text
+manifest
+    |
+    v
+track selection
+    |
+    v
+segment feeder
+    |
+    v
+download workers
+    |
+    +--> retry / resume
+    +--> decrypt when needed
+    |
+    v
+ordered writer
+    |
+    +--> mux to file
+    |
+    +--> restream
+```
+
+The same basic engine is used for VOD and live streams.
+
+Segments do not all have to sit in memory waiting for the download to finish. Workers use part files and the ordered writer commits completed segments in the correct sequence.
+
+## Concurrent downloading
+
+If you don't specify a thread count, m314dl adjusts concurrency automatically.
+
+It starts conservatively, increases the number of requests while things are going well, and backs off when the server starts returning rate-limit or server errors.
+
+`Retry-After` is honored when supplied by the server.
+
+If you prefer a fixed number of workers:
+
+```bash
+m314dl -t 16 -o video.mp4 URL
+```
+
+The HTTP download path intentionally uses independent HTTP/1.1 connections for concurrent requests rather than putting all segment traffic through a single multiplexed connection.
+
+## Resume
+
+VOD downloads are checkpointed while they are running.
+
+If a download is interrupted, run the same command again:
+
+```bash
+m314dl -o video.mp4 URL
+```
+
+Completed segments are not downloaded again.
+
+A segment that was only partially downloaded can also continue using an HTTP byte range when the server supports it.
+
+The checkpoint is updated as segments are committed, so resume does not depend on the process shutting down cleanly.
+
+Failed segments are retried with exponential backoff and jitter. Mid-transfer read failures are retried as well, not only connection failures.
+
+A segment that ultimately fails is treated as an error instead of being silently skipped.
+
+## Native decryption
+
+For supported formats, encrypted fragments are decrypted directly inside the download workers.
+
+Currently implemented schemes include:
+
+* CENC / `cenc` (AES-CTR)
+* `cbcs`
+* `cens`
+* `cbc1`
+* HLS AES-128
+* supported HLS SAMPLE-AES AAC/H.264 streams
+
+For example:
+
+```bash
+m314dl \
+  -key 00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef \
+  -o video.mp4 \
+  https://example.com/manifest.mpd
+```
+
+`-key` is repeatable for streams using multiple keys.
+
+For fragmented MP4, the decryption code parses the encryption information from the MP4 boxes and decrypts samples while fragments pass through the normal download pipeline.
+
+That means there is no need to download an encrypted file first and then run the entire result through `mp4decrypt` or `shaka-packager`.
+
+m314dl is not a Widevine or PlayReady CDM and does not perform the license exchange. Key acquisition is outside the scope of the project.
+
+## Track selection
+
+By default, m314dl chooses the best video, appropriate audio tracks and available subtitles.
+
+Use `-list` to inspect a manifest:
+
+```bash
+m314dl -list URL
+```
+
+Video, audio and subtitle tracks can then be selected with `-sv`, `-sa` and `-ss`.
+
+For example:
+
+```bash
+m314dl \
+  -sv 'res=1080' \
+  -sa 'lang=^en' \
+  -ss 'lang=en|de' \
+  -o video.mkv \
+  URL
+```
+
+Simple selectors are also available:
+
+```bash
+-sv best
+-sv worst
+-sv best3
+-sv all
+-sv none
+```
+
+Filters can be combined:
+
+```bash
+m314dl \
+  -sv 'res=x720$:codecs=avc1|avc3:for=best' \
+  URL
+```
+
+Supported filter fields include identifiers, language, name, codec, resolution, dynamic range, channel information, bandwidth, segment count and playlist duration.
+
+Negation is supported as well:
+
+```bash
+-ss 'id!=^(a|b)$:for=all'
+```
+
+This can be useful with manifests containing unwanted periods, bumpers or incorrectly labelled tracks.
+
+## Subtitles
+
+m314dl can handle:
+
+* WebVTT
+* TTML
+* `stpp` carried inside fragmented MP4
+
+Segmented WebVTT is joined and duplicate cues are removed.
+
+TTML can be converted to SRT, including some malformed/non-strict input that normal XML parsing may reject.
+
+`stpp` samples are extracted directly from fragmented MP4.
+
+Subtitles can be muxed into the final output or kept separately:
+
+```bash
+m314dl -sub-external -o video.mp4 URL
+```
+
+## Live recording
+
+Live HLS and DASH can be recorded using the same downloader:
+
+```bash
+m314dl -live-duration 1h -o recording.mp4 https://example.com/live.m3u8
+```
+
+By default recording begins near the current live edge.
+
+To start from the beginning of the currently available DVR window:
+
+```bash
+m314dl -live-from-start -o recording.mp4 URL
+```
+
+Live playlists are refreshed continuously and already-seen segments are deduplicated.
+
+If refreshing the manifest temporarily fails, m314dl keeps retrying instead of immediately killing the recording.
+
+Pressing Ctrl-C stops the recording gracefully and finalizes what has already been downloaded.
+
+## Headers, cookies and proxies
+
+Custom HTTP headers can be supplied directly:
+
+```bash
+m314dl \
+  -H 'Referer: https://example.com/' \
+  -H 'User-Agent: Mozilla/5.0' \
+  -o video.mp4 \
+  URL
+```
+
+Netscape-format `cookies.txt` files are supported, as are HTTP and SOCKS proxies with authentication.
+
+For requests that depend on several browser headers, m314dl can also read a copied cURL command:
+
+```bash
+m314dl -curl request.txt -o video.mp4
+```
+
+or from stdin:
+
+```bash
+m314dl -curl - -o video.mp4 <<'CURL'
+curl 'https://example.com/master.m3u8' \
+  -H 'referer: https://example.com/' \
+  -H 'user-agent: Mozilla/5.0'
+CURL
+```
+
+The URL and headers are taken from the cURL command.
+
+## Input doesn't have to be a manifest
+
+You can give m314dl:
+
+* an HTTP/HTTPS manifest URL
+* a local `.m3u8` or `.mpd`
+* a `file://` manifest
+* a web page containing a stream
+* a direct file URL
+
+When given a normal web page, m314dl looks for HLS/DASH URLs referenced by the page, including common inline JSON cases and one level of iframe discovery.
+
+For a normal file:
+
+```bash
+m314dl -o archive.zip https://example.com/archive.zip
+```
+
+m314dl uses parallel byte-range downloading when the server supports ranges and falls back to a normal single connection when it doesn't.
+
+The same retry and resume behavior is used.
+
+## Ad segment filtering
+
+For live streams where unwanted segments can be identified from their URLs, `-ad-keyword` can be used to skip matching segments.
+
+The filter is also applied as live manifests refresh.
+
+## Restreaming
+
+m314dl can send the output of its normal download pipeline to an HTTP server instead of writing only to a final file.
+
+Start a restream:
+
+```bash
+m314dl -serve :8314 https://example.com/master.m3u8
+```
+
+The HLS output is then available at:
+
+```text
+http://localhost:8314/live.m3u8
+```
+
+Three output modes are currently available:
+
+```bash
+# HLS
+m314dl -serve :8314 URL
+
+# continuous MPEG-TS
+m314dl -serve :8314 -serve-format ts URL
+
+# DASH
+m314dl -serve :8314 -serve-format dash URL
+```
+
+The restreamer sits after the normal selection/download/decryption path, so the source only has to be fetched once.
+
+### HLS output
+
+HLS mode keeps a rolling segment window in memory for live sources and generates the master and media playlists itself.
+
+The same stored segment can be served to multiple viewers instead of creating a separate copy of the upstream stream for every client.
+
+For finite sources, segments are spooled to disk and the output behaves as a growing seekable VOD until it completes.
+
+### MPEG-TS output
+
+When the source is already muxed MPEG-TS, m314dl can produce a continuous TS stream without FFmpeg.
+
+Transport-stream continuity counters are rewritten across segment boundaries so the segments form one continuous stream.
+
+For fMP4 or sources with separate audio/video tracks, one long-running FFmpeg process is used to copy-remux the tracks into TS.
+
+Optional transcoding can be requested with:
+
+```bash
+-serve-transcode '<ffmpeg args>'
+```
+
+### DASH output
+
+DASH serving generates an MPD and serves the downloaded fMP4 media directly.
+
+The output timeline is built from the actual segment durations. Live input produces a dynamic MPD; finite input produces a static one.
+
+## Worker mode
+
+`-serve` handles one presentation.
+
+For applications that need many independently controlled streams, m314dl can run as a worker:
+
+```bash
+m314dl \
+  -worker :7001 \
+  -worker-secret mytoken \
+  -worker-max-channels 32
+```
+
+Channels are created through the HTTP API:
+
+```bash
+curl \
+  -H 'Authorization: Bearer mytoken' \
+  -X POST http://server:7001/api/channels \
+  -d '{
+    "id": "news",
+    "url": "https://example.com/manifest.mpd",
+    "format": "hls"
+  }'
+```
+
+The resulting stream is available under the channel ID:
+
+```text
+http://server:7001/news/live.m3u8
+```
+
+A worker keeps all channels in one process. Each channel uses the same selection, downloading, decryption and packaging code as normal `-serve` mode.
+
+The worker itself is intentionally stateless. A controller is expected to recreate the desired channels after a restart.
+
+## RPC download server
+
+There is a separate RPC mode for remotely starting normal m314dl download jobs:
+
+```bash
+m314dl \
+  -rpc 0.0.0.0:8314 \
+  -rpc-secret mytoken
+```
+
+Submit a job:
+
+```bash
+curl \
+  -H 'Authorization: Bearer mytoken' \
+  -X POST http://server:8314/add \
+  -d '{
+    "url": "https://example.com/master.m3u8",
+    "args": ["-o", "video.mp4"]
+  }'
+```
+
+Each job runs as a child m314dl process, so normal CLI options, resume and graceful shutdown behavior still apply.
+
+Jobs can be listed and inspected through the API and stopped gracefully.
+
+The server has limits for concurrent jobs, retained job history and captured logs so it can be left running without job state growing indefinitely.
+
+Do not expose the RPC endpoint without authentication. An authenticated RPC client effectively has the same power as running m314dl from the command line on that machine.
+
+## Installation
+
+### Build from source
+
+```bash
+git clone https://github.com/mohaanymo/m314dl
+cd m314dl
 go build -o m314dl .
 ```
 
-Requires `ffmpeg` on PATH (or next to the binary, or passed with `-ffmpeg <path>`) for muxing.
+FFmpeg is required for final muxing and for the restream paths that require remuxing or transcoding.
 
-## Usage
+m314dl looks for FFmpeg on `PATH` or next to the executable.
 
-```sh
-# best video + best audio per language + all subtitles → out.mp4
-m314dl -o out.mp4 https://example.com/master.m3u8
-
-# decrypt a CENC/cbcs DASH stream with a known key (native, no mp4decrypt)
-m314dl -key KID:KEY -o out.mp4 https://example.com/manifest.mpd
-
-# list streams
-m314dl -list https://example.com/manifest.mpd
-
-# pick streams: filters are regexes, colon-separated; for= picks from matches
-m314dl -sv 'res=1080' -sa 'lang=^en' -ss 'lang=en|de' -o out.mkv URL
-m314dl -sv best -sa 'for=best2' URL
-
-# record a live stream for 1 hour (or Ctrl-C anytime — file still muxed)
-m314dl -live-duration 1h -o show.mp4 https://example.com/live.m3u8
-
-# scrape a page for the stream
-m314dl -o video.mp4 https://example.com/watch/12345
-
-# resume an interrupted VOD download: just rerun the same command
-```
-
-Run `m314dl -h` for all flags.
-
-## RPC server (remote downloads)
-
-Run m314dl on a server and submit jobs over HTTP/JSON. Each job is a child
-m314dl process, so every flag, resume, and graceful-stop behavior works
-exactly as it does locally.
+A specific binary can also be supplied:
 
 ```bash
-# on the server (a secret is required on non-loopback binds)
-m314dl -rpc 0.0.0.0:8314 -rpc-secret mytoken -rpc-max-jobs 64
-
-# submit a job (args = normal CLI flags)
-curl -H 'Authorization: Bearer mytoken' -X POST http://server:8314/add \
-  -d '{"url":"https://example.com/master.m3u8","args":["-o","movie.mp4","-key","KID:KEY"]}'
-# → {"id":1}   (or HTTP 503 if -rpc-max-jobs are already running)
-
-# watch: state, latest progress line, error if any
-curl -H 'Authorization: Bearer mytoken' http://server:8314/jobs
-curl -H 'Authorization: Bearer mytoken' http://server:8314/jobs/1   # + full log
-curl -H 'Authorization: Bearer mytoken' http://server:8314/health   # {"running":3,"total":57,"max":64}
-
-# stop gracefully (live: mux what's recorded; VOD: save resume state);
-# call twice to abort — same semantics as Ctrl-C
-curl -H 'Authorization: Bearer mytoken' -X POST http://server:8314/jobs/1/stop
+m314dl -ffmpeg /path/to/ffmpeg -o video.mp4 URL
 ```
 
-Output files land in the server's working directory unless `-o` gives a path.
-An authenticated client has the full power of the CLI on the server — treat
-the secret like an SSH key.
+### Docker
 
-Built to run unattended in production:
-
-- **Bounded memory** — finished jobs are reaped after `-rpc-retain` (default 1h,
-  with a hard ceiling), and each job's captured log is capped. A server left up
-  for weeks doesn't grow without limit.
-- **Admission cap** — `-rpc-max-jobs` (default 64) bounds concurrent jobs; past
-  it, `/add` returns `503` instead of fork-bombing the host. `0` = unlimited.
-- **No lock contention** — each job's output is buffered under its own lock,
-  never a shared one, so hundreds of chatty jobs don't serialize on the server.
-- **Monotonic job ids** — a reaped id is never reused, so a stale client can't
-  address a recycled job.
-- **Graceful shutdown** — SIGINT/SIGTERM stops accepting, signals every running
-  job to finish, then exits. On Linux, jobs also die with the server even on a
-  hard crash (`Pdeathsig`), so a crash never leaves orphaned downloads.
-- **Hardened endpoints** — bounded request bodies, a read-header timeout, and
-  constant-time secret comparison.
-
-## Restream: live HLS out (`-serve`)
-
-Instead of writing a file, m314dl can republish what it downloads as a **live
-HLS stream** over HTTP — decrypt a DRM source and re-serve it in the clear, pull
-one feed and fan it out to many viewers, or turn a live recording into a
-watchable endpoint.
+The Docker image includes FFmpeg:
 
 ```bash
-# pull a stream and re-serve it as live HLS
-m314dl -serve :8314 https://example.com/master.m3u8
-# → http://localhost:8314/live.m3u8
-
-# decrypt a DRM DASH source and restream it in the clear
-m314dl -serve :8314 -key KID:KEY https://example.com/manifest.mpd
-
-# re-serve as one continuous MPEG-TS instead (VLC, set-top boxes)
-m314dl -serve :8314 -serve-format ts https://example.com/live.m3u8
-# → http://localhost:8314/live.ts
-
-# re-serve as live DASH (dash.js, Shaka, ExoPlayer)
-m314dl -serve :8314 -serve-format dash https://example.com/manifest.mpd
-# → http://localhost:8314/live.mpd
+docker build -t m314dl .
 ```
 
-Open `http://<host>:8314/live.m3u8` (HLS), `/live.ts` (MPEG-TS), or `/live.mpd`
-(DASH) in VLC, mpv, hls.js, dash.js, or any player.
-
-What it serves:
-
-HLS mode serves:
-
-- `GET /live.m3u8` — multivariant (master) playlist
-- `GET /{track}/index.m3u8` — a track's media playlist (`video`, `audio-en`, …)
-- `GET /{track}/init.mp4` — fMP4 init segment (EXT-X-MAP target)
-- `GET /{track}/000123.ts` — a media segment
-
-MPEG-TS mode serves `GET /live.ts` — one never-ending transport stream fanned
-out to every viewer. The fan-out is non-blocking: a viewer that falls a full
-buffer behind is dropped, and no other viewer ever waits on it (unlike a naive
-broadcaster that stalls everyone on the slowest client).
-
-- **TS source → pure Go, no FFmpeg.** The segments are already MPEG-TS, so they
-  concatenate into a valid continuous stream with no re-mux; each viewer joins on
-  a segment boundary (a clean, decodable PAT/PMT + keyframe start). Continuity
-  counters are renumbered into one seamless per-PID sequence across boundaries —
-  the one good idea from FFmpeg restreamers, done in-process with no reconnect
-  seam to bridge.
-- **fMP4 source, or separate video+audio → one FFmpeg remux.** When the source
-  isn't already a muxed TS, m314dl runs a single long-lived FFmpeg that
-  copy-remuxes the decrypted tracks into TS (separate audio is muxed in). One
-  process for the whole stream — not one per segment — and no `-re` pacing
-  (segment arrival paces it). Because m314dl decrypts upstream, FFmpeg only sees
-  a clear copy, so the DRM-demuxer memory leak that plagues FFmpeg restreamers
-  never applies. Pass `-serve-transcode '<ffmpeg args>'` to re-encode instead of
-  copy (e.g. `-c:v libx264 -preset veryfast -c:a aac`).
-
-DASH mode serves `GET /live.mpd` — a SegmentTemplate + SegmentTimeline manifest
-plus the same in-memory fMP4 segments (one AdaptationSet per media type, one
-Representation per track, each with its own timeline built from real segment
-durations). A live source produces a `dynamic` MPD with `minimumUpdatePeriod`; a
-finite one produces a `static` MPD with `mediaPresentationDuration`. Needs an
-fMP4 source (a TS source must be remuxed first — a later phase).
-
-How it's built — and why it's different from an FFmpeg restreamer:
-
-- **No FFmpeg on the copy path.** Segments arrive already decrypted and in
-  playback order from the normal download engine; the packager just keeps a
-  rolling in-memory window and rewrites the playlist. No subprocess, no `-re`
-  pacing (the source's own segment cadence paces it), no TS continuity-counter
-  surgery (segments are copied whole, never re-muxed). Output segments are
-  **byte-identical** to the source.
-- **One copy feeds every viewer.** Segments are held once in a shared window and
-  served with Range/ETag support, not buffered per connection.
-- **Correct playlists.** Right `EXT-X-VERSION` for fMP4 vs TS, `EXT-X-MAP` for
-  fMP4, real `BANDWIDTH`/`CODECS`/`RESOLUTION` in the master (measured, not
-  guessed), source discontinuities passed through, and an output media sequence
-  that can't be wedged by a source that rewinds its own numbering.
-- **Live and VOD.** A live source rolls a window. A finite (VOD) source is served
-  as a **seekable** growing VOD instead — segments spool to disk (RAM stays flat)
-  and the whole timeline is scrubbable, gaining `EXT-X-ENDLIST` when it completes.
-
-Scope today: HLS and DASH output are copy-only (same container family, no
-FFmpeg); MPEG-TS output copies a TS source in pure Go and remuxes an fMP4 or
-separate-audio source through one FFmpeg (with optional transcode). TS→fMP4 for
-DASH/HLS-fMP4 output, and subtitle restreaming, are not wired up yet.
-
-## Worker mode (many channels, one process)
-
-`-serve` runs one presentation. `-worker` runs a **multi-channel restream
-agent** a controller drives over HTTP — start and stop channels on the fly, each
-served at `/{id}/…`. One process holds them all: the media is already in RAM in
-the packager, so there is no subprocess to babysit and no reverse proxy to a
-child's port.
+Example:
 
 ```bash
-# on the streaming server (secret required on non-loopback binds)
-m314dl -worker :7001 -worker-secret mytoken -worker-max-channels 32
-
-# start a channel (source → live HLS at /news/live.m3u8)
-curl -H 'Authorization: Bearer mytoken' -X POST http://server:7001/api/channels \
-  -d '{"id":"news","url":"https://…/manifest.mpd","format":"hls","keys":["KID:KEY"],
-       "headers":{"Referer":"https://…"}}'
-
-# ts / dash channels the same way (format: "ts" | "dash")
-# list / inspect / stop
-curl -H 'Authorization: Bearer mytoken' http://server:7001/api/channels
-curl -H 'Authorization: Bearer mytoken' http://server:7001/api/channels/news
-curl -H 'Authorization: Bearer mytoken' -X DELETE http://server:7001/api/channels/news
-curl -H 'Authorization: Bearer mytoken' http://server:7001/api/health
-
-# viewers just play the media URL (unauthenticated, like any origin)
-mpv http://server:7001/news/live.m3u8
+docker run --rm \
+  -v "$PWD:/data" \
+  m314dl \
+  -o video.mp4 \
+  https://example.com/master.m3u8
 ```
 
-Each channel reuses the whole engine — selection, native decrypt, live refresh,
-and the HLS/TS/DASH packagers above — so a channel is exactly a `-serve` stream
-under an id. The control plane carries the production hardening: a bearer secret,
-an admission cap (`-worker-max-channels`, 503 past it), and graceful shutdown
-that stops every channel. State is in-memory by design: the worker is stateless,
-so a controller's own reconciliation restarts channels after a restart.
+## Benchmarks
 
-## Selector syntax
+### Microbenchmarks
 
-`-sv`, `-sa`, `-ss` accept:
+These are `go test` microbenchmarks over the hot paths. They are reproducible on your own machine:
 
-| Value | Meaning |
-|---|---|
-| `best`, `worst`, `all`, `best3` | positional over sorted streams |
-| `key=regex[:key=regex...]` | filter; keeps **all** matches |
-| `key!=regex` | negate — keep streams that do **not** match (RE2 has no negative lookahead, so this is how you express a deny-list) |
-| `...:for=bestN` | take N best from the filtered set |
-| `none` | drop this type |
+```bash
+# decryption and manifest/playlist rendering (no external corpus needed)
+go test ./internal/dash/ ./internal/hls/ ./internal/restream/ -run=^$ -bench=. -benchmem
 
-Regex keys: `id`, `lang`, `name`, `codecs`, `res`, `range`, `channel`.
-Numeric keys: `bwmin`/`bwmax` (kbps), `segsmin`/`segsmax` (segment count),
-`plistdurmin`/`plistdurmax` (seconds, or `20m`). Numeric filters treat an
-unknown value as passing, so `segsmin`/`plistdurmin` drop short ad/bumper
-periods in DASH without touching HLS tracks whose length isn't known yet.
-Sorting: video by height→bandwidth, audio by default-flag→channels→bandwidth.
-
-```sh
-# drop 1-segment SSAI bumpers, keep ≥720p AVC content
-m314dl -sv 'segsmin=2:plistdurmin=20m:res=x720$:codecs=avc1|avc3:for=best' URL
-# drop two mislabeled subtitle tracks by id (deny-list via negation)
-m314dl -ss 'id!=^(a|b)$:for=all' URL
+# native decryption and the full download->decrypt->commit pipeline
+# (uses the small corpus from bench/gen-fixtures.sh)
+M314_FIXTURES="$PWD/bench/fixtures" \
+  go test ./internal/mp4/ ./internal/engine/ -run=^$ -bench=. -benchmem
 ```
 
-## FAQ
+Measured on an Intel Core i5-6200U (2 cores / 4 threads, 2.3 GHz), Go 1.27, Linux. Your numbers will differ; treat these as relative, not absolute.
 
-### How do I download an HLS (`.m3u8`) stream?
+| Benchmark | What it measures | Result |
+|---|---|---|
+| `DecryptFragment/dash-cenc` | native CENC (AES-CTR) decrypt of a ~2 MB fMP4 fragment | **1.68 GB/s** |
+| `DecryptFragment/dash-cbcs` | native cbcs (AES-CBC pattern) decrypt of the same fragment | **2.05 GB/s** |
+| `PipelineCENC` | full pipeline: concurrent download + CENC decrypt + in-order commit of ~375 MB over localhost | **~10 GB/s** effective |
+| `DASHManifest` (cached) | serving the MPD for a 3000-segment VOD | **7.5 µs**, 15 allocs |
+| `DASHManifest` (uncached) | same, rebuilding the timeline every request | 49.5 µs, 33 allocs |
+| `Parse` (DASH) | parsing a 4-period × 6-rendition × 100-segment manifest (2400 `<S>`) | 16.8 ms |
+| `ParseMedia` (HLS) | parsing a 3000-segment media playlist | 4.9 ms |
 
-`m314dl -o out.mp4 https://host/master.m3u8`. m314dl fetches the master
-playlist, picks the best video + audio + all subtitles by default, downloads
-the segments in parallel and muxes to MP4 with ffmpeg.
+Two things worth calling out:
 
-### How do I download a DASH (`.mpd`) stream?
+* The `PipelineCENC` figure has no network latency (everything is localhost), so it measures the download → decrypt → commit ceiling, not a network-bound real-world speed. It exists to show that decrypt-while-downloading is not the bottleneck: on this old laptop the pipeline moves media far faster than any single connection delivers it.
+* The cached vs uncached manifest rows show why serving a long growing VOD to many polling players stays cheap: the timeline body is rebuilt only when a segment is added, not on every request.
 
-Same command, with the MPD URL: `m314dl -o out.mp4 https://host/manifest.mpd`.
-SegmentTemplate, SegmentTimeline, SegmentList, SegmentBase and multi-period
-manifests are all supported.
+### End-to-end comparison
 
-### How do I decrypt a CENC / DRM-protected stream without mp4decrypt?
+There is also a reproducible end-to-end setup in [`bench/`](bench/) that compares HLS, fMP4 HLS, clear DASH and encrypted DASH downloads against other downloaders under a simulated CDN round-trip. That one needs the competitor binaries and the generated corpus, so it is kept in the repository rather than as a fixed table here:
 
-Pass the content key: `m314dl -key KID:KEY -o out.mp4 https://host/manifest.mpd`.
-Decryption (`cenc` AES-CTR and `cbcs` AES-CBC pattern) runs in-process, per
-fragment, as the stream downloads — there is no `mp4decrypt` or `shaka-packager`
-step. m314dl does not perform the license/CDM handshake, so you supply the key.
-
-### How do I record a live stream?
-
-`m314dl -live-duration 1h -o show.mp4 https://host/live.m3u8`. Recording starts
-at the live edge; press Ctrl-C anytime and the file is still finalized and muxed.
-
-### Is it faster than N_m3u8DL-RE or vsd?
-
-On the reproducible benchmark above, yes — across HLS, DASH and encrypted
-content. See [`bench/`](bench/) to run it yourself.
-
-## Tests
-
-```sh
-go test ./...                      # unit + integration
-go test -bench . ./internal/mp4/   # decryption throughput
+```bash
+cd bench
 ```
 
-The CENC test suite proves decryption two independent ways: **byte-exact
-parity** with `mp4decrypt` on real shaka-packaged fixtures (skips if the fixtures
-or `mp4decrypt` are absent), and **hermetic round-trips** that build fragments
-in-code and recover the plaintext with no external dependencies.
+The main performance-related design choice in m314dl is that encrypted fragments are decrypted by the workers while downloading. There isn't a second full-file decryption pass after the download completes.
+
+## A note about DRM
+
+m314dl contains media decryption code, not a DRM client.
+
+It does not:
+
+* perform a Widevine license exchange
+* perform a PlayReady license exchange
+* extract content keys
+* bypass a CDM
+
+When encrypted media is used, you provide the content key yourself:
+
+```text
+KID:KEY
+```
+
+m314dl then uses that key to decrypt supported media formats.
+
+Only use m314dl with streams and keys you are authorized to access.
+
+## Command line options
+
+The README only covers the commonly used options.
+
+Run:
+
+```bash
+m314dl -h
+```
+
+for the complete list of flags.
+
+## Reporting problems
+
+Streaming manifests in the wild have a lot of strange edge cases.
+
+If you find a stream that m314dl parses incorrectly, a download that doesn't resume correctly, a subtitle format it mishandles, or a case where another downloader works and m314dl doesn't, open an issue.
+
+When possible, include the manifest or a minimal reproducible example. For authenticated streams, a sanitized manifest that still reproduces the problem is much more useful than credentials or private URLs.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
