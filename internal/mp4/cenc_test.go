@@ -338,3 +338,50 @@ func TestDecryptMultiTrunCBCS(t *testing.T) {
 		t.Fatalf("multi-trun CBCS mismatch at byte %d of %d", firstDiff(got, want), len(want))
 	}
 }
+
+// TestApplyPatternCBC_SkipZero pins the cbcs (1,0) pattern: skip=0 means every
+// block is encrypted (a pure CBC run over the whole range). Regression for a bug
+// where only the first crypt run was decrypted and the rest of each sample was
+// left encrypted, so a (1,0)-pattern track came out as noise while a (1,9) one
+// played.
+func TestApplyPatternCBC_SkipZero(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	iv := []byte("ABCDEFGHIJKLMNOP")
+	block, _ := aes.NewCipher(key)
+
+	pt := make([]byte, 160) // 10 whole blocks
+	for i := range pt {
+		pt[i] = byte(i * 7)
+	}
+	ct := make([]byte, len(pt))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, pt)
+
+	got := append([]byte(nil), ct...)
+	applyPatternCBC(got, iv, block, 1, 0)
+	if !bytes.Equal(got, pt) {
+		t.Fatalf("skip=0 did not fully decrypt:\n got %x\nwant %x", got[:32], pt[:32])
+	}
+}
+
+// TestApplyPatternCBC_Pattern19 checks a real (1,9) pattern still round-trips:
+// one encrypted block per 10-block unit, CBC-chained across encrypted blocks.
+func TestApplyPatternCBC_Pattern19(t *testing.T) {
+	key := []byte("fedcba9876543210")
+	iv := []byte("iv--------------")
+	block, _ := aes.NewCipher(key)
+
+	pt := make([]byte, 16*25)
+	for i := range pt {
+		pt[i] = byte(i)
+	}
+	ct := append([]byte(nil), pt...)
+	enc := cipher.NewCBCEncrypter(block, iv)
+	for pos := 0; pos+16 <= len(ct); pos += 10 * 16 {
+		enc.CryptBlocks(ct[pos:pos+16], ct[pos:pos+16])
+	}
+	got := append([]byte(nil), ct...)
+	applyPatternCBC(got, iv, block, 1, 9)
+	if !bytes.Equal(got, pt) {
+		t.Fatalf("(1,9) pattern round-trip failed:\n got %x\nwant %x", got[:32], pt[:32])
+	}
+}

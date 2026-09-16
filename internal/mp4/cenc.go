@@ -403,19 +403,26 @@ func decryptCBCFull(buf, iv []byte, block cipher.Block) {
 // starts at the given (constant) IV for this protected range.
 func applyPatternCBC(buf, iv []byte, block cipher.Block, cryptBlocks, skipBlocks int) {
 	dec := cipher.NewCBCDecrypter(block, iv[:16])
+	// skip=0 means no blocks are skipped: every 16-byte block is encrypted and
+	// CBC-chained, a pure CBC run over the whole range. Decrypt all whole blocks
+	// (a trailing partial block is left clear, per cbcs). The old code decrypted
+	// only the first crypt run (cryptBlocks*16 bytes) then broke, leaving the rest
+	// of every sample encrypted for a (1,0) pattern while (1,9) was unaffected.
+	if skipBlocks == 0 {
+		n := len(buf) - len(buf)%16
+		if n > 0 {
+			dec.CryptBlocks(buf[:n], buf[:n])
+		}
+		return
+	}
 	unit := (cryptBlocks + skipBlocks) * 16
-	pos := 0
-	for pos+16 <= len(buf) {
+	for pos := 0; pos+16 <= len(buf); pos += unit {
 		cn := cryptBlocks * 16
 		if pos+cn > len(buf) {
 			cn = (len(buf) - pos) / 16 * 16
 		}
 		if cn > 0 {
 			dec.CryptBlocks(buf[pos:pos+cn], buf[pos:pos+cn])
-		}
-		pos += unit
-		if skipBlocks == 0 {
-			break // pure CBC already handled the whole run
 		}
 	}
 }
