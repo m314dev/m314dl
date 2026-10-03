@@ -481,7 +481,14 @@ func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, it
 // in the same order: strip fake image header, then CENC, then AES-128, then BBTS.
 // trackID is the fMP4 init's sole track (0 for TS or multi-track inits).
 func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, trackID uint32, bbtsKey []byte, keys map[[16]byte][]byte, it item, data []byte) ([]byte, error) {
-	data = stripFakeImageHeader(data)
+	// AES-128 encrypts the whole segment, so before decrypting there is no TS
+	// sync or box to find — only random bytes. Ciphertext that happens to open
+	// FF D8 (JPEG) and hold three 0x47s 188 apart got chopped to a non-block
+	// length (3isk/grzcdn seg 188). Strip after decrypting instead.
+	aes128 := it.key != nil && it.key.Method == manifest.EncAES128
+	if !aes128 {
+		data = stripFakeImageHeader(data)
+	}
 	// fMP4 CENC and fMP4 SAMPLE-AES (== cbcs) both decrypt through the CENC path;
 	// the init's tenc/schm already selected the scheme when dec was built.
 	if !it.isInit && dec != nil && it.key != nil &&
@@ -511,7 +518,7 @@ func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, track
 		}
 		data = out
 	}
-	if it.key != nil && it.key.Method == manifest.EncAES128 {
+	if aes128 {
 		key, err := kc.get(ctx, it.key.URI)
 		if err != nil {
 			return nil, fmt.Errorf("fetch AES key: %w", err)
@@ -525,6 +532,7 @@ func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, track
 		if err != nil {
 			return nil, err
 		}
+		data = stripFakeImageHeader(data)
 	}
 	// BBTS: whole-segment iQiyi-style TS cipher. The key is supplied out of band;
 	// the IV rides in each segment's own SDT. Media segments only (no init).

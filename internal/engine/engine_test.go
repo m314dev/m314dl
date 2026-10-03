@@ -606,3 +606,30 @@ func mustClient(t *testing.T) *httpx.Client {
 	}
 	return c
 }
+
+// AES-128 ciphertext is random bytes, so it can open FF D8 (JPEG) and hold
+// three 0x47s 188 apart by chance. The fake-header strip must not run on it:
+// it once chopped a 2084928-byte segment to 256222 and the decrypt failed.
+func TestAES128CiphertextNotTakenForFakeImage(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, 16)
+	ct := make([]byte, 4096)
+	for i := range ct {
+		ct[i] = byte(i*31 + 5)
+	}
+	ct[0], ct[1] = 0xFF, 0xD8
+	for _, off := range []int{1001, 1001 + 188, 1001 + 376} {
+		ct[off] = 0x47
+	}
+	it := item{key: &manifest.Key{
+		Method: manifest.EncAES128,
+		URI:    "data:text/plain," + string(key),
+		IV:     make([]byte, 16),
+	}}
+	got, err := decryptSegment(context.Background(), &keyCache{}, nil, 0, nil, nil, it, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(ct) {
+		t.Fatalf("got %d bytes, want %d", len(got), len(ct))
+	}
+}
