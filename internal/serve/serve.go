@@ -122,12 +122,18 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 // `-serve` mode and the multi-channel worker. Subtitles are skipped (no live
 // WebVTT segmentation yet).
 func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv func(string, ...any)) (Presentation, http.Handler, string, []Job, error) {
+	if logv == nil {
+		logv = func(string, ...any) {}
+	}
 	var streams []*manifest.Stream
 	for _, st := range selected {
 		if st.Type == manifest.Subtitles {
 			logv("restream: skipping subtitle track %s (not supported yet)", st.ID)
 			continue
 		}
+		// Shared by -serve and worker mode, so both expose selected audio as
+		// well as video. No source URL, headers or content keys are logged here.
+		logv("restream: selected track %s: %s", st.ID, st)
 		streams = append(streams, st)
 	}
 	if len(streams) == 0 {

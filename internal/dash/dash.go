@@ -55,6 +55,7 @@ type adaptXML struct {
 	SegmentTemplate   *tmplXML  `xml:"SegmentTemplate"`
 	SegmentList       *listXML  `xml:"SegmentList"`
 	ContentProtection []cpXML   `xml:"ContentProtection"`
+	AudioChannels     []acXML   `xml:"AudioChannelConfiguration"`
 	Roles             []roleXML `xml:"Role"`
 	Essential         []propXML `xml:"EssentialProperty"`
 	Representations   []repXML  `xml:"Representation"`
@@ -87,7 +88,8 @@ type repXML struct {
 }
 
 type acXML struct {
-	Value string `xml:"value,attr"`
+	SchemeIDURI string `xml:"schemeIdUri,attr"`
+	Value       string `xml:"value,attr"`
 }
 
 type cpXML struct {
@@ -266,8 +268,13 @@ func buildStream(as *adaptXML, rep *repXML, ai, ri int) *manifest.Stream {
 		Name:     rep.ID,
 	}
 	st.FrameRate = parseFrameRate(firstNonEmpty(rep.FrameRate, as.FrameRate))
-	if len(rep.AudioChannels) > 0 {
-		st.Channels = rep.AudioChannels[0].Value
+	channels := rep.AudioChannels
+	if len(channels) == 0 {
+		channels = as.AudioChannels
+	}
+	if len(channels) > 0 {
+		st.Channels = channels[0].Value
+		st.ChannelScheme = channels[0].SchemeIDURI
 	}
 	mime := firstNonEmpty(rep.MimeType, as.MimeType, as.ContentType)
 	codec := st.Codecs

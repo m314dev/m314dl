@@ -103,6 +103,9 @@ type Stream struct {
 	Init         *InitMap
 	Segments     []Segment
 	SegmentsFull bool // segments already populated (bare media playlist)
+
+	// DASH AudioChannelConfiguration scheme; Channels is its value.
+	ChannelScheme string
 }
 
 // Resolution returns "WxH" or "".

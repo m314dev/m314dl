@@ -25,13 +25,13 @@ import (
 // (now − AST − delay) lands inside the spooled timeline. Back-dating AST to make
 // the spool "available" instantly was tried and broke dash.js outright: its DVR
 // window is wall-clock derived by default, so it sought ~24h in and never
-// played. Once the download completes the MPD stays dynamic, gains a
-// mediaPresentationDuration and drops minimumUpdatePeriod — the DASH-IF
-// live-to-VOD transition; a static MPD handed to a mid-session dash.js makes it
-// end playback at whatever it has buffered — and turns static only once the
-// wall clock has passed the end, for late joiners who then get a fully seekable
-// VOD. DASH segments are fMP4 — a TS source must be remuxed first (a later
-// phase), which the coordinator enforces before choosing this output.
+// played. Once the download completes the MPD still stays dynamic, without a
+// mediaPresentationDuration and with minimumUpdatePeriod, until the wall clock
+// has passed the end. A static MPD handed to a mid-session dash.js made it end
+// playback at whatever it had buffered. Late joiners after the end get a
+// static, fully seekable VOD. DASH segments are fMP4 — a TS source must be
+// remuxed first (a later phase), which the coordinator enforces before choosing
+// this output.
 
 const isoTime = "2006-01-02T15:04:05Z"
 
@@ -205,7 +205,13 @@ func writeAdaptationSet(b *strings.Builder, t *Track, contentType, mime string) 
 	b.WriteString(">\n")
 
 	if contentType == "audio" && t.channels != "" {
-		fmt.Fprintf(b, `        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value=%q/>`+"\n", t.channels)
+		// Preserve the scheme alongside its value: a Dolby hex speaker mask
+		// (e.g. F801) must not be relabelled as an MPEG channel index.
+		scheme := t.channelScheme
+		if scheme == "" {
+			scheme = "urn:mpeg:dash:23003:3:audio_channel_configuration:2011"
+		}
+		fmt.Fprintf(b, `        <AudioChannelConfiguration schemeIdUri=%q value=%q/>`+"\n", scheme, t.channels)
 	}
 
 	visible := t.visibleLocked()

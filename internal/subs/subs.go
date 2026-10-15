@@ -25,7 +25,7 @@ const (
 	KindVTT Kind = iota
 	KindTTML
 	KindSRT
-	KindFMP4 // wvtt/stpp inside fMP4 — needs ffmpeg
+	KindFMP4 // wvtt/stpp inside fMP4 — extracted natively
 	KindUnknown
 )
 

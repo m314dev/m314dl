@@ -82,7 +82,8 @@ func ParseKeys(vals []string) (map[[16]byte][]byte, error) {
 // LoadManifest fetches the input, sniffs HLS/DASH/MSS, and falls back to
 // scraping when the input is a web page. A direct file (anything binary, or
 // served as an attachment) comes back as a single-stream master of kind
-// FileKind whose segments are the file's byte ranges — see file.go.
+// FileKind whose segments are the file's byte ranges — see file.go. An IPTV
+// M3U list comes back as kind PlaylistKind — see playlist.go.
 func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, logv func(string, ...any)) (*manifest.Master, string, error) {
 	// Local manifest file (path or file://): some providers sign the playlist
 	// per request and hand it over as text rather than a URL.
@@ -110,7 +111,7 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 	head, err := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if err == nil && isDirectFile(resp, head) {
 		logv("input is a direct file (%s)", resp.Header.Get("Content-Type"))
-		return fileMaster(ctx, client, resp, finalURL, logv), FileKind, nil
+		return fileMaster(ctx, client, resp, inputURL, finalURL, logv), FileKind, nil
 	}
 	var rest []byte
 	if err == nil {
@@ -154,6 +155,8 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 // body is none of them (a web page, most likely).
 func parseManifest(body []byte, baseURL string) (m *manifest.Master, kind string, err error, ok bool) {
 	switch {
+	case hls.IsHLS(body) && isPlaylist(body):
+		return parsePlaylist(body, baseURL), PlaylistKind, nil, true
 	case hls.IsHLS(body):
 		m, err = hls.ParseMaster(body, baseURL)
 		return m, "hls", err, true

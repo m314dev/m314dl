@@ -2,7 +2,9 @@ package engine
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +25,9 @@ type Progress struct {
 	live     bool
 	start    time.Time
 	interval time.Duration // render tick override; 0 = default (1s TTY, 5s piped)
+
+	outMu sync.Mutex          // serializes status-line draws and Log
+	lw    *progressLineWriter // set while Render runs
 }
 
 type sample struct {
@@ -41,11 +46,17 @@ func (p *Progress) AddDone(n int64)       { p.done.Add(n) }
 func (p *Progress) SetKnownBytes(n int64) { p.knownBytes.Store(n) }
 
 func (p *Progress) AddBytes(n int64) {
-	p.bytes.Add(n)
+	cur := p.bytes.Add(n)
+	now := time.Now()
 	p.mu.Lock()
-	p.samples = append(p.samples, sample{time.Now(), p.bytes.Load()})
-	if len(p.samples) > 256 {
-		p.samples = p.samples[128:]
+	// At most one sample per 100ms. A sample per Read let a few dozen busy
+	// workers fill the ring within milliseconds, so the window Speed measures
+	// shrank under its 0.1s floor and a fast download read "0B/s | ETA ?".
+	if k := len(p.samples); k == 0 || now.Sub(p.samples[k-1].t) >= 100*time.Millisecond {
+		p.samples = append(p.samples, sample{now, cur})
+		if len(p.samples) > 256 {
+			p.samples = p.samples[128:]
+		}
 	}
 	p.mu.Unlock()
 }
@@ -126,25 +137,84 @@ func (p *Progress) Render(stop <-chan struct{}) {
 	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
+	lineWriter := progressLineWriter{out: os.Stderr, tty: isTTY, width: func() int {
+		w, _, err := term.GetSize(int(os.Stderr.Fd()))
+		if err != nil {
+			return 0
+		}
+		return w
+	}}
+	p.outMu.Lock()
+	p.lw = &lineWriter
+	p.outMu.Unlock()
 	for {
 		select {
 		case <-stop:
-			if isTTY {
-				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s\n", p.Line())
-			} else {
-				fmt.Fprintln(os.Stderr, p.Line())
-			}
+			p.outMu.Lock()
+			lineWriter.write(p.Line(), true)
+			p.lw = nil
+			p.outMu.Unlock()
 			return
 		case <-tick.C:
-			if isTTY {
-				line := p.Line()
-				if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && len(line) > w && w > 4 {
-					line = line[:w-1]
-				}
-				fmt.Fprintf(os.Stderr, "\r\x1b[2K%s", line)
-			} else {
-				fmt.Fprintln(os.Stderr, p.Line())
-			}
+			p.outMu.Lock()
+			lineWriter.write(p.Line(), false)
+			p.outMu.Unlock()
 		}
 	}
+}
+
+// Log prints a message on its own line. On a TTY the status line is erased
+// first and redrawn at the next tick, so messages from downloads sharing this
+// Progress never land in the middle of it.
+func (p *Progress) Log(line string) {
+	p.outMu.Lock()
+	defer p.outMu.Unlock()
+	out := io.Writer(os.Stderr)
+	if w := p.lw; w != nil {
+		out = w.out
+		if w.tty && w.previous > 0 {
+			fmt.Fprintf(out, "\r%s\r", strings.Repeat(" ", w.previous))
+			w.previous = 0
+		}
+	}
+	fmt.Fprintln(out, line)
+}
+
+// Progress lines are ASCII. Pad to erase the previous line without ANSI/VT
+// sequences, which classic Windows consoles don't interpret by default.
+// The same width limit applies to ticks and the final line; leave one spare
+// column to avoid terminal auto-wrap (including at an exact-width boundary).
+type progressLineWriter struct {
+	out      io.Writer
+	tty      bool
+	width    func() int
+	previous int
+}
+
+func (w *progressLineWriter) write(line string, final bool) {
+	if !w.tty {
+		fmt.Fprintln(w.out, line)
+		return
+	}
+	columns := 0
+	if w.width != nil {
+		columns = w.width()
+	}
+	limit := max(0, columns-1)
+	if columns > 0 {
+		if len(line) > limit {
+			line = line[:limit]
+		}
+	}
+	clearWidth := max(w.previous, len(line))
+	if columns > 0 && clearWidth > limit {
+		clearWidth = limit
+	}
+	padding := strings.Repeat(" ", max(0, clearWidth-len(line)))
+	suffix := ""
+	if final {
+		suffix = "\n"
+	}
+	fmt.Fprintf(w.out, "\r%s%s%s", line, padding, suffix)
+	w.previous = len(line)
 }

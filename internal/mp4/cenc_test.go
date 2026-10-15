@@ -194,6 +194,40 @@ func TestDecryptCBCSHermetic(t *testing.T) {
 	}
 }
 
+// A trun may omit per-sample sizes when tfhd supplies default_sample_size.
+// OSN uses that compact form for its one-sample fragments; treating the absent
+// trun field as zero makes the valid CENC subsample range look out of bounds.
+func TestDecryptCTRUsesTFHDDefaultSampleSize(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	sample := testSample{
+		plain: bytes.Repeat([]byte{0xA1}, 96),
+		subs:  []subsample{{clear: 16, encrypted: 80}},
+		iv:    seqIV(1),
+	}
+	cipherData := encryptCTR(key, []testSample{sample})
+
+	// tfhd.default_sample_size is present; trun has data_offset but deliberately
+	// no sample-size-present flag.
+	tfhd := mkFullBox("tfhd", 0, 0x020000|0x000010, concat(u32(1), u32(uint32(len(sample.plain)))))
+	trun := mkFullBox("trun", 0, 0x000001, concat(u32(1), u32(0)))
+	senc := mkFullBox("senc", 0, 0x000002, concat(
+		u32(1), sample.iv, u16(1), u16(16), u32(80),
+	))
+	traf := mkBox("traf", concat(tfhd, trun, senc))
+	moof := mkBox("moof", traf)
+	ti := bytes.Index(moof, []byte("trun"))
+	binary.BigEndian.PutUint32(moof[ti+4+4+4:], uint32(len(moof)+8))
+	frag := concat(moof, mkBox("mdat", cipherData))
+
+	info := &InitInfo{Scheme: SchemeCENC, PerSampleIVLen: 16, Protected: true}
+	if err := DecryptFragment(frag, info, key); err != nil {
+		t.Fatal(err)
+	}
+	if got := mdatOf(frag); !bytes.Equal(got, sample.plain) {
+		t.Fatalf("default-size CTR decrypt mismatch: got %x want %x", got, sample.plain)
+	}
+}
+
 func seqIV(seq uint64) []byte {
 	iv := make([]byte, 16)
 	binary.BigEndian.PutUint64(iv, seq)

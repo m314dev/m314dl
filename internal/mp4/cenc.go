@@ -216,15 +216,17 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 		baseIsMoof          bool
 		tfhdBaseDataOff     int64
 		haveTfhdBaseDataOff bool
+		tfhdDefaultSize     uint32
+		haveTfhdDefaultSize bool
 	)
 	traf.children(func(b box) bool {
 		switch b.typ {
 		case "tfhd":
-			baseIsMoof, tfhdBaseDataOff, haveTfhdBaseDataOff = parseTfhd(b)
+			baseIsMoof, tfhdBaseDataOff, haveTfhdBaseDataOff, tfhdDefaultSize, haveTfhdDefaultSize = parseTfhd(b)
 		case "trun":
 			// Collect every trun in order (not just the last): senc/saiz index
 			// samples globally across all of them.
-			if sizes, off, ok := parseTrun(b); ok {
+			if sizes, off, ok := parseTrunWithDefault(b, tfhdDefaultSize, haveTfhdDefaultSize); ok {
 				hasOff := len(b.payload) >= 4 && b.payload[3]&0x01 != 0
 				truns = append(truns, trunRun{sizes: sizes, dataOff: off, hasOff: hasOff})
 			}
@@ -446,24 +448,50 @@ func applyPatternCTR(buf []byte, stream cipher.Stream, cryptBlocks, skipBlocks i
 
 // ---- box field parsers ----
 
-func parseTfhd(b box) (baseIsMoof bool, baseDataOff int64, haveBaseDataOff bool) {
+func parseTfhd(b box) (baseIsMoof bool, baseDataOff int64, haveBaseDataOff bool, defaultSize uint32, haveDefaultSize bool) {
 	_, flags, rest, err := fullBox(b.payload)
 	if err != nil || len(rest) < 4 {
-		return true, 0, false
+		return true, 0, false, 0, false
 	}
 	baseIsMoof = flags&0x020000 != 0
 	rest = rest[4:] // skip track_ID
 	if flags&0x000001 != 0 {
 		if len(rest) < 8 {
-			return baseIsMoof, 0, false
+			return baseIsMoof, 0, false, 0, false
 		}
 		baseDataOff = int64(binary.BigEndian.Uint64(rest))
 		haveBaseDataOff = true
+		rest = rest[8:]
 	}
-	return baseIsMoof, baseDataOff, haveBaseDataOff
+	if flags&0x000002 != 0 { // sample-description-index-present
+		if len(rest) < 4 {
+			return baseIsMoof, baseDataOff, haveBaseDataOff, 0, false
+		}
+		rest = rest[4:]
+	}
+	if flags&0x000008 != 0 { // default-sample-duration-present
+		if len(rest) < 4 {
+			return baseIsMoof, baseDataOff, haveBaseDataOff, 0, false
+		}
+		rest = rest[4:]
+	}
+	if flags&0x000010 != 0 { // default-sample-size-present
+		if len(rest) < 4 {
+			return baseIsMoof, baseDataOff, haveBaseDataOff, 0, false
+		}
+		defaultSize = binary.BigEndian.Uint32(rest)
+		haveDefaultSize = true
+	}
+	return baseIsMoof, baseDataOff, haveBaseDataOff, defaultSize, haveDefaultSize
 }
 
+// parseTrun reads a trun without a tfhd fallback. Kept for callers that only
+// need the explicit fields; CENC decryption uses parseTrunWithDefault below.
 func parseTrun(b box) (sizes []uint32, dataOff int64, ok bool) {
+	return parseTrunWithDefault(b, 0, false)
+}
+
+func parseTrunWithDefault(b box, defaultSampleSize uint32, haveDefaultSampleSize bool) (sizes []uint32, dataOff int64, ok bool) {
 	version, flags, rest, err := fullBox(b.payload)
 	if err != nil || len(rest) < 4 {
 		return nil, 0, false
@@ -502,6 +530,8 @@ func parseTrun(b box) (sizes []uint32, dataOff int64, ok bool) {
 			}
 			sz = binary.BigEndian.Uint32(rest)
 			rest = rest[4:]
+		} else if haveDefaultSampleSize {
+			sz = defaultSampleSize
 		}
 		if flagsPresent {
 			if len(rest) < 4 {

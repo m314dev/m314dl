@@ -185,6 +185,8 @@ type Track struct {
 	spoolDir   string // VOD only: where segment files live (the run's tmpDir)
 	segExt     string // "ts" | "m4s"
 
+	channelScheme string // DASH audio descriptor scheme, preserved with channels
+
 	ver *atomic.Int64 // shared publisher version; bumped per segment/init/end
 
 	mu          sync.RWMutex
@@ -229,7 +231,8 @@ func TrackFromStream(id string, st *manifest.Stream, live bool, spoolDir string)
 		bandwidth: st.Bandwidth, width: st.Width, height: st.Height,
 		frameRate: st.FrameRate, codecs: st.Codecs,
 		language: st.Language, name: st.Name, channels: st.Channels, def: st.Default,
-		fmp4: fmp4, live: live, spoolDir: spoolDir, segExt: ext,
+		channelScheme: st.ChannelScheme,
+		fmp4:          fmp4, live: live, spoolDir: spoolDir, segExt: ext,
 	}
 }
 

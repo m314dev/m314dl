@@ -87,3 +87,33 @@ func TestSanitizeInit(t *testing.T) {
 		t.Fatal("avcC codec config lost")
 	}
 }
+
+func TestSanitizeEAC3InitPreservesCodecConfig(t *testing.T) {
+	// Encrypted EAC3 uses an enca entry just like encrypted AAC, but must be
+	// restored to ec-3 with its dec3 decoder configuration intact.
+	dec3 := mkBox("dec3", []byte{0x04, 0x00, 0x20, 0x0f, 0x00})
+	sinf := mkBox("sinf", concat(
+		mkBox("frma", []byte("ec-3")),
+		mkFullBox("schm", 0, 0, concat([]byte("cenc"), u32(0x10000))),
+		mkBox("schi", mkFullBox("tenc", 0, 0, concat([]byte{0, 0, 1, 8}, make([]byte, 16)))),
+	))
+	entry := mkBox("enca", concat(make([]byte, 28), dec3, sinf))
+	stsd := mkFullBox("stsd", 0, 0, concat(u32(1), entry))
+	init := mkBox("moov", mkBox("trak", mkBox("mdia", mkBox("minf", mkBox("stbl", stsd)))))
+	info, err := ParseInit(init)
+	if err != nil || info == nil || !info.Protected {
+		t.Fatalf("EAC3 protection not recognized: %+v, %v", info, err)
+	}
+	out := SanitizeInit(init)
+	stsdBox, ok := find(out, "moov", "trak", "mdia", "minf", "stbl", "stsd")
+	if !ok {
+		t.Fatal("sanitized init lost stsd")
+	}
+	clear, ok := find(stsdBox.payload[8:], "ec-3")
+	if !ok || !bytes.Equal(clear.payload[28:], dec3) {
+		t.Fatal("EAC3 codec or dec3 configuration was not preserved")
+	}
+	if info, err := ParseInit(out); err != nil || info != nil {
+		t.Fatalf("sanitized EAC3 still encrypted: %+v, %v", info, err)
+	}
+}

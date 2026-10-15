@@ -55,6 +55,14 @@ func parseAttrs(s string) map[string]string {
 	return attrs
 }
 
+// AppendURLParams, when set, makes resolve() carry the parent playlist's query
+// string onto any child (variant playlist, segment, key, init) that has none of
+// its own. Some CDNs sign the master URL with a path-scoped token in the query
+// and serve the relative children only when that same query rides along; plain
+// URL resolution drops it and those children 403. Off by default — inheriting a
+// query is wrong for sites that sign each URL separately — so a caller opts in.
+var AppendURLParams bool
+
 func resolve(base, ref string) string {
 	if ref == "" {
 		return ""
@@ -67,7 +75,11 @@ func resolve(base, ref string) string {
 	if err != nil {
 		return ref
 	}
-	return b.ResolveReference(r).String()
+	out := b.ResolveReference(r)
+	if AppendURLParams && out.RawQuery == "" && b.RawQuery != "" {
+		out.RawQuery = b.RawQuery
+	}
+	return out.String()
 }
 
 // ParseMaster parses a master playlist. If body is a media playlist, it

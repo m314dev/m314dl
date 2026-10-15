@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/mohamed/m314dl/internal/manifest"
@@ -19,6 +20,13 @@ type Input struct {
 	Default  bool
 }
 
+func exeName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
+}
+
 // FindFFmpeg resolves the ffmpeg binary. An explicit path (from -ffmpeg) wins —
 // it may be an absolute/relative path or a bare name found on PATH; otherwise it
 // looks next to our binary, then on PATH.
@@ -30,7 +38,7 @@ func FindFFmpeg(explicit string) (string, error) {
 		return "", fmt.Errorf("ffmpeg not usable at %q", explicit)
 	}
 	if exe, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(exe), "ffmpeg")
+		cand := filepath.Join(filepath.Dir(exe), exeName("ffmpeg"))
 		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
 			return cand, nil
 		}

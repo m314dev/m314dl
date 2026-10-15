@@ -162,6 +162,11 @@ verification is on by default and only skipped with an explicit `-insecure`.
   `.zip`, anything) and it downloads over many byte-range connections at once,
   with the same resume/retry; a single connection when the server won't do
   ranges.
+- **IPTV M3U lists** (URL or local file): each `#EXTINF` entry downloads as its
+  own title to `<-o dir>/<group-title>/<title>.<ext>`, one after another.
+  Select with `-list` / `-pick 3,7-12` / `-group REGEX` / `-match REGEX`; live
+  channels are skipped and finished titles are skipped on a rerun.
+  `-titles N` downloads N titles at once under one combined progress line.
 
 ### Decryption
 
@@ -206,9 +211,12 @@ verification is on by default and only skipped with an explicit `-insecure`.
 ### Subtitles
 
 - WebVTT (concatenated segments deduped), TTML→SRT (lenient regex parsing —
-  survives non-compliant XML), stpp-in-fMP4 extracted natively (no ffmpeg TTML
-  gap), muxed with correct ISO 639-2 language tags — or written as sidecar files
-  with `-sub-external`.
+  survives non-compliant XML), and native fMP4 `wvtt`/`stpp` extraction.
+  `wvtt` timing comes from the MP4 sample metadata, including empty gaps and
+  cues split across samples; SRT/VTT conversion does not require FFmpeg.
+  Subtitles are muxed with ISO 639-2 language tags or written as sidecars with
+  `-sub-external`. If conversion fails, the raw subtitle file is kept for
+  recovery even after successful video/audio muxing without `-keep-temp`.
 
 ### Input & scraping
 
@@ -279,6 +287,12 @@ m314dl -live-duration 1h -o show.mp4 https://example.com/live.m3u8
 m314dl -o video.mp4 https://example.com/watch/12345
 
 # resume an interrupted VOD download: just rerun the same command
+
+# IPTV M3U list: number the entries, then download some of them into Movies/
+m314dl -list playlist.m3u
+m314dl -o Movies -group 'movies' -match 'batman' -t 1 playlist.m3u
+# three titles at once, one connection each
+m314dl -o Movies -pick 1-40 -titles 3 -t 1 playlist.m3u
 ```
 
 Run `m314dl -h` for all flags.
@@ -383,12 +397,22 @@ stalls everyone on the slowest client).
 ### DASH output
 
 `GET /live.mpd` — a SegmentTemplate + SegmentTimeline manifest plus the same
-in-memory fMP4 segments (one AdaptationSet per media type, one Representation
-per track, each timeline built from real segment durations). A live source
-produces a `dynamic` MPD with `minimumUpdatePeriod`; a finite one is served the
-same way while it downloads and becomes a `static`, fully-seekable MPD once it
-completes. Needs an fMP4 source (a TS source must be remuxed first — a later
-phase).
+fMP4 segments (one AdaptationSet per track; live segments in memory, VOD on
+disk). A live source produces a `dynamic` MPD with `minimumUpdatePeriod`.
+VOD is currently presented like a live broadcast too: it stays `dynamic` until
+both the download has completed and the full published duration has elapsed
+since the publisher started. Only then does it become `static` and fully
+seekable. This player-compatibility behavior is intentional; downloading a
+two-hour film in five minutes does not make its MPD static after five minutes.
+Needs an fMP4 source (a TS source must be remuxed first — a later phase).
+
+The first MPD request waits briefly for every track's first segment. If a track
+is still missing, the server returns HTTP 503 with `Retry-After: 1`, not a
+successful MPD with an empty timeline. Retry once the source is ready.
+
+Audio codecs, including EAC3 (`ec-3`), are passed through rather than converted
+to AAC. The player must support the selected codec. Verbose logs (`-v`) list
+selected video/audio tracks in both `-serve` and worker mode.
 
 Scope today: HLS and DASH output are copy-only (same container family, no
 FFmpeg); MPEG-TS output copies a TS source in pure Go and remuxes an fMP4 or

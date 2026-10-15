@@ -57,6 +57,8 @@ type Config struct {
 	// inherits every property the file path has (adaptive concurrency, CENC/
 	// AES-128/BBTS decrypt, live refresh, hole tolerance).
 	Sink Sink
+
+	fileURL *fileURL // direct file behind an expiring redirect; set by DownloadFile
 }
 
 // Sink is the destination for one stream's ordered, decrypted segments. It is
@@ -202,11 +204,21 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	}
 	writerDone := make(chan error, 1)
 	go func() {
+		var err error
 		if cfg.Sink != nil {
-			writerDone <- sinkWriter(ctx, cfg, st.Live, outPath, state, kc, dec, trackID, results)
+			err = sinkWriter(ctx, cfg, st.Live, outPath, state, kc, dec, trackID, results)
 		} else {
-			writerDone <- writer(ctx, cfg, st.Live, out, outPath, state, kc, dec, trackID, results)
+			err = writer(ctx, cfg, st.Live, out, outPath, state, kc, dec, trackID, results)
 		}
+		if err != nil {
+			// The writer is the only consumer of `results`. Once it dies the
+			// workers fill the buffer and park, the feeder parks on `items`, and
+			// nothing below ever returns — the process sits on the same progress
+			// line forever with no sockets open. Cancel so both unwind; the
+			// writer's error is what the caller sees (feedErr is then Canceled).
+			cancel()
+		}
+		writerDone <- err
 	}()
 
 	feedErr := feed(ctx, cfg, st, refresh, state, items)
@@ -860,14 +872,71 @@ func DownloadFile(ctx context.Context, cfg Config, st *manifest.Stream, outPath 
 	}
 	cfg.Verbatim = true
 	cfg.AdFilters = nil // a URL filter meant for ad segments must not blank out the file
+	// Already finished: full size on disk and no checkpoint. Without this check
+	// a rerun (or a playlist rerun over done titles) finds no checkpoint, so
+	// openOutput truncates and the whole file downloads again.
+	if r := st.Segments[len(st.Segments)-1].Range; r != nil {
+		if fi, err := os.Stat(outPath); err == nil && fi.Size() == r.End+1 {
+			if _, err := os.Stat(statePath(outPath)); errors.Is(err, os.ErrNotExist) {
+				cfg.Verbose("%s already complete", outPath)
+				if cfg.Progress != nil {
+					cfg.Progress.AddTotal(1)
+					cfg.Progress.AddDone(1)
+				}
+				return nil
+			}
+		}
+	}
+	u := st.Segments[0].URL
+	if st.PlaylistURL != "" && st.PlaylistURL != u {
+		cfg.fileURL = &fileURL{origin: st.PlaylistURL, cur: u}
+	}
 	err := DownloadStream(ctx, cfg, st, outPath, nil)
 	if !errors.Is(err, ErrRangeIgnored) {
 		return err
 	}
 	cfg.Verbose("server ignored byte ranges; downloading on one connection")
+	if cfg.fileURL != nil {
+		u = cfg.fileURL.get()
+	}
 	single := *st
-	single.Segments = []manifest.Segment{{URL: st.Segments[0].URL}}
+	single.Segments = []manifest.Segment{{URL: u}}
 	return DownloadStream(ctx, cfg, &single, outPath, nil)
+}
+
+// fileURL is a direct file's current download URL, re-resolvable from the URL
+// the user gave. IPTV panels (Xtream Codes / XUI) and signed-redirect hosts
+// redirect to a short-lived token URL; a long chunked download outlives it and
+// its later chunks are refused (406, 403). Requesting the origin again mints a
+// fresh token.
+type fileURL struct {
+	origin string
+	mu     sync.Mutex
+	cur    string
+}
+
+func (f *fileURL) get() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cur
+}
+
+// refresh replaces stale with a freshly resolved URL. Workers refused on the
+// same stale URL share one re-resolve: the lock is held across the request, so
+// the rest wait for it and then find cur already moved on.
+func (f *fileURL) refresh(ctx context.Context, c *httpx.Client, stale string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cur != stale {
+		return nil
+	}
+	resp, err := c.Open(ctx, f.origin, "bytes=0-0")
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	f.cur = httpx.FinalURL(resp, f.origin)
+	return nil
 }
 
 // ---- single big file ----

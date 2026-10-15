@@ -10,8 +10,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mohamed/m314dl/internal/dash"
+	"github.com/mohamed/m314dl/internal/hls"
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/mohamed/m314dl/internal/mss"
 )
 
 // A plain file (mp4, mkv, zip, iso, …) is downloaded by the same pipeline as a
@@ -60,6 +63,14 @@ func planChunks(size int64) []manifest.ByteRange {
 // endpoint may well carry stream URLs) unless it's served as an attachment or
 // is far too big to be a playlist or page.
 func isDirectFile(resp *http.Response, head []byte) bool {
+	// A body that is itself a manifest is never a direct file, whatever the
+	// headers claim. Some CDNs force-download playlists with
+	// Content-Disposition: attachment (Tencent COS sets it on every object),
+	// which would otherwise save the raw .m3u8/.mpd as the "download". Sniff
+	// the bytes, which are decisive, before trusting the header.
+	if hls.IsHLS(head) || dash.IsDASH(head) || mss.IsMSS(head) {
+		return false
+	}
 	if strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Disposition")), "attachment") {
 		return true
 	}
@@ -78,16 +89,20 @@ func isHTML(contentType string) bool {
 }
 
 // fileName picks the output filename: the Content-Disposition filename, else
-// the final URL's basename; the real extension is kept. Reduced to a bare
-// basename so a hostile header can't point outside the output directory.
-func fileName(resp *http.Response, finalURL string) string {
+// the final URL's basename — or the given URL's, when a redirect landed on an
+// opaque token path with no extension (IPTV panels, signed CDNs) and the given
+// URL names the file. That name is also stable across runs, which resume needs:
+// the token changes every time. Reduced to a bare basename so a hostile header
+// can't point outside the output directory.
+func fileName(resp *http.Response, inputURL, finalURL string) string {
 	name := ""
 	if _, params, err := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); err == nil {
 		name = params["filename"]
 	}
 	if name == "" {
-		if u, err := url.Parse(finalURL); err == nil {
-			name = path.Base(u.Path)
+		name = urlBase(finalURL)
+		if in := urlBase(inputURL); filepath.Ext(name) == "" && filepath.Ext(in) != "" {
+			name = in
 		}
 	}
 	name = filepath.Base(strings.TrimSpace(name))
@@ -101,13 +116,24 @@ func fileName(resp *http.Response, finalURL string) string {
 	return name
 }
 
+func urlBase(s string) string {
+	u, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	return path.Base(u.Path)
+}
+
 // fileMaster builds the single-stream master for a direct file. When the
 // length is known and a byte-range probe is honored, the stream is the object
 // sliced into ranges; otherwise (unknown/chunked length, ranges ignored, or a
 // file no bigger than one slice) it is one whole-object segment, which the
 // engine streams on a single connection with byte-offset resume.
-func fileMaster(ctx context.Context, client *httpx.Client, resp *http.Response, finalURL string, logv func(string, ...any)) *manifest.Master {
-	st := &manifest.Stream{Type: manifest.Unknown, ID: "file", Name: fileName(resp, finalURL), PlaylistURL: finalURL}
+//
+// PlaylistURL is the URL as given, before redirects: re-requesting it mints a
+// fresh redirect token when the one in finalURL expires mid-download.
+func fileMaster(ctx context.Context, client *httpx.Client, resp *http.Response, inputURL, finalURL string, logv func(string, ...any)) *manifest.Master {
+	st := &manifest.Stream{Type: manifest.Unknown, ID: "file", Name: fileName(resp, inputURL, finalURL), PlaylistURL: inputURL}
 	size := resp.ContentLength
 	var chunks []manifest.ByteRange
 	if size > fileChunk && rangesHonored(ctx, client, finalURL, size) {

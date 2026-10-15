@@ -52,7 +52,7 @@ func walk(buf []byte, fn func(b box) bool) error {
 // readBox parses one box header at off and returns the box plus the offset of
 // the following box.
 func readBox(buf []byte, off int64) (box, int64, error) {
-	if off+8 > int64(len(buf)) {
+	if off < 0 || off > int64(len(buf))-8 {
 		return box{}, 0, errors.New("mp4: truncated box header")
 	}
 	size := int64(binary.BigEndian.Uint32(buf[off:]))
@@ -68,7 +68,7 @@ func readBox(buf []byte, off int64) (box, int64, error) {
 	case 0: // extends to end of buffer
 		size = int64(len(buf)) - off
 	}
-	if size < hdr || off+size > int64(len(buf)) {
+	if size < hdr || size > int64(len(buf))-off {
 		return box{}, 0, fmt.Errorf("mp4: box %q size %d out of range at %d", typ, size, off)
 	}
 	return box{typ: typ, off: off, hdrLen: hdr, payload: buf[off+hdr : off+size]}, off + size, nil

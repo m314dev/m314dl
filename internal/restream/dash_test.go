@@ -75,11 +75,9 @@ func TestDASHManifestVODGrowing(t *testing.T) {
 	}
 }
 
-// Completion is the DASH-IF live-to-VOD transition: the MPD stays dynamic
-// (a static MPD mid-session makes dash.js end at its buffered position), gains
-// mediaPresentationDuration and drops minimumUpdatePeriod so sessions stop
-// refreshing. Only once the wall clock has passed the end — no live session can
-// remain — does it turn into a plain static VOD for late joiners.
+// Completion alone does not change the MPD: it stays dynamic with refreshes
+// until the wall clock has passed the published duration. Only then is a
+// static VOD with mediaPresentationDuration returned to late joiners.
 func TestDASHManifestVODCompletionPhases(t *testing.T) {
 	pub, vs, as := dashPub(t, false)
 	clock := pub.start

@@ -65,12 +65,21 @@ func TestFileName(t *testing.T) {
 		if c.cd != "" {
 			resp.Header.Set("Content-Disposition", c.cd)
 		}
-		if got := fileName(resp, c.url); got != c.want {
+		if got := fileName(resp, c.url, c.url); got != c.want {
 			t.Errorf("fileName(%q, %q) = %q, want %q", c.cd, c.url, got, c.want)
 		}
 	}
+	// Redirect to an extensionless token path: the given URL names the file.
+	// One with an extension of its own wins over the given URL's.
+	plain := &http.Response{Header: http.Header{}}
+	if got := fileName(plain, "http://ott/movie/u/p/835115.mkv", "http://157.1.1.1/Z3VjV2tyVTJn"); got != "835115.mkv" {
+		t.Errorf("token redirect: got %q, want 835115.mkv", got)
+	}
+	if got := fileName(plain, "http://h/get.php?id=5", "http://cdn/real.mp4"); got != "real.mp4" {
+		t.Errorf("named redirect: got %q, want real.mp4", got)
+	}
 	long := &http.Response{Header: http.Header{"Content-Disposition": {`attachment; filename="` + strings.Repeat("a", 300) + `.tar.gz"`}}}
-	if got := fileName(long, ""); len(got) > 200 || !strings.HasSuffix(got, ".gz") {
+	if got := fileName(long, "", ""); len(got) > 200 || !strings.HasSuffix(got, ".gz") {
 		t.Fatalf("long name not capped with extension kept: %d %q", len(got), got[len(got)-10:])
 	}
 }
@@ -97,6 +106,13 @@ func fileServer(t *testing.T, big []byte) *httptest.Server {
 	master := "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nv.m3u8\n"
 	mux.HandleFunc("/playlist.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream") // CDNs do this
+		fmt.Fprint(w, master)
+	})
+	// A CDN that force-downloads every object (Tencent COS) sends a real HLS
+	// master with Content-Disposition: attachment. The body wins over the header.
+	mux.HandleFunc("/forced.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-mpegURL")
+		w.Header().Set("Content-Disposition", "attachment")
 		fmt.Fprint(w, master)
 	})
 	mux.HandleFunc("/page.html", func(w http.ResponseWriter, r *http.Request) {
@@ -166,6 +182,7 @@ func TestLoadManifestDetect(t *testing.T) {
 		name       string // file: expected filename
 	}{
 		{"/playlist.m3u8", "hls", 0, ""},
+		{"/forced.m3u8", "hls", 0, ""}, // attachment must not beat a manifest body
 		{"/page.html", "hls", 0, ""},
 		{"/json", "hls", 0, ""}, // textual non-HTML still scrapes
 		{"/blob.bin", FileKind, 3, "blob.bin"},

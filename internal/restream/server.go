@@ -52,14 +52,21 @@ const (
 
 // readyTimeout bounds how long a manifest request waits for the first segment
 // of every track. Under every common player's manifest timeout (dash.js 10s,
-// Shaka 30s); past it the manifest is served as is.
+// Shaka 30s); past it an incomplete DASH presentation returns a retryable 503.
 const readyTimeout = 8 * time.Second
 
 func (s *Server) mpd(w http.ResponseWriter, r *http.Request) {
 	s.pub.WaitReady(r.Context(), readyTimeout)
 	cors(w)
-	w.Header().Set("Content-Type", mimeMPD)
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	if !s.pub.Ready() {
+		// A timeout (or failed download) doesn't make an empty timeline valid.
+		// Never let a player initialize successfully on an unplayable MPD.
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "DASH presentation not ready: waiting for a segment from every track", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", mimeMPD)
 	// ServeContent (not a bare Write) so the response carries Content-Length and
 	// answers Range requests: ffmpeg's DASH demuxer sends "Range: bytes=0-" and
 	// cannot finalize a chunked, length-less manifest reply ("Unable to read to

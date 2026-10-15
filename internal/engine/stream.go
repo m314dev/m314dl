@@ -56,7 +56,11 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 
 	pressure := 0
 	backoff := 500 * time.Millisecond
+	u, refreshed := it.url, false
 	for attempt := 0; ; attempt++ {
+		if cfg.fileURL != nil {
+			u = cfg.fileURL.get() // another worker may have re-resolved it
+		}
 		rngHdr := resumeRange(it.rng != nil, segStart, segEnd, have)
 		// Per-attempt idle watchdog: a throttling CDN (common when concurrency is
 		// pushed high) often holds the connection open and sends nothing rather
@@ -68,7 +72,7 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 		// cancelled attempt as retryable, not fatal.
 		reqCtx, cancel := context.WithCancel(ctx)
 		wd := time.AfterFunc(segIdleTimeout, cancel)
-		resp, err := cfg.Client.RangeGet(reqCtx, it.url, rngHdr)
+		resp, err := cfg.Client.RangeGet(reqCtx, u, rngHdr)
 		if err != nil {
 			wd.Stop()
 			cancel()
@@ -123,8 +127,18 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			if httpx.Retriable(code) {
 				pressure++
 			}
+			// A refused token (see fileURL): re-resolve once per segment. Once,
+			// so a server refusing for another reason still fails the segment.
+			if (code == http.StatusNotAcceptable || code == http.StatusForbidden) &&
+				cfg.fileURL != nil && !refreshed && ctx.Err() == nil {
+				refreshed = true
+				if err := cfg.fileURL.refresh(ctx, cfg.Client, u); err == nil {
+					cfg.Verbose("HTTP %d on %s; re-resolved the file URL", code, u)
+					continue
+				}
+			}
 			if !httpx.Retriable(code) || attempt >= cfg.Client.Retries() || ctx.Err() != nil {
-				return pressure, &httpx.StatusError{Code: code, URL: it.url}
+				return pressure, &httpx.StatusError{Code: code, URL: u}
 			}
 			if !retryWait(ctx, &backoff, ra) {
 				return pressure, ctx.Err()

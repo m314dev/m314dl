@@ -157,3 +157,63 @@ func TestDownloadFileShortRange(t *testing.T) {
 	}
 	assertFile(t, out, body)
 }
+
+// An expiring redirect token (Xtream-style IPTV panels, signed-URL hosts): once
+// the token is refused its chunks get 406, and the download re-resolves the
+// origin for a fresh one — once, shared by every worker — instead of failing.
+func TestDownloadFileReresolvesRefusedToken(t *testing.T) {
+	body := fileBody(5000)
+	var mu sync.Mutex
+	token, resolves, firstUses := 1, 0, 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/movie.mkv":
+			resolves++
+			token++
+			http.Redirect(w, r, fmt.Sprintf("/tok/%d", token), http.StatusFound)
+			return
+		case "/tok/1":
+			if firstUses++; firstUses > 2 {
+				w.WriteHeader(http.StatusNotAcceptable) // token expired
+				return
+			}
+		}
+		http.ServeContent(w, r, "f", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+	client, _ := httpx.New(httpx.Options{Retries: 1})
+	st := rangedStream(srv.URL+"/tok/1", 5000, 1000)
+	st.PlaylistURL = srv.URL + "/movie.mkv"
+	out := filepath.Join(t.TempDir(), "f.bin")
+	if err := DownloadFile(context.Background(), Config{Client: client, Threads: 3}, st, out); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, out, body)
+	if resolves != 1 {
+		t.Fatalf("origin re-resolved %d times, want 1", resolves)
+	}
+}
+
+// A finished chunked file (full size, no checkpoint) is left alone on a rerun:
+// without the check, the missing checkpoint truncates it and it downloads again.
+func TestDownloadFileCompleteIsNotRefetched(t *testing.T) {
+	body := fileBody(5000)
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.ServeContent(w, r, "f", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+	client, _ := httpx.New(httpx.Options{Retries: 1})
+	out := filepath.Join(t.TempDir(), "f.bin")
+	os.WriteFile(out, body, 0o644)
+	if err := DownloadFile(context.Background(), Config{Client: client, Threads: 2}, rangedStream(srv.URL, 5000, 1000), out); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, out, body)
+	if requests != 0 {
+		t.Fatalf("%d requests for a finished file", requests)
+	}
+}

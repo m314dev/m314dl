@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/mohamed/m314dl/internal/hls"
 	"github.com/mohamed/m314dl/internal/httpx"
 	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/mohamed/m314dl/internal/mp4"
 	"github.com/mohamed/m314dl/internal/mux"
 	"github.com/mohamed/m314dl/internal/pick"
 	"github.com/mohamed/m314dl/internal/rpc"
@@ -41,16 +43,22 @@ import (
 	"github.com/mohamed/m314dl/internal/worker"
 )
 
-const version = "0.3.5"
+const version = "0.3.6"
 
 type multiFlag []string
 
 func (m *multiFlag) String() string     { return strings.Join(*m, ", ") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
+type helpOption struct {
+	name  string
+	value string
+}
+
 type options struct {
 	output           string
 	threads          int
+	multiTracks      bool
 	headers          multiFlag
 	curl             string
 	cookies          string
@@ -61,6 +69,7 @@ type options struct {
 	listOnly         bool
 	sv, sa, ss       string
 	adKeywords       multiFlag
+	appendURLParams  bool
 	liveLimit        time.Duration
 	liveFromStart    bool
 	noMux            bool
@@ -84,6 +93,10 @@ type options struct {
 	worker           string
 	workerSecret     string
 	workerMaxChan    int
+	pick             string
+	titles           int
+	group            string
+	match            string
 }
 
 func main() {
@@ -93,10 +106,94 @@ func main() {
 	}
 }
 
+// printUsage keeps the command-line help short enough to scan. The standard
+// flag package prints one long alphabetical list, which hides the options most
+// people need for a normal download among the server-only settings.
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, "m314dl %s — HLS/DASH/MSS media downloader\n\n", version)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  m314dl [options] URL")
+	fmt.Fprintln(w, "  m314dl -serve ADDRESS [options] URL")
+	fmt.Fprintln(w, "  m314dl -rpc ADDRESS [server options]")
+	fmt.Fprintln(w, "  m314dl -worker ADDRESS [server options]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "URL can be an HLS/DASH/Smooth playlist, a web page containing one, a normal file,")
+	fmt.Fprintln(w, "or an IPTV M3U list (URL or local file) whose entries are downloaded one by one.")
+	fmt.Fprintln(w, "Flags may go before or after the URL.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  m314dl URL")
+	fmt.Fprintln(w, "      Download the best video, its preferred audio, and subtitles.")
+	fmt.Fprintln(w, "  m314dl -o movie.mp4 -t 16 URL")
+	fmt.Fprintln(w, "      Save as movie.mp4 and use up to 16 segment downloads per track.")
+	fmt.Fprintln(w, "  m314dl -mt -sv best -sa 'lang=^en' URL")
+	fmt.Fprintln(w, "      Download selected tracks at the same time, with English audio when available.")
+	fmt.Fprintln(w, "  m314dl -list URL")
+	fmt.Fprintln(w, "      Show available video, audio, and subtitle tracks without downloading.")
+	fmt.Fprintln(w, "  m314dl -o Movies -group 'movies' -match 'batman' -t 1 playlist.m3u")
+	fmt.Fprintln(w, "      Download the matching titles of an M3U list into Movies/<group>/<title>.")
+	fmt.Fprintln(w)
+
+	printUsageSection(w, "Basic download", []helpOption{
+		{"o", "FILE"}, {"t", "N"}, {"mt", ""}, {"list", ""},
+		{"no-mux", ""}, {"keep", ""}, {"v", ""},
+	})
+	printUsageSection(w, "Choose tracks and live recording", []helpOption{
+		{"sv", "SELECTOR"}, {"sa", "SELECTOR"}, {"ss", "SELECTOR"},
+		{"ad-keyword", "REGEX"}, {"live-duration", "DURATION"}, {"live-from-start", ""},
+	})
+	printUsageSection(w, "M3U playlists (IPTV lists: one download per entry)", []helpOption{
+		{"pick", "LIST"}, {"group", "REGEX"}, {"match", "REGEX"}, {"titles", "N"},
+	})
+	printUsageSection(w, "Input and network", []helpOption{
+		{"curl", "SOURCE"}, {"H", "HEADER"}, {"cookies", "FILE"}, {"proxy", "URL"},
+		{"insecure", ""}, {"retries", "N"}, {"timeout", "DURATION"}, {"progress-interval", "DURATION"},
+	})
+	printUsageSection(w, "Decryption and subtitles", []helpOption{
+		{"key", "KID:KEY"}, {"bbts-key", "HEX_KEY"}, {"sub-format", "srt|vtt"},
+		{"sub-external", ""}, {"ffmpeg", "PATH"},
+	})
+	printUsageSection(w, "Restream a selected presentation", []helpOption{
+		{"serve", "ADDRESS"}, {"serve-format", "hls|ts|dash"},
+		{"serve-transcode", "FFMPEG_ARGS"}, {"spool-dir", "DIR"},
+	})
+	printUsageSection(w, "Run as a server", []helpOption{
+		{"rpc", "ADDRESS"}, {"rpc-secret", "TOKEN"}, {"rpc-max-jobs", "N"}, {"rpc-retain", "DURATION"},
+		{"worker", "ADDRESS"}, {"worker-secret", "TOKEN"}, {"worker-max-channels", "N"},
+	})
+	printUsageSection(w, "Other", []helpOption{{"no-update-check", ""}, {"version", ""}})
+}
+
+func printUsageSection(w io.Writer, title string, options []helpOption) {
+	fmt.Fprintf(w, "%s:\n", title)
+	for _, option := range options {
+		f := flag.Lookup(option.name)
+		if f == nil { // Keep help usable if a flag is removed later.
+			continue
+		}
+		label := "-" + f.Name
+		if option.value != "" {
+			label += " " + option.value
+		}
+		fmt.Fprintf(w, "  %-29s %s%s\n", label, f.Usage, usageDefault(f))
+	}
+	fmt.Fprintln(w)
+}
+
+func usageDefault(f *flag.Flag) string {
+	// Empty values, false, and zero normally have special meanings described in
+	// the option text, so repeating them as a default would add noise.
+	if f.DefValue == "" || f.DefValue == "false" || f.DefValue == "0" || f.DefValue == "0s" {
+		return ""
+	}
+	return " (default: " + f.DefValue + ")"
+}
+
 func run() error {
 	var o options
-	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4). Direct file: used as given, default the server's/URL's filename")
+	flag.StringVar(&o.output, "o", "", "output file (extension selects container; default from URL, .mp4). Direct file: used as given, default the server's/URL's filename. M3U playlist: output directory")
 	flag.IntVar(&o.threads, "t", 0, "concurrent segment downloads per stream (direct file: parallel connections) — a fixed count, held (backs off only on rate limits, then climbs back). Omit to auto-tune (up to 64)")
+	flag.BoolVar(&o.multiTracks, "mt", false, "download selected tracks concurrently (default: one track at a time)")
 	flag.Var(&o.headers, "H", "custom header 'Key: Value' (repeatable)")
 	flag.StringVar(&o.curl, "curl", "", "take the URL and headers from a copy-as-curl command: a file path, '-' for stdin, or the command itself. For a browser copy-as-curl use a file or stdin — its quotes break an inline shell argument. -H overrides its headers")
 	flag.BoolVar(&o.noUpdateCheck, "no-update-check", false, "don't check GitHub for a newer release (also M314DL_NO_UPDATE_CHECK=1)")
@@ -104,11 +201,16 @@ func run() error {
 	flag.StringVar(&o.proxy, "proxy", "", "proxy URL (http://, socks5://, user:pass@ ok)")
 	flag.BoolVar(&o.insecure, "insecure", false, "skip TLS certificate verification")
 	flag.IntVar(&o.retries, "retries", 5, "retries per request (covers mid-body failures)")
-	flag.BoolVar(&o.listOnly, "list", false, "list streams and exit")
+	flag.BoolVar(&o.listOnly, "list", false, "list streams (or M3U playlist entries) and exit")
+	flag.StringVar(&o.pick, "pick", "", "M3U playlist: download only these entry numbers from -list, e.g. 3,7-12")
+	flag.IntVar(&o.titles, "titles", 1, "M3U playlist: titles downloaded at the same time (each uses up to -t connections)")
+	flag.StringVar(&o.group, "group", "", "M3U playlist: download only entries whose group-title matches this regex (case-insensitive)")
+	flag.StringVar(&o.match, "match", "", "M3U playlist: download only entries whose title matches this regex (case-insensitive)")
 	flag.StringVar(&o.sv, "sv", "best", "video select: best|worst|all|bestN|key=regex[:...] (keys: id,lang,name,codecs,res,bwmin,bwmax)")
 	flag.StringVar(&o.sa, "sa", "", "audio select (default: best per language, video's group preferred)")
 	flag.StringVar(&o.ss, "ss", "", "subtitle select (default: all)")
 	flag.Var(&o.adKeywords, "ad-keyword", "regex; matching segment URLs are skipped as ads (repeatable, live too)")
+	flag.BoolVar(&o.appendURLParams, "append-url-params", false, "carry the input/playlist URL's query string onto relative child URLs (variant playlists, segments, keys) that have none — for CDNs that sign the master with a path-scoped token and 403 the children without it")
 	flag.DurationVar(&o.liveLimit, "live-duration", 0, "stop live recording after this duration (e.g. 1h30m)")
 	flag.BoolVar(&o.liveFromStart, "live-from-start", false, "live: download the whole DVR window instead of starting at the live edge")
 	flag.BoolVar(&o.noMux, "no-mux", false, "keep raw per-stream files, skip ffmpeg")
@@ -133,10 +235,7 @@ func run() error {
 	flag.StringVar(&o.workerSecret, "worker-secret", "", "bearer token for -worker control API (required when binding a non-loopback address)")
 	flag.IntVar(&o.workerMaxChan, "worker-max-channels", 32, "-worker: max concurrent channels; further starts get 503 (0 = unlimited)")
 	showVersion := flag.Bool("version", false, "print version")
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "m314dl %s — HLS/DASH/MSS media downloader\n\nusage: m314dl [flags] <URL>\n\n", version)
-		flag.PrintDefaults()
-	}
+	flag.Usage = func() { printUsage(flag.CommandLine.Output()) }
 	// Flags may appear in any order relative to the URL. Go's flag package stops
 	// at the first non-flag arg, so parse in a loop: keep the positional it stops
 	// on and resume parsing the rest. Flags before, after, or around the URL all
@@ -156,6 +255,7 @@ func run() error {
 		fmt.Println("m314dl", version)
 		return nil
 	}
+	hls.AppendURLParams = o.appendURLParams
 	if o.rpc != "" {
 		if len(positionals) != 0 {
 			return fmt.Errorf("-rpc takes no URL; submit jobs via POST /add")
@@ -256,7 +356,6 @@ func run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stopLive := make(chan struct{})
 
 	// fetch + detect manifest (scraping web pages transparently)
 	master, kind, err := source.LoadManifest(ctx, client, inputURL, logv)
@@ -267,8 +366,59 @@ func run() error {
 	if tPinned {
 		threadCeiling = o.threads
 	}
+	j := job{o: &o, client: client, threads: threadCeiling, adFilters: adFilters, keys: keys, bbtsKey: bbtsKey, logv: logv}
+	if kind == source.PlaylistKind {
+		return downloadPlaylist(ctx, cancel, j, master)
+	}
+	return j.download(ctx, cancel, inputURL, master, kind)
+}
+
+// job is what a download needs besides its URL: settled once per run and
+// shared by every entry of an M3U playlist.
+type job struct {
+	o         *options
+	client    *httpx.Client
+	threads   int // -t ceiling; 0 = auto-tune
+	adFilters []*regexp.Regexp
+	keys      map[[16]byte][]byte
+	bbtsKey   []byte
+	logv      func(string, ...any)
+	skipLive  bool             // playlist entry: a live stream is skipped (errLiveEntry), not recorded
+	prog      *engine.Progress // playlist -titles >1: one status line shared by the titles in flight
+}
+
+// say prints a status message, through the shared status line when there is one.
+func (j job) say(format string, args ...any) {
+	if j.prog != nil {
+		j.prog.Log(fmt.Sprintf(format, args...))
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+// progress is the status line for one download: its own, drawn until stop is
+// called, or the playlist's shared one, which the playlist stops.
+func (j job) progress(live bool) (prog *engine.Progress, stop func()) {
+	if j.prog != nil {
+		return j.prog, func() {}
+	}
+	prog = engine.NewProgress(live, j.o.progressInterval)
+	done := make(chan struct{})
+	go prog.Render(done)
+	return prog, func() {
+		close(done)
+		time.Sleep(50 * time.Millisecond) // let renderer print the final line
+	}
+}
+
+// download runs one loaded input to its output: a direct file as-is, a
+// manifest through selection, download, and mux.
+func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL string, master *manifest.Master, kind string) error {
+	o, client, threadCeiling, logv := j.o, j.client, j.threads, j.logv
+	keys, bbtsKey, adFilters := j.keys, j.bbtsKey, j.adFilters
+	stopLive := make(chan struct{})
 	if kind == source.FileKind {
-		return downloadFile(ctx, cancel, &o, client, master.Streams[0], threadCeiling, logv)
+		return j.downloadFile(ctx, cancel, master.Streams[0])
 	}
 
 	ve, err := pick.ParseExpr(o.sv)
@@ -300,7 +450,7 @@ func run() error {
 		return fmt.Errorf("no streams matched the selection")
 	}
 	for _, st := range selected {
-		fmt.Fprintf(os.Stderr, "selected: %-4s %s\n", st.ID, st)
+		j.say("selected: %-4s %s", st.ID, st)
 	}
 
 	// expand HLS media playlists for selected streams only
@@ -331,6 +481,9 @@ func run() error {
 			return fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
 		}
 	}
+	if live && j.skipLive {
+		return errLiveEntry
+	}
 
 	// Restream mode: republish live HLS over HTTP instead of downloading a file.
 	if o.serve != "" {
@@ -347,9 +500,7 @@ func run() error {
 
 	interruptHandler(live, stopLive, cancel)
 
-	prog := engine.NewProgress(live, o.progressInterval)
-	progStop := make(chan struct{})
-	go prog.Render(progStop)
+	prog, stopProg := j.progress(live)
 
 	cfg := engine.Config{
 		Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey, AdFilters: adFilters,
@@ -375,12 +526,16 @@ func run() error {
 	// handful hides its latency, and the cap keeps total in-flight requests
 	// bounded (streamPar × workers) even with 25 subtitle tracks and a big -t.
 	const subWorkerCap = 16
-	streamPar := len(results)
-	if streamPar < 4 {
-		streamPar = 4
-	} else if streamPar > 16 {
-		streamPar = 16
+	streamPar := 1
+	if o.multiTracks {
+		streamPar = len(results)
+		if streamPar < 4 {
+			streamPar = 4
+		} else if streamPar > 16 {
+			streamPar = 16
+		}
 	}
+
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(streamPar)
 	tDownload := time.Now()
@@ -402,7 +557,7 @@ func run() error {
 				// Video/audio failures stay fatal — there's no output without them.
 				if r.st.Type == manifest.Subtitles {
 					r.failed = true
-					fmt.Fprintf(os.Stderr, "warning: subtitle %s failed to download (%v); skipping it\n", r.st.ID, err)
+					j.say("warning: subtitle %s failed to download (%v); skipping it", r.st.ID, err)
 					return nil
 				}
 				return fmt.Errorf("stream %s: %w", r.st.ID, err)
@@ -413,8 +568,7 @@ func run() error {
 	err = g.Wait()
 	logv("phase download: %s (%d streams)", time.Since(tDownload).Round(time.Millisecond), len(results))
 	tFinalize := time.Now()
-	close(progStop)
-	time.Sleep(50 * time.Millisecond) // let renderer print the final line
+	stopProg()
 	if err != nil {
 		return err
 	}
@@ -424,6 +578,7 @@ func run() error {
 	var sidecars []string             // -sub-external: files written beside output
 	wentExternal := map[string]bool{} // raw paths whose subtitle became a sidecar
 	subSidecars := map[string]bool{}  // sidecar paths already used (collision guard)
+	keepRaw := map[string]bool{}      // conversion/placement failures must remain recoverable
 	for _, r := range results {
 		if r.failed {
 			continue // subtitle that failed to download — already warned
@@ -437,14 +592,16 @@ func run() error {
 		}
 		subPath, err := convertSubtitle(r.path, o.subFormat, ffmpeg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: subtitle %s conversion failed (%v); keeping raw file %s\n", r.st.ID, err, r.path)
+			keepRaw[r.path] = true
+			j.say("warning: subtitle %s conversion failed (%v); keeping raw file %s", r.st.ID, err, r.path)
 			continue
 		}
 		if o.subExternal {
 			sidecar := sidecarSubPath(outPath, r.st, o.subFormat, subSidecars)
 			subSidecars[sidecar] = true
 			if err := os.Rename(subPath, sidecar); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not place sidecar subtitle (%v); keeping %s\n", err, subPath)
+				keepRaw[r.path] = true
+				j.say("warning: could not place sidecar subtitle (%v); keeping %s", err, subPath)
 				continue
 			}
 			sidecars = append(sidecars, sidecar)
@@ -452,7 +609,7 @@ func run() error {
 			if !o.keepTemp {
 				os.Remove(r.path) // raw payload superseded by the sidecar
 			}
-			fmt.Fprintln(os.Stderr, "subtitle: "+sidecar)
+			j.say("subtitle: %s", sidecar)
 			continue
 		}
 		muxInputs = append(muxInputs, mux.Input{
@@ -463,14 +620,14 @@ func run() error {
 	logv("phase subtitle-convert: %s", time.Since(tFinalize).Round(time.Millisecond))
 
 	if o.noMux {
-		fmt.Fprintln(os.Stderr, "done (raw streams kept):")
+		j.say("done (raw streams kept):")
 		for _, r := range results {
 			if !wentExternal[r.path] {
-				fmt.Fprintln(os.Stderr, "  "+r.path)
+				j.say("  %s", r.path)
 			}
 		}
 		for _, s := range sidecars {
-			fmt.Fprintln(os.Stderr, "  "+s)
+			j.say("  %s", s)
 		}
 		return nil
 	}
@@ -481,32 +638,51 @@ func run() error {
 		if len(sidecars) == 0 {
 			return fmt.Errorf("no streams selected to write")
 		}
-		fmt.Fprintln(os.Stderr, "done (subtitles only)")
+		j.say("done (subtitles only)")
 		return nil
 	}
 
 	tMux := time.Now()
 	if err := mux.Mux(ffmpeg, muxInputs, outPath); err != nil {
-		fmt.Fprintf(os.Stderr, "mux failed; raw stream files kept in %s\n", workDir)
+		j.say("mux failed; raw stream files kept in %s", workDir)
 		return err
 	}
 	logv("phase mux: %s (%d inputs)", time.Since(tMux).Round(time.Millisecond), len(muxInputs))
 	if !o.keepTemp {
+		var temporary []string
 		for _, in := range muxInputs {
-			os.Remove(in.Path)
+			temporary = append(temporary, in.Path)
 		}
 		for _, r := range results { // raw subtitle payloads too
-			os.Remove(r.path)
+			temporary = append(temporary, r.path)
+		}
+		cleanupTempFiles(temporary, keepRaw)
+	}
+	j.say("done: %s", outPath)
+	return nil
+}
+
+// cleanupTempFiles removes only superseded downloads, never raw subtitles
+// whose conversion failed (the warning promises those files are recoverable).
+func cleanupTempFiles(paths []string, preserve map[string]bool) {
+	for _, path := range paths {
+		if !preserve[path] {
+			os.Remove(path)
 		}
 	}
-	fmt.Fprintln(os.Stderr, "done: "+outPath)
-	return nil
 }
 
 // interruptHandler makes the first Ctrl-C/SIGTERM stop the download cleanly — a
 // live recording finishes up (stopLive closed), a VOD cancels so the next run
-// resumes — and a second one abort outright.
+// resumes — and a second one abort outright. Installed once per process: a
+// playlist installs it for the whole batch, and its entries' calls are no-ops.
 func interruptHandler(live bool, stopLive chan struct{}, cancel context.CancelFunc) {
+	interruptOnce.Do(func() { installInterruptHandler(live, stopLive, cancel) })
+}
+
+var interruptOnce sync.Once
+
+func installInterruptHandler(live bool, stopLive chan struct{}, cancel context.CancelFunc) {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -531,7 +707,8 @@ func interruptHandler(live bool, stopLive chan struct{}, cancel context.CancelFu
 // selection, no temp file, no mux — the bytes are the deliverable. -o is used
 // as given (no container extension is forced); otherwise the server's or the
 // URL's filename, extension and all.
-func downloadFile(ctx context.Context, cancel context.CancelFunc, o *options, client *httpx.Client, st *manifest.Stream, threads int, logv func(string, ...any)) error {
+func (j job) downloadFile(ctx context.Context, cancel context.CancelFunc, st *manifest.Stream) error {
+	o := j.o
 	outPath := o.output
 	if outPath == "" {
 		outPath = st.Name
@@ -544,18 +721,15 @@ func downloadFile(ctx context.Context, cancel context.CancelFunc, o *options, cl
 		fmt.Printf("file %s (%s)\n", st.Name, size)
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "file: %s (%s)\n", outPath, size)
+	j.say("file: %s (%s)", outPath, size)
 	interruptHandler(false, nil, cancel)
-	prog := engine.NewProgress(false, o.progressInterval)
-	progStop := make(chan struct{})
-	go prog.Render(progStop)
-	err := engine.DownloadFile(ctx, engine.Config{Client: client, Threads: threads, Progress: prog, Verbose: logv}, st, outPath)
-	close(progStop)
-	time.Sleep(50 * time.Millisecond) // let renderer print the final line
+	prog, stopProg := j.progress(false)
+	err := engine.DownloadFile(ctx, engine.Config{Client: j.client, Threads: j.threads, Progress: prog, Verbose: j.logv}, st, outPath)
+	stopProg()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "done: "+outPath)
+	j.say("done: %s", outPath)
 	return nil
 }
 
@@ -659,7 +833,15 @@ func convertSubtitle(rawPath, format, ffmpeg string) (string, error) {
 	}
 	outPath := strings.TrimSuffix(rawPath, ".rawsub") + "." + format
 	kind := subs.Sniff(b)
+	var cues []subs.Cue
 	if kind == subs.KindFMP4 {
+		cues, err = subs.ParseWVTT(b)
+		if err == nil {
+			return writeSubtitle(outPath, format, cues)
+		}
+		if !errors.Is(err, mp4.ErrTrackNotFound) {
+			return "", fmt.Errorf("wvtt extraction: %w", err)
+		}
 		// stpp: TTML documents live in mdat — extract natively (ffmpeg has
 		// no TTML decoder)
 		if mdat := subs.ExtractMdat(b); subs.IsTTMLPayload(mdat) {
@@ -671,21 +853,21 @@ func convertSubtitle(rawPath, format, ffmpeg string) (string, error) {
 		if ffmpeg == "" {
 			return "", errors.New("fMP4 subtitles need ffmpeg")
 		}
-		// ffmpeg reads mp4-wrapped wvtt/stpp fine; rename so it sniffs mp4
-		mp4Path := strings.TrimSuffix(rawPath, ".rawsub") + ".sub.mp4"
-		if err := os.Rename(rawPath, mp4Path); err != nil {
-			return "", err
-		}
-		defer os.Rename(mp4Path, rawPath)
-		if err := mux.ExtractSubtitle(ffmpeg, mp4Path, outPath); err != nil {
+		// Native paths above handle wvtt and TTML. Leave other subtitle codecs
+		// to ffmpeg's content probe; never rename away the recoverable raw file.
+		if err := mux.ExtractSubtitle(ffmpeg, rawPath, outPath); err != nil {
 			return "", err
 		}
 		return outPath, nil
 	}
-	cues, err := subs.Parse(b, kind)
+	cues, err = subs.Parse(b, kind)
 	if err != nil {
 		return "", err
 	}
+	return writeSubtitle(outPath, format, cues)
+}
+
+func writeSubtitle(outPath, format string, cues []subs.Cue) (string, error) {
 	if len(cues) == 0 {
 		return "", errors.New("no cues found")
 	}

@@ -607,6 +607,46 @@ func mustClient(t *testing.T) *httpx.Client {
 	return c
 }
 
+// A commit error (here: the AES-128 key for segment 2 is a 404) must end
+// DownloadStream even while the feeder still has segments to push. Before the
+// fix the writer died, the workers filled `results`, the feeder parked on
+// `items`, and the process printed the same progress line forever with no
+// sockets open — seen fleet-wide as "hung" downloads.
+func TestWriterErrorStopsPipeline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/badkey" {
+			http.NotFound(w, r)
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+		fmt.Fprintf(w, "[%s]", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	st := &manifest.Stream{ID: "t", Type: manifest.Video}
+	for i := 0; i < 200; i++ {
+		seg := manifest.Segment{URL: fmt.Sprintf("%s/seg%d", srv.URL, i), Seq: int64(i), Duration: 1}
+		if i == 2 {
+			seg.Key = &manifest.Key{Method: manifest.EncAES128, URI: srv.URL + "/badkey"}
+		}
+		st.Segments = append(st.Segments, seg)
+	}
+	client, _ := httpx.New(httpx.Options{Retries: 1})
+	out := filepath.Join(t.TempDir(), "out.ts")
+	done := make(chan error, 1)
+	go func() {
+		done <- DownloadStream(context.Background(), Config{Client: client, Threads: 2}, st, out, nil)
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("want the key error")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("DownloadStream hung after the writer failed")
+	}
+}
+
 // AES-128 ciphertext is random bytes, so it can open FF D8 (JPEG) and hold
 // three 0x47s 188 apart by chance. The fake-header strip must not run on it:
 // it once chopped a 2084928-byte segment to 256222 and the decrypt failed.
