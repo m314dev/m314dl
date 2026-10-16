@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 func IsDASH(body []byte) bool {

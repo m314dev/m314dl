@@ -27,23 +27,23 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/mohamed/m314dl/internal/curl"
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/hls"
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/mp4"
-	"github.com/mohamed/m314dl/internal/mux"
-	"github.com/mohamed/m314dl/internal/pick"
-	"github.com/mohamed/m314dl/internal/rpc"
-	"github.com/mohamed/m314dl/internal/serve"
-	"github.com/mohamed/m314dl/internal/source"
-	"github.com/mohamed/m314dl/internal/subs"
-	"github.com/mohamed/m314dl/internal/update"
-	"github.com/mohamed/m314dl/internal/worker"
+	"github.com/m314dev/m314dl/internal/curl"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/hls"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/mp4"
+	"github.com/m314dev/m314dl/internal/mux"
+	"github.com/m314dev/m314dl/internal/pick"
+	"github.com/m314dev/m314dl/internal/rpc"
+	"github.com/m314dev/m314dl/internal/serve"
+	"github.com/m314dev/m314dl/internal/source"
+	"github.com/m314dev/m314dl/internal/subs"
+	"github.com/m314dev/m314dl/internal/update"
+	"github.com/m314dev/m314dl/internal/worker"
 )
 
-const version = "0.3.6"
+var version = "0.3.6" // set by goreleaser via -ldflags "-X main.version=..."
 
 type multiFlag []string
 

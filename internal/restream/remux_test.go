@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/mux"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/mux"
 )
 
 // Feed a real fMP4 rendition through the FFmpeg remux and confirm valid MPEG-TS

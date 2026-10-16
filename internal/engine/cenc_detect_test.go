@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 // box builds one MP4 box: 4-byte size, 4-byte type, payload.

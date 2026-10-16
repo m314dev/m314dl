@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/mohamed/m314dl/internal/mp4"
+	"github.com/m314dev/m314dl/internal/mp4"
 )
 
 func word(n uint32) []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, n); return b }

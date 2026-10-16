@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/mp4"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/mp4"
 )
 
 // ExpandIndexed replaces every SegmentBase placeholder in st (a whole

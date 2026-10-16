@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/mohamed/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/engine"
 )
 
 // Continuous MPEG-TS output.

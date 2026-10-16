@@ -8,9 +8,9 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/mp4"
-	"github.com/mohamed/m314dl/internal/mss"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/mp4"
+	"github.com/m314dev/m314dl/internal/mss"
 )
 
 const (

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/mp4"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/mp4"
 )
 
 // cencDecryptor holds the protection metadata and content key for one stream.

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 func TestBuildOutputsLogsAudioTrack(t *testing.T) {

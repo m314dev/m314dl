@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/dash"
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/dash"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 // onDemandFile is a fake SegmentBase media file: 100 bytes of "init", a sidx

@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 func TestSidecarSubPath(t *testing.T) {

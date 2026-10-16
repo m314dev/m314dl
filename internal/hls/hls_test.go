@@ -3,7 +3,7 @@ package hls
 import (
 	"testing"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 const master = `#EXTM3U

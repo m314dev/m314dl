@@ -24,8 +24,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 const (

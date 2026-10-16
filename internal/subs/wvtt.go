@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/mohamed/m314dl/internal/mp4"
+	"github.com/m314dev/m314dl/internal/mp4"
 )
 
 // ParseWVTT reads MP4 WebVTT samples natively. Timing belongs to the MP4

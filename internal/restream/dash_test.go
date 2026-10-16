@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 func dashPub(t *testing.T, live bool) (*Publisher, engine.Sink, engine.Sink) {

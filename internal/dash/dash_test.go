@@ -3,7 +3,7 @@ package dash
 import (
 	"testing"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 const mpdTimeline = `<?xml version="1.0"?>

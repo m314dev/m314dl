@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 // IsHLS sniffs playlist content.

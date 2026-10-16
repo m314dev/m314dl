@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 func TestStripFakeImageHeader(t *testing.T) {

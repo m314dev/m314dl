@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 type Input struct {

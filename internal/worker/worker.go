@@ -32,12 +32,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/hls"
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/pick"
-	"github.com/mohamed/m314dl/internal/serve"
-	"github.com/mohamed/m314dl/internal/source"
+	"github.com/m314dev/m314dl/internal/hls"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/pick"
+	"github.com/m314dev/m314dl/internal/serve"
+	"github.com/m314dev/m314dl/internal/source"
 )
 
 type workerServer struct {

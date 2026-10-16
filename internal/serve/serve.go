@@ -21,12 +21,12 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/mux"
-	"github.com/mohamed/m314dl/internal/restream"
-	"github.com/mohamed/m314dl/internal/source"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/mux"
+	"github.com/m314dev/m314dl/internal/restream"
+	"github.com/m314dev/m314dl/internal/source"
 )
 
 // Options is the subset of the CLI flags that shapes a restream: where to

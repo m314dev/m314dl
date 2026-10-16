@@ -1,4 +1,4 @@
-module github.com/mohamed/m314dl
+module github.com/m314dev/m314dl
 
 go 1.26.5
 

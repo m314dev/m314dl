@@ -23,11 +23,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/bbts"
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/mp4"
-	"github.com/mohamed/m314dl/internal/sampleaes"
+	"github.com/m314dev/m314dl/internal/bbts"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/mp4"
+	"github.com/m314dev/m314dl/internal/sampleaes"
 )
 
 type Config struct {

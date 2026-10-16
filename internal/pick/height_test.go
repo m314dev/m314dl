@@ -3,7 +3,7 @@ package pick
 import (
 	"testing"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 func vid(w, h int) *manifest.Stream {

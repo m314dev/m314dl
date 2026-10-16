@@ -3,8 +3,8 @@ package restream
 import (
 	"testing"
 
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 // buildVODPublisher makes a completed VOD publisher with n spooled segments,

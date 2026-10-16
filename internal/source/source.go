@@ -14,13 +14,13 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/mohamed/m314dl/internal/dash"
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/hls"
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/mss"
-	"github.com/mohamed/m314dl/internal/scrape"
+	"github.com/m314dev/m314dl/internal/dash"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/hls"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/mss"
+	"github.com/m314dev/m314dl/internal/scrape"
 )
 
 // localManifestPath returns the filesystem path when input is a local manifest

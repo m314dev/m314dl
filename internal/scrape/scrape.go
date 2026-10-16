@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/mohamed/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/httpx"
 )
 
 // absolute URLs in page source / inline JSON (handles \/ escaping)

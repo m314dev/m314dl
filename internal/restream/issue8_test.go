@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/dash"
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/source"
+	"github.com/m314dev/m314dl/internal/dash"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/source"
 )
 
 // The issue's MAX source uses CICP, while works.xml uses Dolby's hex mask.

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mohamed/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/engine"
 )
 
 // Cross-container remux to MPEG-TS via one long-lived FFmpeg.

@@ -17,8 +17,8 @@ import (
 
 const (
 	// Page is where a user goes to get the new build.
-	Page       = "https://github.com/mohaanymo/m314dl/releases/latest"
-	releaseAPI = "https://api.github.com/repos/mohaanymo/m314dl/releases/latest"
+	Page       = "https://github.com/m314dev/m314dl/releases/latest"
+	releaseAPI = "https://api.github.com/repos/m314dev/m314dl/releases/latest"
 	// checkEvery bounds how often the network is hit: at most once a day.
 	checkEvery = 24 * time.Hour
 )

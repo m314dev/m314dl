@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 // rangedStream slices a body of n bytes into chunk-sized byte-range segments,

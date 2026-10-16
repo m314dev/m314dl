@@ -5,7 +5,7 @@ import (
 	"math"
 	"strings"
 
-	"github.com/mohamed/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/manifest"
 )
 
 // Live/VOD DASH output. The same Track window that feeds HLS also feeds a DASH

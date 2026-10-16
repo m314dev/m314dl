@@ -10,7 +10,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/httpx"
 )
 
 // partPath is where a segment's raw (still-encrypted, still-fake-header) bytes

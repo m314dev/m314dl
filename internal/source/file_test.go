@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/httpx"
 )
 
 func TestPlanChunks(t *testing.T) {

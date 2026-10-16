@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/engine"
 )
 
 // tsPacket builds a 188-byte payload-bearing TS packet for pid with counter cc.

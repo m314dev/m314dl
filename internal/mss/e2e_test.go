@@ -24,14 +24,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mohamed/m314dl/internal/engine"
-	"github.com/mohamed/m314dl/internal/httpx"
-	"github.com/mohamed/m314dl/internal/manifest"
-	"github.com/mohamed/m314dl/internal/mp4"
-	"github.com/mohamed/m314dl/internal/mux"
-	"github.com/mohamed/m314dl/internal/pick"
-	"github.com/mohamed/m314dl/internal/serve"
-	"github.com/mohamed/m314dl/internal/source"
+	"github.com/m314dev/m314dl/internal/engine"
+	"github.com/m314dev/m314dl/internal/httpx"
+	"github.com/m314dev/m314dl/internal/manifest"
+	"github.com/m314dev/m314dl/internal/mp4"
+	"github.com/m314dev/m314dl/internal/mux"
+	"github.com/m314dev/m314dl/internal/pick"
+	"github.com/m314dev/m314dl/internal/serve"
+	"github.com/m314dev/m314dl/internal/source"
 )
 
 const (
