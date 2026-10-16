@@ -13,3 +13,9 @@
 # release artifacts
 /dist/
 /RELEASE_NOTES.md
+
+# local junk
+*.xapk
+*.apk
+/m314dl.exe
+/.d.txt

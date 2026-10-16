@@ -1,0 +1,95 @@
+# Release config for goreleaser v2. CI runs it on every v* tag
+# (.github/workflows/release.yml). Local dry run:
+#   goreleaser release --snapshot --clean
+version: 2
+
+project_name: m314dl
+
+builds:
+  - main: .
+    binary: m314dl
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    # Same platforms as build-release.sh.
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - linux_arm_7
+      - darwin_amd64
+      - darwin_arm64
+      - windows_amd64
+      - windows_arm64
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+  sort: asc
+
+release:
+  github:
+    owner: m314dev
+    name: m314dl
+
+# brews is deprecated in goreleaser v2; homebrew_casks is its replacement and
+# writes to the same tap (Casks/m314dl.rb). Install: brew install m314dev/tap/m314dl
+homebrew_casks:
+  - repository:
+      owner: m314dev
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://m314.dev
+    description: Fast HLS/DASH/MSS downloader with native CENC decryption
+    license: MIT
+    dependencies:
+      - formula: ffmpeg # muxing
+    hooks:
+      post:
+        # The binary is not notarized; drop the quarantine flag so macOS runs it.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/m314dl"]
+          end
+
+scoops:
+  - repository:
+      owner: m314dev
+      name: scoop-bucket
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://m314.dev
+    description: Fast HLS/DASH/MSS downloader with native CENC decryption
+    license: MIT
+    depends: [ffmpeg]
+
+aurs:
+  - name: m314dl-bin
+    homepage: https://m314.dev
+    description: Fast HLS/DASH/MSS downloader with native CENC decryption
+    license: MIT
+    # skipped until the AUR_KEY secret exists
+    disable: '{{ if eq (envOrDefault "AUR_KEY" "") "" }}true{{ end }}'
+    private_key: '{{ envOrDefault "AUR_KEY" "" }}'
+    git_url: ssh://aur@aur.archlinux.org/m314dl-bin.git
+    depends: [ffmpeg]
+
+dockers_v2:
+  - dockerfile: Dockerfile.goreleaser
+    images: [ghcr.io/m314dev/m314dl]
+    tags: ["{{ .Version }}", latest]
+    platforms: [linux/amd64, linux/arm64, linux/arm/v7]
+    labels:
+      org.opencontainers.image.source: https://github.com/m314dev/m314dl
+      org.opencontainers.image.url: https://m314.dev
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.licenses: MIT

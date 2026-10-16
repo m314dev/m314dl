@@ -1,0 +1,9 @@
+# Image goreleaser publishes (see .goreleaser.yaml): it copies in the binary it
+# already built for each platform. The plain Dockerfile builds from source.
+FROM alpine:3.20
+RUN apk add --no-cache ffmpeg ca-certificates
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/m314dl /usr/local/bin/m314dl
+# Downloads land in /data — mount a host directory there.
+WORKDIR /data
+ENTRYPOINT ["m314dl"]
