@@ -259,9 +259,6 @@ brew install m314dev/tap/m314dl
 scoop bucket add m314dev https://github.com/m314dev/scoop-bucket
 scoop install m314dl
 
-# Arch Linux (AUR)
-yay -S m314dl-bin
-
 # with a Go toolchain
 go install github.com/m314dev/m314dl@latest
 ```
