@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1095" height="138" viewBox="0 0 1095 138" font-family="SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+<rect width="1095" height="138" rx="8" fill="#1a1b26"/>
+<circle cx="18" cy="18" r="5" fill="#f7768e"/><circle cx="34" cy="18" r="5" fill="#e0af68"/><circle cx="50" cy="18" r="5" fill="#9ece6a"/>
+<text x="18" y="54" xml:space="preserve" textLength="470.4" lengthAdjust="spacingAndGlyphs">
+<tspan fill="#c0caf5">selected: 0.0.0 video 1920x1080 4071kbps avc1.640028 (0)</tspan>
+</text>
+<text x="18" y="76" xml:space="preserve" textLength="361.2" lengthAdjust="spacingAndGlyphs">
+<tspan fill="#c0caf5">selected: 1.1.0 audio 132kbps mp4a.40.2 (1)</tspan>
+</text>
+<text x="18" y="98" xml:space="preserve" textLength="999.6" lengthAdjust="spacingAndGlyphs">
+<tspan fill="#7dcfff">[██████████░░░░░░░░░░]</tspan>
+<tspan fill="#c0caf5"> </tspan>
+<tspan fill="#7dcfff"> 50.0%</tspan>
+<tspan fill="#c0caf5"> | 4/8 segs | 8.4MiB/~16.9MiB | </tspan>
+<tspan fill="#9ece6a">6.2MiB/s</tspan>
+<tspan fill="#c0caf5"> | </tspan>
+<tspan fill="#e0af68">ETA 1s</tspan>
+<tspan fill="#c0caf5"> | </tspan>
+<tspan fill="#565f89">3 conns</tspan>
+<tspan fill="#c0caf5"> | Big Buck Bunny (2008) 1080p.</tspan>
+</text>
+<text x="18" y="120" xml:space="preserve" textLength="529.2" lengthAdjust="spacingAndGlyphs">
+<tspan fill="#9ece6a">done:</tspan>
+<tspan fill="#c0caf5"> Big Buck Bunny (2008) 1080p.mp4 (12.4MiB, 3s at 4.8MiB/s)</tspan>
+</text>
+</svg>

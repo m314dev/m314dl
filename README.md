@@ -1,29 +1,38 @@
 # m314dl
 
-A fast HLS (`.m3u8`) and DASH (`.mpd`) downloader in one static Go binary. It
-decrypts CENC and cbcs streams (ISO/IEC 23001-7) with keys you supply, in the
-same pass as the download, so there is no separate `mp4decrypt` or
-`shaka-packager` step.
+**A fast HLS and DASH downloader in one Go binary.** m314dl downloads `.m3u8`
+and `.mpd` streams, decrypts CENC and cbcs content with keys you supply in the
+same pass as the download (no `mp4decrypt`, no `shaka-packager` step), records
+live streams, downloads IPTV M3U lists, and can re-serve a stream as live HLS,
+MPEG-TS or DASH for other players.
+
+[![Latest release](https://img.shields.io/github/v/release/m314dev/m314dl?label=release)](https://github.com/m314dev/m314dl/releases)
+[![Downloads](https://img.shields.io/github/downloads/m314dev/m314dl/total)](https://github.com/m314dev/m314dl/releases)
+[![Go version](https://img.shields.io/github/go-mod/go-version/m314dev/m314dl)](go.mod)
+[![License: MIT](https://img.shields.io/github/license/m314dev/m314dl)](LICENSE)
 
 ```sh
 m314dl -o out.mp4 https://example.com/master.m3u8            # download an HLS stream
-m314dl -key KID:KEY -o out.mp4 https://example.com/video.mpd # download + decrypt a DASH stream
+m314dl -key KID:KEY -o out.mp4 https://example.com/video.mpd # download and decrypt a DASH stream
 ```
 
-If you already use [N_m3u8DL-RE](https://github.com/nilaoda/N_m3u8DL-RE),
-[vsd](https://github.com/clitic/vsd), `yt-dlp` or `ffmpeg` for this, m314dl is a
-single-binary alternative. It was faster than N_m3u8DL-RE and vsd in every case
-of the benchmark below.
+<img src="docs/progress.svg" width="100%" alt="m314dl in a terminal downloading an HLS stream: a progress bar with the percentage, segments done, size, speed, ETA and connections, then a done line with the output size, elapsed time and average speed">
+
+If you use [N_m3u8DL-RE](https://github.com/nilaoda/N_m3u8DL-RE),
+[vsd](https://github.com/clitic/vsd), `yt-dlp` or `ffmpeg` for this today,
+m314dl is a single-binary alternative. It was faster than N_m3u8DL-RE and vsd in
+every case of the [benchmark](#benchmarks) below.
 
 ## Contents
 
+- [Install](#install)
 - [Quick start](#quick-start)
+- [What it does](#what-it-does)
 - [Why I built it](#why-i-built-it)
 - [Benchmarks](#benchmarks)
 - [How decryption works](#how-decryption-works)
 - [Responsible use](#responsible-use)
-- [Features](#features)
-- [Install](#install)
+- [Features in detail](#features-in-detail)
 - [Usage](#usage)
 - [Track selection](#track-selection)
 - [Serving a live stream](#serving-a-live-stream)
@@ -32,6 +41,40 @@ of the benchmark below.
 - [FAQ](#faq)
 - [Tests](#tests)
 - [License](#license)
+
+## Install
+
+Prebuilt binaries for Linux, macOS and Windows (amd64 and arm64, plus armv7 on
+Linux) are on the [releases page](https://github.com/m314dev/m314dl/releases).
+Or use a package manager:
+
+```sh
+# macOS and Linux (Homebrew)
+brew install m314dev/tap/m314dl
+
+# Windows (Scoop)
+scoop bucket add m314dev https://github.com/m314dev/scoop-bucket
+scoop install m314dl
+
+# with a Go toolchain
+go install github.com/m314dev/m314dl@latest
+```
+
+m314dl needs `ffmpeg` to mux: on your PATH, next to the binary, or given with
+`-ffmpeg <path>`. The Docker image already has it:
+
+```sh
+docker run --rm -v "$PWD:/data" ghcr.io/m314dev/m314dl -o out.mp4 https://example.com/master.m3u8
+```
+
+Files land in the current directory, which is what the `-v "$PWD:/data"` mount
+does.
+
+To build from source:
+
+```sh
+go build -o m314dl .
+```
 
 ## Quick start
 
@@ -54,6 +97,18 @@ m314dl -serve :8314 https://example.com/master.m3u8
 ```
 
 Run `m314dl -h` for the full flag list.
+
+## What it does
+
+| | |
+|---|---|
+| Inputs | HLS (`.m3u8`, TS and fMP4), DASH (`.mpd`), Smooth Streaming (`.ism/Manifest`), plain files, IPTV M3U lists, web pages with a stream URL in them, copy-as-curl commands |
+| Decryption | CENC, cbcs, cens and cbc1 (ISO/IEC 23001-7), HLS AES-128 and SAMPLE-AES, BBTS; all in process, per segment, while downloading |
+| Live | records from the live edge or the whole DVR window, with a time limit, deduped across refreshes, and a clean stop on Ctrl-C |
+| Output | MP4, MKV or any ffmpeg container; subtitles muxed in or written as SRT/VTT sidecars |
+| Resume | byte-exact resume after a clean exit or a hard kill; one temp folder per download |
+| Serving | republish a stream as live HLS, MPEG-TS or DASH; a multi-channel worker and an RPC job server for running it unattended |
+| Platforms | Linux, macOS, Windows (amd64, arm64, armv7 on Linux), Docker |
 
 ## Why I built it
 
@@ -141,7 +196,7 @@ m314dl decrypts only with keys you already have. Use it on streams you own or
 have the right to download, and check the terms of the service and the law where
 you live. Issues asking how to get keys for a particular service will be closed.
 
-## Features
+## Features in detail
 
 ### Formats and protocols
 
@@ -242,10 +297,8 @@ can recover it, even after the video and audio muxed fine and without
   CURL
   ```
 
-### Networking and operations
+### Terminal output, networking and operations
 
-- Custom headers (sent verbatim), Netscape `cookies.txt`, and HTTP or SOCKS
-  proxies with auth.
 - On a terminal the status line shows a progress bar, segments done, size so
   far with the projected total, speed, ETA, connections in flight and the file
   name, in color: progress cyan, speed green, ETA and warnings yellow, errors
@@ -253,43 +306,11 @@ can recover it, even after the video and audio muxed fine and without
   `-no-color` or `NO_COLOR=1` keeps it plain.
 - Plays well with scripts: plain progress lines when stderr isn't a terminal (no
   ANSI codes in your logs), real exit codes, and quiet, machine-readable output.
+- Custom headers (sent verbatim), Netscape `cookies.txt`, and HTTP or SOCKS
+  proxies with auth.
 - Once a day it checks GitHub for a newer release and prints a one-line notice
   if you're behind. The check never blocks a download. `-no-update-check` or
   `M314DL_NO_UPDATE_CHECK=1` turns it off.
-
-## Install
-
-Prebuilt binaries for Linux, macOS and Windows (amd64 and arm64, plus armv7 on
-Linux) are on the [releases page](https://github.com/m314dev/m314dl/releases).
-Or use a package manager:
-
-```sh
-# macOS and Linux (Homebrew)
-brew install m314dev/tap/m314dl
-
-# Windows (Scoop)
-scoop bucket add m314dev https://github.com/m314dev/scoop-bucket
-scoop install m314dl
-
-# with a Go toolchain
-go install github.com/m314dev/m314dl@latest
-```
-
-m314dl needs `ffmpeg` to mux: on your PATH, next to the binary, or given with
-`-ffmpeg <path>`. The Docker image already has it:
-
-```sh
-docker run --rm -v "$PWD:/data" ghcr.io/m314dev/m314dl -o out.mp4 https://example.com/master.m3u8
-```
-
-Files land in the current directory, which is what the `-v "$PWD:/data"` mount
-does.
-
-To build from source:
-
-```sh
-go build -o m314dl .
-```
 
 ## Usage
 
@@ -314,6 +335,9 @@ m314dl -live-duration 1h -o show.mp4 https://example.com/live.m3u8
 m314dl -o video.mp4 https://example.com/watch/12345
 
 # resume an interrupted VOD download: rerun the same command
+
+# keep temp files on a scratch disk instead of beside the output
+m314dl -temp-dir /mnt/scratch -o out.mp4 URL
 
 # M3U playlist: number the entries, then download some of them into Movies/
 m314dl -list playlist.m3u
@@ -558,6 +582,32 @@ has to come from you.
 `m314dl -live-duration 1h -o show.mp4 https://host/live.m3u8`. Recording starts
 at the live edge. Press Ctrl-C at any point and the file is still finalized and
 muxed.
+
+### How do I resume an interrupted download?
+
+Run the same command again. The download's temp folder, `<name>.m314dl/` next
+to the output, holds the finished segments and a checkpoint, and the rerun
+continues from there byte for byte. The folder is removed once the file is
+muxed.
+
+### Does m314dl need ffmpeg?
+
+Only to mux the final file. Downloading, decrypting and converting subtitles to
+SRT or VTT happen in m314dl itself. `-no-mux` keeps the raw stream files and
+skips ffmpeg entirely.
+
+### Does it work on Windows?
+
+Yes. Releases include Windows amd64 and arm64 builds, and `scoop install m314dl`
+installs it. Colored output uses the console's virtual terminal mode, which
+Windows 10 and later support.
+
+### Can it download an IPTV M3U list?
+
+Yes. Give it the list (a URL or a local file) and each entry becomes its own
+download under `<dir>/<group-title>/<title>.<ext>`. `-list` numbers the entries,
+and `-pick`, `-group` and `-match` choose which to download. Live channels are
+skipped; see [Features in detail](#formats-and-protocols).
 
 ### Is it faster than N_m3u8DL-RE or vsd?
 
