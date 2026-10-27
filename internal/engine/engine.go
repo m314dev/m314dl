@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -41,6 +42,10 @@ type Config struct {
 	FromStart bool            // live: download the whole DVR window instead of starting at the edge
 	Progress  *Progress       // shared across streams; may be nil
 	Verbose   func(format string, args ...any)
+	// PartDir, when set, is where segment part files go instead of beside the
+	// output. A stream's output already sits in its download's temp folder, so
+	// this matters for a plain file, whose output is the deliverable itself.
+	PartDir string
 	// Verbatim commits segment bytes exactly as received: no fake-image-header
 	// strip, no decryption. A plain file's chunks are its own bytes — a PNG
 	// or a chunk that happens to start with 0xFFD8 must not be "de-obfuscated".
@@ -473,7 +478,13 @@ func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, it
 		if err := ctl.lim.acquire(ctx); err != nil {
 			return
 		}
-		pressure, err := downloadSegment(ctx, cfg, ctl, it, partPath(outPath, it.idx))
+		if cfg.Progress != nil {
+			cfg.Progress.AddConns(1)
+		}
+		pressure, err := downloadSegment(ctx, cfg, ctl, it, partPath(cfg.PartDir, outPath, it.idx))
+		if cfg.Progress != nil {
+			cfg.Progress.AddConns(-1)
+		}
 		ctl.lim.release()
 		if pressure > 0 {
 			ctl.addPressure(pressure)
@@ -846,7 +857,7 @@ const pacePrimeSegments = 3
 // otherwise leave its segments behind, and 1430 of those directories once ate
 // 43 GB nobody could see.
 func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, trackID uint32, outPath string, idx int64, it item) ([]byte, error) {
-	part := partPath(outPath, idx)
+	part := partPath(cfg.PartDir, outPath, idx)
 	data, err := os.ReadFile(part)
 	if err != nil {
 		return nil, fmt.Errorf("read segment %d: %w", idx, err)
@@ -1010,17 +1021,32 @@ func downloadSingleFile(ctx context.Context, cfg Config, st *manifest.Stream, ou
 	return nil
 }
 
-// TempStreamPath returns the raw per-stream temp file path. The name is
-// derived from the OUTPUT file, not just the stream id, so two concurrent
-// downloads that share an output directory but write different files (e.g. two
-// episodes of one series whose manifests reuse stream ids like "video=3000000"
-// or "1") never collide on the same temp file. The path is stable across reruns
-// of the same command, so resume still works.
-func TempStreamPath(outPath string, st *manifest.Stream, ext string) string {
-	dir := filepath.Dir(outPath)
-	outBase := filepath.Base(strings.TrimSuffix(outPath, filepath.Ext(outPath)))
-	name := fmt.Sprintf("%s.m314dl-%s-%s%s", outBase, st.Type, sanitize(st.ID), ext)
-	return filepath.Join(dir, name)
+// TempDir is the folder one download stages its files in: raw streams, part
+// files and the resume checkpoint. It sits beside the output as <name>.m314dl,
+// so two downloads into one directory never share it, and a rerun of the same
+// command finds it again and resumes. With root set (-temp-dir) the folder
+// moves under root, and a short hash of the output's absolute path keeps two
+// outputs that share a name but not a directory apart.
+func TempDir(outPath, root string) string {
+	base := strings.TrimSuffix(filepath.Base(outPath), filepath.Ext(outPath))
+	if root == "" {
+		return filepath.Join(filepath.Dir(outPath), base+".m314dl")
+	}
+	abs, err := filepath.Abs(outPath)
+	if err != nil {
+		abs = outPath
+	}
+	h := fnv.New32a()
+	h.Write([]byte(abs))
+	return filepath.Join(root, fmt.Sprintf("%s-%08x.m314dl", base, h.Sum32()))
+}
+
+// TempStreamPath is the raw file one stream downloads to inside its download's
+// TempDir: <type>-<id><ext>, for example video-1.mp4 or subtitles-en.rawsub.
+// Stream ids repeat across manifests ("video=3000000", "1"), which is why the
+// folder, not the file name, is what keeps concurrent downloads apart.
+func TempStreamPath(dir string, st *manifest.Stream, ext string) string {
+	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", st.Type, sanitize(st.ID), ext))
 }
 
 var badChars = regexp.MustCompile(`[^\w.\-]+`)

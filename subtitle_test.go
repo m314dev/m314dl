@@ -159,7 +159,8 @@ func TestSubtitleFailureSurvivesSuccessfulMux(t *testing.T) {
 	if st, err := os.Stat(output); err != nil || st.Size() == 0 {
 		t.Fatalf("no muxed output: %v", err)
 	}
-	raw, err := filepath.Glob(filepath.Join(outDir, "*.rawsub"))
+	// The raw file stays in the download's temp folder, which therefore survives the cleanup too.
+	raw, err := filepath.Glob(filepath.Join(outDir, "*.m314dl", "*.rawsub"))
 	if err != nil || len(raw) != 1 {
 		t.Fatalf("failed subtitle lost after mux: %v (%v); logs: %s", raw, err, logs)
 	}

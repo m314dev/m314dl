@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/m314dev/m314dl/internal/httpx"
@@ -16,8 +17,12 @@ import (
 // partPath is where a segment's raw (still-encrypted, still-fake-header) bytes
 // stream to before the writer decrypts and appends them. Derived from the
 // output so concurrent downloads never collide, and stable across reruns so a
-// killed download resumes from the partial bytes already on disk.
-func partPath(outPath string, idx int64) string {
+// killed download resumes from the partial bytes already on disk. With dir set
+// (Config.PartDir) the part files live there instead of beside the output.
+func partPath(dir, outPath string, idx int64) string {
+	if dir != "" {
+		outPath = filepath.Join(dir, filepath.Base(outPath))
+	}
 	return fmt.Sprintf("%s.part%d", outPath, idx)
 }
 

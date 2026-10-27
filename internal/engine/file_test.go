@@ -118,7 +118,7 @@ func TestDownloadFileRangedResume(t *testing.T) {
 	// prior run: chunks 0-1 committed, 300 bytes of chunk 2 in its part file
 	os.WriteFile(out, body[:2000], 0o644)
 	os.WriteFile(out+".m314dl-state", []byte(`{"next_idx":2,"offset":2000}`), 0o644)
-	os.WriteFile(partPath(out, 2), body[2000:2300], 0o644)
+	os.WriteFile(partPath("", out, 2), body[2000:2300], 0o644)
 
 	client, _ := httpx.New(httpx.Options{Retries: 1})
 	if err := DownloadFile(context.Background(), Config{Client: client, Threads: 2}, rangedStream(srv.URL, 5000, 1000), out); err != nil {

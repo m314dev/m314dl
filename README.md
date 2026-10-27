@@ -182,6 +182,13 @@ H.264) works too when you supply the key.
   writer. Segments stream to disk (one part file per in-flight segment, decrypted
   and appended in order), so peak memory is about one segment rather than one
   per thread, even when segments are huge.
+- Each download stages its files in one folder beside the output,
+  `<name>.m314dl/`: the raw stream files, one part file per in-flight segment
+  and the resume checkpoint. The folder goes away once the mux succeeds and
+  stays when the download is interrupted, so a rerun resumes from it and the
+  output directory never fills with part files. `-temp-dir DIR` puts the folder
+  under DIR instead (a scratch disk, say); its name then carries a hash of the
+  output path, so same-named outputs in different directories don't share one.
 - Without `-t`, requests in flight tune themselves to the network (AIMD, 4 to
   64) and back off on 429 and 5xx, honoring `Retry-After`. `-t N` pins exactly N
   and still backs off on rate limits.
@@ -239,7 +246,12 @@ can recover it, even after the video and audio muxed fine and without
 
 - Custom headers (sent verbatim), Netscape `cookies.txt`, and HTTP or SOCKS
   proxies with auth.
-- Plays well with scripts: plain progress lines when stdout isn't a terminal (no
+- On a terminal the status line shows a progress bar, segments done, size so
+  far with the projected total, speed, ETA, connections in flight and the file
+  name, in color: progress cyan, speed green, ETA and warnings yellow, errors
+  red. A final line gives the output size, elapsed time and average speed.
+  `-no-color` or `NO_COLOR=1` keeps it plain.
+- Plays well with scripts: plain progress lines when stderr isn't a terminal (no
   ANSI codes in your logs), real exit codes, and quiet, machine-readable output.
 - Once a day it checks GitHub for a newer release and prints a one-line notice
   if you're behind. The check never blocks a download. `-no-update-check` or

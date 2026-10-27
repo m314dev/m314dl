@@ -4,6 +4,7 @@
 *.mkv
 *.m4s
 *.m314dl-state
+*.m314dl/
 *.rawsub
 
 # benchmark artifacts
@@ -19,3 +20,4 @@
 *.apk
 /m314dl.exe
 /.d.txt
+/.ua/

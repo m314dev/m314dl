@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -130,21 +131,41 @@ func TestDRMRefused(t *testing.T) {
 	}
 }
 
-func TestTempStreamPathIsolation(t *testing.T) {
+func TestTempDirAndStreamPath(t *testing.T) {
 	st := &manifest.Stream{Type: manifest.Video, ID: "video=3000000"}
 	// two episodes in the same season directory, same manifest stream id
-	a := TempStreamPath("/lib/Show/Season 01/E01.mkv", st, ".mp4")
-	b := TempStreamPath("/lib/Show/Season 01/E02.mkv", st, ".mp4")
+	a := TempDir("/lib/Show/Season 01/E01.mkv", "")
+	b := TempDir("/lib/Show/Season 01/E02.mkv", "")
 	if a == b {
-		t.Fatalf("concurrent episodes must not share a temp path: both %q", a)
+		t.Fatalf("concurrent episodes must not share a temp folder: both %q", a)
 	}
 	// stable across reruns of the same command (resume relies on this)
-	if a2 := TempStreamPath("/lib/Show/Season 01/E01.mkv", st, ".mp4"); a2 != a {
-		t.Fatalf("temp path not stable: %q vs %q", a, a2)
+	if a2 := TempDir("/lib/Show/Season 01/E01.mkv", ""); a2 != a {
+		t.Fatalf("temp folder not stable: %q vs %q", a, a2)
 	}
-	// lives beside the output, not in some scratch dir
-	if got := filepath.Dir(a); got != "/lib/Show/Season 01" {
-		t.Fatalf("temp not beside output: %q", got)
+	// lives beside the output, named after it
+	if want := filepath.Join("/lib/Show/Season 01", "E01.m314dl"); a != want {
+		t.Fatalf("temp folder %q, want %q", a, want)
+	}
+	if got := TempStreamPath(a, st, ".mp4"); got != filepath.Join(a, "video-video_3000000.mp4") {
+		t.Fatalf("stream path %q", got)
+	}
+	// -temp-dir: under the given root, and two outputs that share a name but
+	// not a directory still get different folders
+	ra := TempDir("/lib/A/movie.mkv", "/scratch")
+	rb := TempDir("/lib/B/movie.mkv", "/scratch")
+	if filepath.Dir(ra) != "/scratch" || ra == rb {
+		t.Fatalf("-temp-dir folders: %q and %q", ra, rb)
+	}
+	if !strings.HasPrefix(filepath.Base(ra), "movie-") || !strings.HasSuffix(ra, ".m314dl") {
+		t.Fatalf("-temp-dir folder name %q", ra)
+	}
+	// part files follow Config.PartDir; without one they sit beside the output
+	if got := partPath("", "/out/movie.mkv", 3); got != "/out/movie.mkv.part3" {
+		t.Fatalf("partPath = %q", got)
+	}
+	if got := partPath("/scratch/movie.m314dl", "/out/movie.mkv", 3); got != "/scratch/movie.m314dl/movie.mkv.part3" {
+		t.Fatalf("partPath with dir = %q", got)
 	}
 }
 
@@ -230,7 +251,7 @@ func TestIntraSegmentResume(t *testing.T) {
 	}
 	out := filepath.Join(t.TempDir(), "out.ts")
 	// a prior run got 30 of seg1's 100 bytes before being killed
-	if err := os.WriteFile(partPath(out, 1), content(1)[:30], 0o644); err != nil {
+	if err := os.WriteFile(partPath("", out, 1), content(1)[:30], 0o644); err != nil {
 		t.Fatal(err)
 	}
 

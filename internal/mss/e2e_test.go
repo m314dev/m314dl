@@ -170,9 +170,11 @@ func TestE2EClearDownloadAndMux(t *testing.T) {
 	}
 
 	out := filepath.Join(t.TempDir(), "out.mp4")
+	tmp := engine.TempDir(out, "")
+	os.MkdirAll(tmp, 0o755)
 	var inputs []mux.Input
 	for _, st := range selected {
-		raw := engine.TempStreamPath(out, st, source.RawExt(st))
+		raw := engine.TempStreamPath(tmp, st, source.RawExt(st))
 		if !strings.HasSuffix(raw, ".mp4") {
 			t.Fatalf("raw ext for %s: %s", st.ID, raw)
 		}

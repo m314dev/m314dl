@@ -39,6 +39,7 @@ import (
 	"github.com/m314dev/m314dl/internal/serve"
 	"github.com/m314dev/m314dl/internal/source"
 	"github.com/m314dev/m314dl/internal/subs"
+	"github.com/m314dev/m314dl/internal/ui"
 	"github.com/m314dev/m314dl/internal/update"
 	"github.com/m314dev/m314dl/internal/worker"
 )
@@ -74,6 +75,8 @@ type options struct {
 	liveFromStart    bool
 	noMux            bool
 	keepTemp         bool
+	tempDir          string
+	noColor          bool
 	subFormat        string
 	subExternal      bool
 	ffmpegPath       string
@@ -101,7 +104,7 @@ type options struct {
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "m314dl: error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s %v\n", ui.Paint(ui.Red, "m314dl: error:"), err)
 		os.Exit(1)
 	}
 }
@@ -136,7 +139,7 @@ func printUsage(w io.Writer) {
 
 	printUsageSection(w, "Basic download", []helpOption{
 		{"o", "FILE"}, {"t", "N"}, {"mt", ""}, {"list", ""},
-		{"no-mux", ""}, {"keep", ""}, {"v", ""},
+		{"no-mux", ""}, {"keep", ""}, {"temp-dir", "DIR"}, {"v", ""},
 	})
 	printUsageSection(w, "Choose tracks and live recording", []helpOption{
 		{"sv", "SELECTOR"}, {"sa", "SELECTOR"}, {"ss", "SELECTOR"},
@@ -161,7 +164,7 @@ func printUsage(w io.Writer) {
 		{"rpc", "ADDRESS"}, {"rpc-secret", "TOKEN"}, {"rpc-max-jobs", "N"}, {"rpc-retain", "DURATION"},
 		{"worker", "ADDRESS"}, {"worker-secret", "TOKEN"}, {"worker-max-channels", "N"},
 	})
-	printUsageSection(w, "Other", []helpOption{{"no-update-check", ""}, {"version", ""}})
+	printUsageSection(w, "Other", []helpOption{{"no-color", ""}, {"no-update-check", ""}, {"version", ""}})
 }
 
 func printUsageSection(w io.Writer, title string, options []helpOption) {
@@ -216,6 +219,8 @@ func run() error {
 	flag.BoolVar(&o.noMux, "no-mux", false, "keep raw per-stream files, skip ffmpeg")
 	flag.StringVar(&o.ffmpegPath, "ffmpeg", "", "path to the ffmpeg binary (default: next to m314dl, then PATH)")
 	flag.BoolVar(&o.keepTemp, "keep", false, "keep temp stream files after mux")
+	flag.StringVar(&o.tempDir, "temp-dir", "", "directory for each download's temp folder (segments, part files, resume state); default: beside the output, as <name>.m314dl/")
+	flag.BoolVar(&o.noColor, "no-color", false, "plain output without ANSI colors (also NO_COLOR=1); colors are only used on a terminal anyway")
 	flag.Var(&o.keys, "key", "CENC content key 'KID:KEY' (hex; KID dashes optional) or bare 'KEY' (repeatable). Enables native in-process DRM decryption — no mp4decrypt needed")
 	flag.StringVar(&o.bbtsKey, "bbts-key", "", "16-byte AES key (32 hex) for BBTS-encrypted MPEG-TS segments; the per-segment IV is read from the stream's SDT")
 	flag.StringVar(&o.subFormat, "sub-format", "srt", "subtitle output: srt or vtt")
@@ -255,6 +260,7 @@ func run() error {
 		fmt.Println("m314dl", version)
 		return nil
 	}
+	ui.Setup(o.noColor)
 	hls.AppendURLParams = o.appendURLParams
 	if o.rpc != "" {
 		if len(positionals) != 0 {
@@ -309,7 +315,7 @@ func run() error {
 
 	logv := func(format string, args ...any) {
 		if o.verbose {
-			fmt.Fprintf(os.Stderr, "[v] "+format+"\n", args...)
+			fmt.Fprintln(os.Stderr, ui.Paint(ui.Dim, fmt.Sprintf("[v] "+format, args...)))
 		}
 	}
 
@@ -394,6 +400,11 @@ func (j job) say(format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+// warn prints a message under a yellow "warning:" tag.
+func (j job) warn(format string, args ...any) {
+	j.say("%s %s", ui.Paint(ui.Yellow, "warning:"), fmt.Sprintf(format, args...))
 }
 
 // progress is the status line for one download: its own, drawn until stop is
@@ -492,15 +503,26 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	}
 
 	outPath := outputPath(o.output, inputURL, live)
-	workDir := filepath.Dir(outPath)
 	ffmpeg, ffErr := mux.FindFFmpeg(o.ffmpegPath)
 	if !o.noMux && ffErr != nil {
 		return fmt.Errorf("ffmpeg not found (needed for muxing; pass -ffmpeg <path>, or -no-mux to skip): %w", ffErr)
+	}
+	// Everything this download writes before the mux goes in one folder, so a
+	// 2000-segment download leaves one entry in the output directory instead of
+	// a part file per in-flight segment, and a Ctrl-C leaves one folder to resume
+	// from. The folder is deleted once the mux succeeds.
+	tempDir := engine.TempDir(outPath, o.tempDir)
+	adoptOldTempFiles(outPath, tempDir)
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return err
 	}
 
 	interruptHandler(live, stopLive, cancel)
 
 	prog, stopProg := j.progress(live)
+	if j.prog == nil {
+		prog.SetName(filepath.Base(outPath))
+	}
 
 	cfg := engine.Config{
 		Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey, AdFilters: adFilters,
@@ -515,7 +537,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	}
 	var results []done
 	for _, st := range selected {
-		results = append(results, done{st: st, path: engine.TempStreamPath(outPath, st, source.RawExt(st))})
+		results = append(results, done{st: st, path: engine.TempStreamPath(tempDir, st, source.RawExt(st))})
 	}
 	// Stream scheduling. A stream's segments are latency-bound when small
 	// (subtitles: thousands of ~byte-sized segments) and bandwidth-bound when
@@ -557,7 +579,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 				// Video/audio failures stay fatal — there's no output without them.
 				if r.st.Type == manifest.Subtitles {
 					r.failed = true
-					j.say("warning: subtitle %s failed to download (%v); skipping it", r.st.ID, err)
+					j.warn("subtitle %s failed to download (%v); skipping it", r.st.ID, err)
 					return nil
 				}
 				return fmt.Errorf("stream %s: %w", r.st.ID, err)
@@ -593,7 +615,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		subPath, err := convertSubtitle(r.path, o.subFormat, ffmpeg)
 		if err != nil {
 			keepRaw[r.path] = true
-			j.say("warning: subtitle %s conversion failed (%v); keeping raw file %s", r.st.ID, err, r.path)
+			j.warn("subtitle %s conversion failed (%v); keeping raw file %s", r.st.ID, err, r.path)
 			continue
 		}
 		if o.subExternal {
@@ -601,7 +623,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 			subSidecars[sidecar] = true
 			if err := os.Rename(subPath, sidecar); err != nil {
 				keepRaw[r.path] = true
-				j.say("warning: could not place sidecar subtitle (%v); keeping %s", err, subPath)
+				j.warn("could not place sidecar subtitle (%v); keeping %s", err, subPath)
 				continue
 			}
 			sidecars = append(sidecars, sidecar)
@@ -620,7 +642,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	logv("phase subtitle-convert: %s", time.Since(tFinalize).Round(time.Millisecond))
 
 	if o.noMux {
-		j.say("done (raw streams kept):")
+		j.say("%s (raw streams kept):", ui.Paint(ui.Green, "done"))
 		for _, r := range results {
 			if !wentExternal[r.path] {
 				j.say("  %s", r.path)
@@ -638,13 +660,14 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		if len(sidecars) == 0 {
 			return fmt.Errorf("no streams selected to write")
 		}
-		j.say("done (subtitles only)")
+		os.Remove(tempDir)
+		j.say("%s (subtitles only)", ui.Paint(ui.Green, "done"))
 		return nil
 	}
 
 	tMux := time.Now()
 	if err := mux.Mux(ffmpeg, muxInputs, outPath); err != nil {
-		j.say("mux failed; raw stream files kept in %s", workDir)
+		j.warn("mux failed; raw stream files kept in %s", tempDir)
 		return err
 	}
 	logv("phase mux: %s (%d inputs)", time.Since(tMux).Round(time.Millisecond), len(muxInputs))
@@ -657,9 +680,47 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 			temporary = append(temporary, r.path)
 		}
 		cleanupTempFiles(temporary, keepRaw)
+		os.Remove(tempDir) // stays if a raw subtitle was kept for recovery
 	}
-	j.say("done: %s", outPath)
+	j.say("%s %s%s", ui.Paint(ui.Green, "done:"), outPath, j.summary(prog, outPath))
 	return nil
+}
+
+// summary is the " (size, elapsed at speed)" suffix of a "done" line. A
+// playlist's shared Progress mixes several titles, so there is none for those.
+func (j job) summary(prog *engine.Progress, outPath string) string {
+	if j.prog != nil {
+		return ""
+	}
+	size := int64(-1)
+	if fi, err := os.Stat(outPath); err == nil {
+		size = fi.Size()
+	}
+	return " (" + prog.Summary(size) + ")"
+}
+
+// adoptOldTempFiles moves the temp files an older m314dl left beside the output
+// (movie.m314dl-video-1.mp4, its .part files and its checkpoint) into the
+// download's folder, so a download started before the folder existed still
+// resumes after an upgrade. The old names were the folder's name plus a dash
+// plus today's file name, so stripping that prefix is the whole rename.
+func adoptOldTempFiles(outPath, tempDir string) {
+	dir := filepath.Dir(outPath)
+	prefix := strings.TrimSuffix(filepath.Base(outPath), filepath.Ext(outPath)) + ".m314dl-"
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if os.MkdirAll(tempDir, 0o755) != nil {
+			return
+		}
+		os.Rename(filepath.Join(dir, name), filepath.Join(tempDir, strings.TrimPrefix(name, prefix)))
+	}
 }
 
 // cleanupTempFiles removes only superseded downloads, never raw subtitles
@@ -689,15 +750,15 @@ func installInterruptHandler(live bool, stopLive chan struct{}, cancel context.C
 		<-sigCh
 		if live {
 			// live: stop discovering, drain pipeline, mux what we have
-			fmt.Fprintln(os.Stderr, "\ninterrupt: finishing recording (press again to abort)")
+			fmt.Fprintln(os.Stderr, "\n"+ui.Paint(ui.Yellow, "interrupt: finishing recording (press again to abort)"))
 			close(stopLive)
 		} else {
 			// VOD: cancel now; resume state lets the next run continue
-			fmt.Fprintln(os.Stderr, "\ninterrupt: stopping (rerun the same command to resume)")
+			fmt.Fprintln(os.Stderr, "\n"+ui.Paint(ui.Yellow, "interrupt: stopping (rerun the same command to resume)"))
 			cancel()
 		}
 		<-sigCh
-		fmt.Fprintln(os.Stderr, "aborted")
+		fmt.Fprintln(os.Stderr, ui.Paint(ui.Red, "aborted"))
 		cancel()
 		os.Exit(130)
 	}()
@@ -723,13 +784,24 @@ func (j job) downloadFile(ctx context.Context, cancel context.CancelFunc, st *ma
 	}
 	j.say("file: %s (%s)", outPath, size)
 	interruptHandler(false, nil, cancel)
+	// The output file is written in place, so only its in-flight chunks need a
+	// home. They go in the same kind of folder a stream download uses, gone
+	// once the file is complete.
+	tempDir := engine.TempDir(outPath, o.tempDir)
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return err
+	}
 	prog, stopProg := j.progress(false)
-	err := engine.DownloadFile(ctx, engine.Config{Client: j.client, Threads: j.threads, Progress: prog, Verbose: j.logv}, st, outPath)
+	if j.prog == nil {
+		prog.SetName(filepath.Base(outPath))
+	}
+	err := engine.DownloadFile(ctx, engine.Config{Client: j.client, Threads: j.threads, Progress: prog, Verbose: j.logv, PartDir: tempDir}, st, outPath)
 	stopProg()
 	if err != nil {
 		return err
 	}
-	j.say("done: %s", outPath)
+	os.Remove(tempDir)
+	j.say("%s %s%s", ui.Paint(ui.Green, "done:"), outPath, j.summary(prog, outPath))
 	return nil
 }
 

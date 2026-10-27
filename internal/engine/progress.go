@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/term"
+
+	"github.com/m314dev/m314dl/internal/ui"
 )
 
 // Progress aggregates counters across all concurrently-downloading streams.
@@ -19,12 +21,16 @@ type Progress struct {
 	done       atomic.Int64
 	bytes      atomic.Int64
 	knownBytes atomic.Int64
+	conns      atomic.Int64 // segment fetches in flight right now
 
 	mu       sync.Mutex
 	samples  []sample // ring of (time, bytes) for windowed speed
 	live     bool
 	start    time.Time
+	end      time.Time     // when Render stopped; zero while it runs
 	interval time.Duration // render tick override; 0 = default (1s TTY, 5s piped)
+	name     string        // output file shown at the end of the terminal line
+	tty      bool          // set by Render: draw the bar shape, not the piped one
 
 	outMu sync.Mutex          // serializes status-line draws and Log
 	lw    *progressLineWriter // set while Render runs
@@ -44,6 +50,17 @@ func NewProgress(live bool, interval time.Duration) *Progress {
 func (p *Progress) AddTotal(n int64)      { p.total.Add(n) }
 func (p *Progress) AddDone(n int64)       { p.done.Add(n) }
 func (p *Progress) SetKnownBytes(n int64) { p.knownBytes.Store(n) }
+
+// AddConns adjusts the in-flight fetch count shown on the terminal line.
+func (p *Progress) AddConns(n int64) { p.conns.Add(n) }
+
+// SetName sets the file name the terminal line ends with. Leave it empty when
+// one Progress is shared by several downloads.
+func (p *Progress) SetName(name string) {
+	p.mu.Lock()
+	p.name = name
+	p.mu.Unlock()
+}
 
 func (p *Progress) AddBytes(n int64) {
 	cur := p.bytes.Add(n)
@@ -91,24 +108,67 @@ func fmtBytes(b int64) string {
 	return fmt.Sprintf("%dB", b)
 }
 
-// Line renders one status line. The two shapes below (VOD: "pct% | done/total
-// segs | bytes | speed/s | ETA x"; live: "REC elapsed | segs | bytes | speed/s")
-// are a stable, machine-parseable contract — external tools parse the piped
-// stderr output — so keep the field order and separators stable; "ETA ?" is the
-// deliberate unknown-ETA sentinel.
+// Line renders one status line.
+//
+// Piped (not a terminal), the two shapes below (VOD: "pct% | done/total segs |
+// bytes | speed/s | ETA x"; live: "REC elapsed | segs | bytes | speed/s") are a
+// stable, machine-parseable contract. External tools and the -rpc server parse
+// them, so keep the field order and separators stable; "ETA ?" is the deliberate
+// unknown-ETA sentinel.
+//
+// On a terminal the line is for a person instead: a bar, the size so far with
+// the estimated total, the fetches in flight, and the file name, in color when
+// ui.Color allows. A terminal line is redrawn in place and never parsed.
 func (p *Progress) Line() string {
 	done, total := p.done.Load(), p.total.Load()
 	bytes := p.bytes.Load()
 	speed := p.Speed()
 	elapsed := time.Since(p.start).Round(time.Second)
-	if p.live {
-		return fmt.Sprintf("REC %s | %d segs | %s | %s/s", elapsed, done, fmtBytes(bytes), fmtBytes(int64(speed)))
+	pct, eta, estTotal := p.estimate(done, total, bytes, speed)
+	if !p.tty {
+		if p.live {
+			return fmt.Sprintf("REC %s | %d segs | %s | %s/s", elapsed, done, fmtBytes(bytes), fmtBytes(int64(speed)))
+		}
+		return fmt.Sprintf("%5.1f%% | %d/%d segs | %s | %s/s | ETA %s", pct, done, total, fmtBytes(bytes), fmtBytes(int64(speed)), eta)
 	}
-	pct := 0.0
+	tail := ""
+	if n := p.conns.Load(); n > 0 {
+		tail += " | " + ui.Paint(ui.Dim, fmt.Sprintf("%d conns", n))
+	}
+	p.mu.Lock()
+	name := p.name
+	p.mu.Unlock()
+	if name != "" {
+		tail += " | " + name
+	}
+	rate := ui.Paint(ui.Green, fmtBytes(int64(speed))+"/s")
+	if p.live {
+		return fmt.Sprintf("%s %s | %d segs | %s | %s%s", ui.Paint(ui.Red, "REC"), elapsed, done, fmtBytes(bytes), rate, tail)
+	}
+	size := fmtBytes(bytes)
+	if total > 0 && done >= total {
+		eta = "0s" // the piped shape keeps its "?" sentinel; a person wants to see it finished
+	} else if estTotal > 0 {
+		size += "/~" + fmtBytes(estTotal)
+	}
+	return fmt.Sprintf("%s %s | %d/%d segs | %s | %s | %s%s",
+		ui.Paint(ui.Cyan, bar(pct, 20)), ui.Paint(ui.Cyan, fmt.Sprintf("%5.1f%%", pct)),
+		done, total, size, rate, ui.Paint(ui.Yellow, "ETA "+eta), tail)
+}
+
+// estimate derives the percentage, the ETA string ("?" when unknown) and the
+// projected total size (0 when unknown) from the counters. Both projections
+// assume the segments so far are typical, so they wait for a handful of them.
+func (p *Progress) estimate(done, total, bytes int64, speed float64) (pct float64, eta string, estTotal int64) {
 	if total > 0 {
 		pct = float64(done) / float64(total) * 100
 	}
-	eta := "?"
+	eta = "?"
+	if known := p.knownBytes.Load(); known > 0 {
+		estTotal = known
+	} else if done > 8 && total > 0 {
+		estTotal = int64(float64(bytes) / float64(done) * float64(total))
+	}
 	if speed > 1 && total > done && done > 8 {
 		perSeg := float64(bytes) / float64(done)
 		etaSec := perSeg * float64(total-done) / speed
@@ -116,12 +176,42 @@ func (p *Progress) Line() string {
 			eta = (time.Duration(etaSec) * time.Second).Round(time.Second).String()
 		}
 	}
-	return fmt.Sprintf("%5.1f%% | %d/%d segs | %s | %s/s | ETA %s", pct, done, total, fmtBytes(bytes), fmtBytes(int64(speed)), eta)
+	return pct, eta, estTotal
+}
+
+// bar draws "[████░░░░]" with width cells, filled in proportion to pct.
+func bar(pct float64, width int) string {
+	filled := int(float64(width) * pct / 100)
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
+}
+
+// Summary describes the finished download for the final "done" line: the
+// output size (outSize, or the bytes transferred when outSize is negative),
+// how long the download phase took, and its average speed.
+func (p *Progress) Summary(outSize int64) string {
+	p.mu.Lock()
+	end := p.end
+	p.mu.Unlock()
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if outSize < 0 {
+		outSize = p.bytes.Load()
+	}
+	elapsed := end.Sub(p.start)
+	avg := int64(0)
+	if secs := elapsed.Seconds(); secs > 0 {
+		avg = int64(float64(p.bytes.Load()) / secs)
+	}
+	return fmt.Sprintf("%s, %s at %s/s", fmtBytes(outSize), elapsed.Round(time.Second), fmtBytes(avg))
 }
 
 // Render prints progress to stderr until stop is closed. On a TTY it rewrites
 // one line; otherwise it prints a plain line each interval (machine-parseable,
-// survives redirection — no ANSI garbage). Default cadence is 1s on a TTY and
+// survives redirection, no ANSI garbage). Default cadence is 1s on a TTY and
 // 5s when piped, overridable via NewProgress's interval.
 func (p *Progress) Render(stop <-chan struct{}) {
 	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
@@ -145,11 +235,15 @@ func (p *Progress) Render(stop <-chan struct{}) {
 		return w
 	}}
 	p.outMu.Lock()
+	p.tty = isTTY
 	p.lw = &lineWriter
 	p.outMu.Unlock()
 	for {
 		select {
 		case <-stop:
+			p.mu.Lock()
+			p.end = time.Now()
+			p.mu.Unlock()
 			p.outMu.Lock()
 			lineWriter.write(p.Line(), true)
 			p.lw = nil
@@ -180,15 +274,18 @@ func (p *Progress) Log(line string) {
 	fmt.Fprintln(out, line)
 }
 
-// Progress lines are ASCII. Pad to erase the previous line without ANSI/VT
-// sequences, which classic Windows consoles don't interpret by default.
-// The same width limit applies to ticks and the final line; leave one spare
-// column to avoid terminal auto-wrap (including at an exact-width boundary).
+// progressLineWriter redraws one line in place. It pads with spaces to erase
+// the previous draw instead of using a clear-line escape, which classic Windows
+// consoles don't interpret by default. Widths are terminal columns (ui.Width),
+// so color codes and the bar glyphs in the line don't count against the
+// terminal width. The same width limit applies to ticks and the final line;
+// leave one spare column to avoid terminal auto-wrap (including at an
+// exact-width boundary).
 type progressLineWriter struct {
 	out      io.Writer
 	tty      bool
 	width    func() int
-	previous int
+	previous int // columns drawn last time
 }
 
 func (w *progressLineWriter) write(line string, final bool) {
@@ -202,19 +299,18 @@ func (w *progressLineWriter) write(line string, final bool) {
 	}
 	limit := max(0, columns-1)
 	if columns > 0 {
-		if len(line) > limit {
-			line = line[:limit]
-		}
+		line = ui.Truncate(line, limit)
 	}
-	clearWidth := max(w.previous, len(line))
+	cells := ui.Width(line)
+	clearWidth := max(w.previous, cells)
 	if columns > 0 && clearWidth > limit {
 		clearWidth = limit
 	}
-	padding := strings.Repeat(" ", max(0, clearWidth-len(line)))
+	padding := strings.Repeat(" ", max(0, clearWidth-cells))
 	suffix := ""
 	if final {
 		suffix = "\n"
 	}
 	fmt.Fprintf(w.out, "\r%s%s%s", line, padding, suffix)
-	w.previous = len(line)
+	w.previous = cells
 }

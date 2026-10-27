@@ -81,3 +81,49 @@ func TestProgressLogClearsStatusLine(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+// On a terminal the line carries a bar, the projected size, the connection
+// count and the file name; piped, it keeps the parseable shape unchanged.
+func TestProgressTerminalLine(t *testing.T) {
+	p := NewProgress(false, 0)
+	p.AddTotal(20)
+	p.AddDone(10)
+	p.AddBytes(10 << 20)
+	p.AddConns(4)
+	p.SetName("movie.mp4")
+	if got := p.Line(); !strings.HasPrefix(got, " 50.0% | 10/20 segs | 10.0MiB | ") || strings.Contains(got, "movie.mp4") {
+		t.Fatalf("piped line changed: %q", got)
+	}
+	p.tty = true
+	got := p.Line()
+	for _, want := range []string{"[██████████░░░░░░░░░░]", " 50.0% | 10/20 segs | 10.0MiB/~20.0MiB | ", "ETA ?", "4 conns | movie.mp4"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("terminal line %q lacks %q", got, want)
+		}
+	}
+	if strings.Contains(got, "\x1b") {
+		t.Fatal("colors emitted with ui.Color off")
+	}
+	// the final line at 100% has a full bar, no projection and no "ETA ?"
+	p.AddDone(10)
+	if got := p.Line(); !strings.Contains(got, "[████████████████████] 100.0% | 20/20 segs | 10.0MiB | ") || !strings.Contains(got, "ETA 0s") {
+		t.Fatalf("final line %q", got)
+	}
+	if s := p.Summary(-1); s != "10.0MiB, 0s at 0B/s" && !strings.HasPrefix(s, "10.0MiB, ") {
+		t.Fatalf("summary %q", s)
+	}
+}
+
+// The redraw pads and truncates by terminal columns, so a colored line with
+// bar glyphs is still erased cleanly and still fits the terminal.
+func TestProgressLineWriterCountsColumnsNotBytes(t *testing.T) {
+	var b bytes.Buffer
+	w := progressLineWriter{out: &b, tty: true, width: func() int { return 8 }}
+	w.write("\x1b[36m[██░░]\x1b[0m 50%", false) // 10 columns, cut to 7
+	if got, want := b.String(), "\r\x1b[36m[██░░]\x1b[0m "; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if w.previous != 7 {
+		t.Fatalf("previous = %d columns, want 7", w.previous)
+	}
+}
