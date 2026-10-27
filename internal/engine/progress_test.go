@@ -114,6 +114,19 @@ func TestProgressTerminalLine(t *testing.T) {
 	}
 }
 
+// A short playlist shows an ETA after a quarter of it is done; a long one
+// waits for nine segments, because the first few are a poor sample.
+func TestEnoughDone(t *testing.T) {
+	for _, c := range []struct {
+		done, total int64
+		want        bool
+	}{{0, 7, false}, {1, 7, false}, {2, 7, true}, {5, 100, false}, {9, 100, true}} {
+		if got := enoughDone(c.done, c.total); got != c.want {
+			t.Errorf("enoughDone(%d, %d) = %v, want %v", c.done, c.total, got, c.want)
+		}
+	}
+}
+
 // The redraw pads and truncates by terminal columns, so a colored line with
 // bar glyphs is still erased cleanly and still fits the terminal.
 func TestProgressLineWriterCountsColumnsNotBytes(t *testing.T) {

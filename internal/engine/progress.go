@@ -133,7 +133,11 @@ func (p *Progress) Line() string {
 	}
 	tail := ""
 	if n := p.conns.Load(); n > 0 {
-		tail += " | " + ui.Paint(ui.Dim, fmt.Sprintf("%d conns", n))
+		word := "conns"
+		if n == 1 {
+			word = "conn"
+		}
+		tail += " | " + ui.Paint(ui.Dim, fmt.Sprintf("%d %s", n, word))
 	}
 	p.mu.Lock()
 	name := p.name
@@ -166,10 +170,10 @@ func (p *Progress) estimate(done, total, bytes int64, speed float64) (pct float6
 	eta = "?"
 	if known := p.knownBytes.Load(); known > 0 {
 		estTotal = known
-	} else if done > 8 && total > 0 {
+	} else if total > 0 && enoughDone(done, total) {
 		estTotal = int64(float64(bytes) / float64(done) * float64(total))
 	}
-	if speed > 1 && total > done && done > 8 {
+	if speed > 1 && total > done && enoughDone(done, total) {
 		perSeg := float64(bytes) / float64(done)
 		etaSec := perSeg * float64(total-done) / speed
 		if etaSec < 360000 {
@@ -177,6 +181,13 @@ func (p *Progress) estimate(done, total, bytes int64, speed float64) (pct float6
 		}
 	}
 	return pct, eta, estTotal
+}
+
+// enoughDone says whether enough segments have finished for a projection to
+// mean something: nine of them, or a quarter of a short playlist, so a 7-segment
+// download still shows an ETA instead of "?" until it is over.
+func enoughDone(done, total int64) bool {
+	return done > 8 || (done > 0 && done*4 >= total)
 }
 
 // bar draws "[████░░░░]" with width cells, filled in proportion to pct.
