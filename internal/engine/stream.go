@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/m314dev/m314dl/internal/httpx"
@@ -208,10 +209,17 @@ func resumeRange(ranged bool, segStart, segEnd, have int64) string {
 	return ""
 }
 
+// copyBufs recycles the 1 MiB read buffers. Allocating a fresh one per segment
+// was 84% of everything a 2000-segment download allocated, and zeroing those
+// buffers alone took 15% of its CPU time.
+var copyBufs = sync.Pool{New: func() any { b := make([]byte, 1<<20); return &b }}
+
 // streamBody copies body into f, reporting bytes to progress and the controller
 // as they arrive (smooth throughput, and a live counter during a huge segment).
 func streamBody(body io.Reader, f *os.File, prog *Progress, ctl *controller, keepalive func()) (int64, error) {
-	buf := make([]byte, 1<<20)
+	bp := copyBufs.Get().(*[]byte)
+	defer copyBufs.Put(bp)
+	buf := *bp
 	var total int64
 	for {
 		n, rerr := body.Read(buf)

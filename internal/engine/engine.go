@@ -997,7 +997,9 @@ func downloadSingleFile(ctx context.Context, cfg Config, st *manifest.Stream, ou
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return err
 	}
-	buf := make([]byte, 1<<20)
+	bp := copyBufs.Get().(*[]byte)
+	defer copyBufs.Put(bp)
+	buf := *bp
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
