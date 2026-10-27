@@ -38,7 +38,8 @@ func TestWalkSamplesDefaultsAndMultipleRuns(t *testing.T) {
 			return Box("moof", Box("traf", tfhd,
 				mkFullBox("tfdt", version, 0, time),
 				mkFullBox("trun", 0, 1|4, concat(u32(2), u32(offset), u32(0))),
-				// second run inherits its data position and overrides sample timing/size
+				// the second run starts where the first ended and carries its own
+				// per-sample duration, size, flags and composition offset
 				mkFullBox("trun", 1, 0x100|0x200|0x400|0x800, concat(u32(1), u32(500), u32(3), u32(0), u32(0xffffff9c)))))
 		}
 		moof := makeMoof(0)
@@ -63,7 +64,7 @@ func TestWalkSamplesTrexAndAbsoluteBase(t *testing.T) {
 			mkFullBox("trun", 0, 1, concat(u32(2), u32(0xfffffffe)))))
 	}
 	moof := makeMoof(0)
-	moof = makeMoof(uint64(len(init) + len(moof) + 8 + 2)) // signed -2 offset lands on mdat
+	moof = makeMoof(uint64(len(init) + len(moof) + 8 + 2)) // the signed -2 offset lands on the mdat payload
 	got, err := collectSamples(concat(init, moof, Box("mdat", []byte("aabb"))))
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +118,8 @@ func TestWalkSamplesErrors(t *testing.T) {
 	if _, err := collectSamples(init); err == nil {
 		t.Fatal("no fragments accepted")
 	}
-	// An overflowing largesize must return an error, not panic while slicing.
+	// A largesize that overflows must come back as an error. Slicing with it
+	// would panic.
 	bad := concat(Box("free"), u32(1), []byte("mdat"), be64(math.MaxInt64))
 	if _, err := collectSamples(bad); err == nil {
 		t.Fatal("overflowing box accepted")

@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// SPS/PPS from an x264 baseline 320x180 encode (the fixture the e2e tests
-// generate); profile 0x42, compat 0xc0, level 0x0d.
+// SPS and PPS taken from an x264 baseline 320x180 encode, the same fixture the
+// e2e tests generate. Profile 0x42, compat 0xc0, level 0x0d.
 var (
 	testSPS, _ = hex.DecodeString("6742c00dda05067e7c0440000003004000000c83c50aa8")
 	testPPS, _ = hex.DecodeString("68ce3c80")
@@ -56,7 +56,8 @@ func TestBuildInitVideoProtected(t *testing.T) {
 		t.Fatalf("sample entry %q, want encv", e.typ)
 	}
 
-	// De-protecting it yields the plain avc1 entry with the avcC we built.
+	// Removing the protection gives back a plain avc1 entry with the avcC we
+	// built.
 	clean := SanitizeInit(init)
 	if info, _ := ParseInit(clean); info != nil {
 		t.Fatal("sanitized init still protected")
@@ -109,15 +110,16 @@ func TestBuildInitAudio(t *testing.T) {
 	}
 }
 
-// piffFragment builds a PIFF-shaped fragment: tfhd for track 2 (no tfdt) and a
-// tfxd carrying the fragment time, the way a Smooth Streaming server serves it.
+// piffFragment builds a fragment shaped like PIFF: a tfhd for trackID (2 in
+// the test), no tfdt, and a tfxd box carrying the fragment time, the way a
+// Smooth Streaming server serves it.
 func piffFragment(trackID uint32, tfxdTime, tfxdDur uint64, mdat []byte) []byte {
 	tfhd := mkFullBox("tfhd", 0, 0x000020, concat(u32(trackID), u32(0x01010000)))
 	trun := mkFullBox("trun", 0, 0x000001|0x000200, concat(u32(1), u32(0), u32(uint32(len(mdat)))))
 	tfxd := mkBox("uuid", concat(uuidTfxd, []byte{1, 0, 0, 0}, be64(tfxdTime), be64(tfxdDur)))
 	moof := mkBox("moof", concat(mkFullBox("mfhd", 0, 0, u32(1)), mkBox("traf", concat(tfhd, trun, tfxd))))
 	ti := bytes.Index(moof, []byte("trun"))
-	binary.BigEndian.PutUint32(moof[ti+12:], uint32(len(moof)+8)) // data_offset → mdat payload
+	binary.BigEndian.PutUint32(moof[ti+12:], uint32(len(moof)+8)) // data_offset: the mdat payload
 	return concat(moof, mkBox("mdat", mdat))
 }
 
@@ -159,12 +161,13 @@ func TestNormalizeFragment(t *testing.T) {
 	if got := out[moofLen+8:]; !bytes.Equal(got, mdat) {
 		t.Fatalf("mdat moved: %q", got)
 	}
-	// idempotent, and a no-op returns the very same slice
+	// Running it again changes nothing, and a no-op returns the very same slice.
 	again := NormalizeFragment(out, 1)
 	if !bytes.Equal(again, out) || &again[0] != &out[0] {
 		t.Fatal("second pass changed the fragment")
 	}
-	// trackID 0 (TS / multi-track init) leaves the id alone but still adds tfdt
+	// trackID 0 (used for TS or a multi-track init) leaves the id alone but
+	// still adds the tfdt.
 	out0 := NormalizeFragment(append([]byte(nil), frag...), 0)
 	tfhd0, _ := find(out0, "moof", "traf", "tfhd")
 	if id := binary.BigEndian.Uint32(tfhd0.payload[4:]); id != 2 {
@@ -175,8 +178,9 @@ func TestNormalizeFragment(t *testing.T) {
 	}
 }
 
-// piffWrap rewrites a fragment's senc into the PIFF uuid form (dropping any
-// saiz/saio), fixing the trun offset for the moof growth/shrink.
+// piffWrap rewrites a fragment's senc into the PIFF uuid form and drops any
+// saiz/saio. It then fixes the trun data_offset for however much the moof grew
+// or shrank.
 func piffWrap(frag []byte, override bool, ivSize byte) []byte {
 	return rebuildSeq(frag, func(b box) ([]byte, bool) {
 		if b.typ != "moof" {
@@ -247,7 +251,8 @@ func TestDecryptPIFFSampleEncryptionBox(t *testing.T) {
 			if got := mdatOf(frag); !bytes.Equal(got, plain) {
 				t.Fatalf("PIFF decrypt mismatch:\n got %q\nwant %q", got, plain)
 			}
-			// and the stripper removes the uuid box, leaving a clean fragment
+			// StripFragmentProtection removes the uuid box too, leaving a clean
+			// fragment.
 			clean := StripFragmentProtection(frag)
 			if _, ok := find(clean, "moof", "traf", "uuid"); ok {
 				t.Fatal("PIFF senc uuid survived StripFragmentProtection")
@@ -259,7 +264,8 @@ func TestDecryptPIFFSampleEncryptionBox(t *testing.T) {
 	}
 }
 
-// A synthesized init guesses the IV size; the senc's own layout corrects it.
+// An init we build ourselves guesses the IV size. The layout of the senc
+// itself corrects that guess.
 func TestSencIVSizeAutoDetect(t *testing.T) {
 	key := []byte("0123456789abcdef")
 	iv16 := func(n byte) []byte { iv := make([]byte, 16); iv[15] = n; return iv }

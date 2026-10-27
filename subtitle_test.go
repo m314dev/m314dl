@@ -100,8 +100,9 @@ func TestCleanupPreservesFailedSubtitle(t *testing.T) {
 	}
 }
 
-// Run the CLI inside a child test process: flag globals and signal handlers
-// stay isolated, while exercising the actual conversion and mux cleanup loop.
+// Run the CLI inside a child test process. The flag globals and signal
+// handlers stay separate from the test's own, while the real conversion and
+// mux cleanup code runs.
 func TestSubtitleCLIHelper(t *testing.T) {
 	if os.Getenv("M314DL_SUBTITLE_TEST_HELPER") != "1" {
 		return
@@ -159,7 +160,8 @@ func TestSubtitleFailureSurvivesSuccessfulMux(t *testing.T) {
 	if st, err := os.Stat(output); err != nil || st.Size() == 0 {
 		t.Fatalf("no muxed output: %v", err)
 	}
-	// The raw file stays in the download's temp folder, which therefore survives the cleanup too.
+	// The raw file stays in the download's temp folder, so the folder survives
+	// the cleanup too.
 	raw, err := filepath.Glob(filepath.Join(outDir, "*.m314dl", "*.rawsub"))
 	if err != nil || len(raw) != 1 {
 		t.Fatalf("failed subtitle lost after mux: %v (%v); logs: %s", raw, err, logs)

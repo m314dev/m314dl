@@ -10,21 +10,24 @@ import (
 )
 
 // ExpandIndexed replaces every SegmentBase placeholder in st (a whole
-// on-demand media file, Segment.Index set) with the subsegments its sidx
-// describes: one byte-range segment per reference, with the exact duration. The
-// engine then fetches, decrypts and publishes a few seconds at a time instead
-// of reading a whole film into RAM (a 4K feature was 11 GB — the OOM kill in
-// issue #8). Only the selected streams are expanded, one small range request
-// each; a placeholder whose index can't be fetched or parsed is kept whole,
-// with a warning, so a clear small file still downloads the old way.
+// on-demand media file with Segment.Index set) with the subsegments its sidx
+// describes. The sidx is the file's index box: a table of where each piece
+// starts and how long it plays. Each reference becomes one byte-range segment
+// with its exact duration. The engine then fetches, decrypts and publishes a
+// few seconds at a time instead of reading a whole film into RAM (a 4K feature
+// was 11 GB, the OOM kill in issue #8). Only the selected streams are expanded,
+// one small range request each. A placeholder whose index cannot be fetched or
+// parsed is kept whole, with a warning, so a clear small file still downloads
+// the old way.
 //
-// Several periods may slice the same file (per-period presentationTimeOffset
-// into one BaseURL); the file is indexed once and later placeholders for it are
-// dropped, since the first expansion already covers it end to end.
+// Several periods may slice the same file (each period has its own
+// presentationTimeOffset into one BaseURL). The file is indexed once and later
+// placeholders for it are dropped, since the first expansion already covers it
+// end to end.
 func ExpandIndexed(ctx context.Context, client *httpx.Client, st *manifest.Stream, logv func(string, ...any)) error {
-	// Nothing to do unless a segment is a SegmentBase placeholder. Template- and
-	// list-based streams (every live stream, and template VOD) keep their
-	// segments and their Seq untouched.
+	// Nothing to do unless some segment is a SegmentBase placeholder. Streams
+	// built from a template or a list (every live stream, and template VOD) keep
+	// their segments and their Seq untouched.
 	hasIndex := false
 	for i := range st.Segments {
 		if st.Segments[i].Index != nil {

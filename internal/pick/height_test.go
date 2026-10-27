@@ -13,7 +13,7 @@ func vid(w, h int) *manifest.Stream {
 
 // "Up to 720p" has to work on a source that publishes no 720p variant.
 //
-// A regex on res= cannot express it: a source publishing 768x432, 640x360 and
+// A regex on res= cannot say it: a source publishing 768x432, 640x360 and
 // 480x270 matches "720" nowhere, so the selection comes back empty and the
 // channel plays sound with no picture.
 func TestHeightBoundPicksTheBestVariantThatFits(t *testing.T) {
@@ -32,7 +32,7 @@ func TestHeightBoundPicksTheBestVariantThatFits(t *testing.T) {
 			t.Fatalf("hmax=720 returned a %dp variant", st.Height)
 		}
 	}
-	// And it takes the best that fits, not the worst.
+	// And it takes the best of the variants that fit.
 	if got[0].Height != 432 {
 		t.Fatalf("best fitting variant = %dp, want 432", got[0].Height)
 	}
@@ -51,7 +51,7 @@ func TestHeightFloorExcludesSmallVariants(t *testing.T) {
 	}
 }
 
-// A width bound matches on the other axis, for the sources where the number an
+// A width bound works on the other axis, for sources where the number an
 // operator knows is the width (720x576).
 func TestWidthBound(t *testing.T) {
 	e, err := ParseExpr("wmax=720")

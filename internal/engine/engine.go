@@ -1,7 +1,8 @@
 // Package engine downloads one stream (VOD or live) through a single
-// pipeline: feeder → worker pool → ordered writer. Live is just a feeder
-// that keeps discovering segments; everything downstream is identical —
-// no duplicated VOD/live managers.
+// pipeline: a feeder, then a worker pool, then an ordered writer. A live
+// stream only differs in the feeder, which keeps discovering new segments.
+// Everything after the feeder is the same code, so there are no separate VOD
+// and live managers.
 package engine
 
 import (
@@ -35,7 +36,7 @@ type Config struct {
 	Client    *httpx.Client
 	Threads   int                 // concurrency ceiling; 0 = auto (up to adaptiveMax)
 	Keys      map[[16]byte][]byte // CENC content keys by KID (zero KID = bare key)
-	BBTSKey   []byte              // 16-byte AES key; set → every .ts segment is BBTS-decrypted
+	BBTSKey   []byte              // 16-byte AES key; when set, every .ts segment is BBTS-decrypted
 	AdFilters []*regexp.Regexp
 	LiveLimit time.Duration   // stop live recording after this long (0 = until end)
 	Stop      <-chan struct{} // graceful live stop: feeder exits, pipeline drains, mux proceeds
@@ -44,31 +45,31 @@ type Config struct {
 	Verbose   func(format string, args ...any)
 	// PartDir, when set, is where segment part files go instead of beside the
 	// output. A stream's output already sits in its download's temp folder, so
-	// this matters for a plain file, whose output is the deliverable itself.
+	// this matters for a plain file, whose output is the finished file itself.
 	PartDir string
 	// Verbatim commits segment bytes exactly as received: no fake-image-header
-	// strip, no decryption. A plain file's chunks are its own bytes — a PNG
-	// or a chunk that happens to start with 0xFFD8 must not be "de-obfuscated".
+	// strip, no decryption. A plain file's chunks are its own bytes. A PNG, or
+	// a chunk that happens to start with 0xFFD8, must not be "de-obfuscated".
 	Verbatim bool
-	// PaceRealtime throttles a Sink restream to the source's real playback rate.
-	// A finite (VOD) source otherwise downloads flat-out and floods the live
-	// output — overrunning a TS viewer's buffer or piling the whole asset into the
-	// packager window at once. A live source already paces itself, so leave this
-	// off there.
+	// PaceRealtime slows a Sink restream down to the source's real playback
+	// rate. Without it a finite (VOD) source downloads as fast as it can and
+	// floods the live output, overrunning a TS viewer's buffer or piling the
+	// whole asset into the packager window at once. A live source already paces
+	// itself, so leave this off there.
 	PaceRealtime bool
-	// Sink, when non-nil, receives ordered decrypted segments instead of a file
-	// (live restreaming). The download pipeline is otherwise identical — same
-	// feeder, workers, decryption, and strict in-order commit — so restreaming
-	// inherits every property the file path has (adaptive concurrency, CENC/
-	// AES-128/BBTS decrypt, live refresh, hole tolerance).
+	// Sink, when non-nil, receives the ordered, decrypted segments instead of a
+	// file (live restreaming). The rest of the download pipeline is the same:
+	// the same feeder, workers, decryption and strict in-order commit. So
+	// restreaming gets every property the file path has (adaptive concurrency,
+	// CENC/AES-128/BBTS decryption, live refresh, hole tolerance).
 	Sink Sink
 
 	fileURL *fileURL // direct file behind an expiring redirect; set by DownloadFile
 }
 
-// Sink is the destination for one stream's ordered, decrypted segments. It is
-// the branch point between file output (default) and live restreaming; the
-// packager on the other side turns these calls into a live HLS/DASH/TS output.
+// Sink is where one stream's ordered, decrypted segments go. It is the point
+// where file output (the default) and live restreaming part ways. The packager
+// on the other side turns these calls into a live HLS, DASH or TS output.
 type Sink interface {
 	// Init hands over the fMP4 initialization segment (the HLS EXT-X-MAP / DASH
 	// init payload). Called at most once per init change, before the segments
@@ -78,9 +79,10 @@ type Sink interface {
 	Segment(info SegmentInfo, data []byte) error
 }
 
-// SegmentInfo is the per-segment metadata a packager needs. Seq is the source
-// media sequence (for diagnostics; the packager assigns its own monotonic
-// output sequence, so a source that rewinds its numbering can't wedge output).
+// SegmentInfo is the metadata a packager needs for each segment. Seq is the
+// source's media sequence number and is for diagnostics only. The packager
+// assigns its own output sequence that only ever goes up, so a source that
+// rewinds its numbering cannot jam the output.
 type SegmentInfo struct {
 	Seq           int64
 	Duration      float64 // seconds; 0 = unknown
@@ -100,26 +102,27 @@ type item struct {
 	seq    int64
 }
 
-// DownloadStream downloads st into outPath (raw concatenated media).
-// refresh is non-nil for live streams.
+// DownloadStream downloads st into outPath as raw media, the segments written
+// one after another. refresh is non-nil for live streams.
 func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPath string, refresh RefreshFunc) error {
 	// cfg.Threads is the concurrency ceiling; 0 means auto (handled below).
 	if cfg.Verbose == nil {
 		cfg.Verbose = func(string, ...any) {}
 	}
-	// CENC: decryption is in-process, no external mp4decrypt.
+	// CENC: decryption happens in this process, with no external mp4decrypt.
 	//
-	// Whether a stream is encrypted is decided by its init segment, not by the
-	// manifest. Packagers do omit ContentProtection — and a stream judged clear
-	// on the manifest's word has its encrypted samples copied straight through,
-	// which reaches the player as a black picture with working audio and no
-	// error raised anywhere along the way.
+	// The init segment decides whether a stream is encrypted; the manifest does
+	// not. Packagers do leave out ContentProtection. A stream judged clear on
+	// the manifest's word has its encrypted samples copied straight through,
+	// which reaches the player as a black picture with working audio, and no
+	// error is raised anywhere along the way.
 	var dec *cencDecryptor
 	var trackID uint32 // the init's sole track; fragments are retagged to it
 	switch {
 	case st.Init != nil && st.Init.URL != "":
-		// fMP4, including fMP4 SAMPLE-AES (which is the cbcs CENC scheme): the
-		// init segment's tenc/schm decides the scheme and the CENC path handles it.
+		// fMP4, including fMP4 SAMPLE-AES (which is the cbcs scheme of CENC).
+		// The init segment's tenc and schm boxes name the scheme, and the CENC
+		// path handles it.
 		initSeg, err := fetchInit(ctx, cfg, st)
 		if err != nil {
 			return err
@@ -143,8 +146,9 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 		}
 	}
 
-	// single-segment stream (SegmentBase / plain file): direct streaming path.
-	// Not taken when restreaming — a sink needs segment boundaries, not one blob.
+	// A stream with a single segment (SegmentBase or a plain file) streams
+	// straight to disk. Restreaming skips this path because a sink needs
+	// segment boundaries, and this path produces one blob.
 	if cfg.Sink == nil && !st.Live && len(st.Segments) == 1 && st.Segments[0].Key == nil && st.Segments[0].Range == nil {
 		if err := downloadSingleFile(ctx, cfg, st, outPath); err != nil {
 			return err
@@ -154,8 +158,8 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	}
 
 	// File output opens the target and loads any resume checkpoint. Restreaming
-	// has neither: segments are ephemeral and live starts at the edge, so state
-	// stays zero and the feeder behaves exactly as a fresh live run.
+	// has neither: its segments are short-lived and live starts at the edge, so
+	// the state stays at zero and the feeder behaves like a fresh live run.
 	var state *resumeState
 	var out *os.File
 	if cfg.Sink == nil {
@@ -179,14 +183,16 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Adaptive concurrency: spawn `ceiling` workers gated by a controller-resized
-	// limiter. -t sets the ceiling (a maximum, not a fixed count); the controller
-	// still ramps up to it and backs off below it on rate-limit pressure. With no
-	// -t the ceiling is adaptiveMax.
+	// Adaptive concurrency: start `ceiling` workers, gated by a limiter that the
+	// controller resizes. With -t the ceiling is that count and the controller
+	// starts right at it, backing off below it only under rate-limit pressure
+	// and then climbing back. With no -t the ceiling is adaptiveMax and the
+	// controller ramps up from adaptiveStart, hunting for the point where more
+	// requests in flight stop helping.
 	ceiling := cfg.Threads
 	var ctl *controller
 	if ceiling > 0 {
-		ctl = newFixedController(ceiling) // user pinned -t: hold it, don't ramp/sawtooth
+		ctl = newFixedController(ceiling) // user pinned -t: hold it, no ramp, no hunting
 	} else {
 		ceiling = adaptiveMax
 		ctl = newController(ceiling) // no -t: auto-tune up to adaptiveMax
@@ -216,11 +222,11 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 			err = writer(ctx, cfg, st.Live, out, outPath, state, kc, dec, trackID, results)
 		}
 		if err != nil {
-			// The writer is the only consumer of `results`. Once it dies the
-			// workers fill the buffer and park, the feeder parks on `items`, and
-			// nothing below ever returns — the process sits on the same progress
-			// line forever with no sockets open. Cancel so both unwind; the
-			// writer's error is what the caller sees (feedErr is then Canceled).
+			// The writer is the only reader of `results`. Once it dies, the
+			// workers fill the buffer and stop, the feeder stops on `items`, and
+			// nothing below ever returns: the process sits on the same progress
+			// line forever with no sockets open. Cancel so both unwind. The
+			// caller sees the writer's error (feedErr is then Canceled).
 			cancel()
 		}
 		writerDone <- err
@@ -247,9 +253,10 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 
 // ---- resume state ----
 
-// resumeState is shared between the feeder (reads NextIdx) and the writer
-// (advances NextIdx, owns Offset), so NextIdx is atomic. Offset is written only
-// by the writer and read only within writer-goroutine saves.
+// resumeState is shared by the feeder, which reads NextIdx, and the writer,
+// which advances NextIdx and owns Offset. That is why NextIdx is atomic. Only
+// the writer writes Offset, and it is read only by saves made from the writer
+// goroutine.
 type resumeState struct {
 	NextIdx atomic.Int64
 	Offset  int64
@@ -290,8 +297,9 @@ func openOutput(outPath string) (*resumeState, *os.File, error) {
 	return st, f, nil
 }
 
-// save persists the resume checkpoint atomically (write-tmp + rename), so a
-// process killed without warning mid-write can never leave a torn state file.
+// save writes the resume checkpoint atomically: it writes a temp file and then
+// renames it. A process killed without warning in the middle of a write can
+// then never leave a half-written state file behind.
 func (s *resumeState) save(outPath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -326,12 +334,13 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 	}
 
 	push := func(cur *manifest.Stream) (int, bool) {
-		// Build the whole batch first (a cheap in-memory walk), publish the
-		// total, then emit. Emitting blocks on the worker channel at download
-		// speed, so counting there would inflate the denominator over the run
-		// and slide the percentage backwards. Counting up front makes it final
-		// before the first progress tick. Live grows per refresh, but live shows
-		// elapsed/count, not a percentage, so there is no bar to run backwards.
+		// Build the whole batch first (a cheap walk in memory), publish the
+		// total, then emit. Emitting blocks on the worker channel and so runs
+		// at download speed. Counting there would grow the denominator over the
+		// run and make the percentage slide backwards. Counting up front makes
+		// the total final before the first progress tick. A live stream grows
+		// at every refresh, but live shows elapsed time and a count rather
+		// than a percentage, so there is no bar to run backwards.
 		fresh := 0
 		var batch []item
 		curKeys := make(map[string]struct{}, len(cur.Segments))
@@ -364,11 +373,12 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 				return fresh, false
 			}
 		}
-		// Prune seen to the segments the source still lists. Without this the map
-		// grows by one URL per segment for the life of the run — unbounded on a
-		// live channel that refreshes forever. A segment that has left the
-		// source's window is not re-listed, so forgetting it is safe; a looping
-		// source that re-lists one costs a single harmless re-download.
+		// Trim seen down to the segments the source still lists. Without this
+		// the map grows by one URL per segment for the life of the run, with no
+		// limit on a live channel that refreshes forever. A segment that has
+		// left the source's window is never listed again, so forgetting it is
+		// safe. A looping source that lists one again costs a single harmless
+		// re-download.
 		if len(seen) > len(curKeys) {
 			for k := range seen {
 				if _, ok := curKeys[k]; !ok {
@@ -380,7 +390,7 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 	}
 
 	if st.Live && refresh != nil && !cfg.FromStart && state.NextIdx.Load() == 0 {
-		// start at the live edge: mark the DVR backlog seen, keep last 3
+		// start at the live edge: mark the DVR backlog as seen, keep the last 3
 		keep := 3
 		if n := len(st.Segments); n > keep {
 			for i := 0; i < n-keep; i++ {
@@ -463,16 +473,17 @@ type result struct {
 	pressure int
 }
 
-// worker streams each segment to its part file. It does not decrypt or hold the
-// segment in memory — the writer decrypts and assembles in order.
+// worker streams each segment to its part file. It does not decrypt and does
+// not keep the segment in memory; the writer decrypts and assembles in order.
 //
 // Restreaming keeps the part file too, even though its writer reads the whole
 // thing straight back into RAM to decrypt it. Holding those bytes in memory
-// instead was tried and reverted: the pipeline is 64 workers deep with a
-// results channel twice that, which costs nothing when the depth is measured in
-// file handles and 19 GB in one process when it is measured in segments. Point
-// the spool at a tmpfs and the writes never reach a disk anyway, with a size cap
-// the kernel enforces — which is the part an in-process buffer was missing.
+// instead was tried and reverted. The pipeline is 64 workers deep with a
+// results channel twice that size. That depth costs nothing when it is counted
+// in file handles, and 19 GB in one process when it is counted in segments.
+// Point the spool at a tmpfs and the writes never reach a disk anyway, with a
+// size cap the kernel enforces, which is the part an in-process buffer was
+// missing.
 func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, items <-chan item, results chan<- result) {
 	for it := range items {
 		if err := ctl.lim.acquire(ctx); err != nil {
@@ -500,31 +511,34 @@ func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, it
 	}
 }
 
-// decryptSegment applies the same in-place transforms the old inline path did,
-// in the same order: strip fake image header, then CENC, then AES-128, then BBTS.
-// trackID is the fMP4 init's sole track (0 for TS or multi-track inits).
+// decryptSegment applies the same in-place transforms the old inline path
+// did, in the same order: strip the fake image header, then CENC, then
+// AES-128, then BBTS. trackID is the fMP4 init's only track (0 for TS, or for
+// an init with several tracks).
 func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, trackID uint32, bbtsKey []byte, keys map[[16]byte][]byte, it item, data []byte) ([]byte, error) {
 	// AES-128 encrypts the whole segment, so before decrypting there is no TS
-	// sync or box to find — only random bytes. Ciphertext that happens to open
-	// FF D8 (JPEG) and hold three 0x47s 188 apart got chopped to a non-block
-	// length (3isk/grzcdn seg 188). Strip after decrypting instead.
+	// sync byte or MP4 box to find, only random-looking bytes. Ciphertext that
+	// happened to start with FF D8 (JPEG) and to hold three 0x47 bytes 188
+	// apart was once cut to a length that was not a multiple of the block size
+	// (3isk/grzcdn seg 188). So strip after decrypting instead.
 	aes128 := it.key != nil && it.key.Method == manifest.EncAES128
 	if !aes128 {
 		data = stripFakeImageHeader(data)
 	}
-	// fMP4 CENC and fMP4 SAMPLE-AES (== cbcs) both decrypt through the CENC path;
-	// the init's tenc/schm already selected the scheme when dec was built.
+	// fMP4 CENC and fMP4 SAMPLE-AES (which is cbcs) both decrypt through the
+	// CENC path. The init's tenc and schm boxes already chose the scheme when
+	// dec was built.
 	if !it.isInit && dec != nil && it.key != nil &&
 		(it.key.Method == manifest.EncCENC || it.key.Method == manifest.EncSampleAES) {
 		if err := dec.decrypt(data); err != nil {
 			return nil, fmt.Errorf("CENC decrypt: %w", err)
 		}
-		// samples are now plaintext — drop senc/saiz/saio so nothing downstream
-		// treats the fragment as still encrypted
+		// The samples are now plaintext. Drop the senc, saiz and saio boxes so
+		// nothing downstream treats the fragment as still encrypted.
 		data = mp4.StripFragmentProtection(data)
 	}
-	// Transport-stream SAMPLE-AES (no fMP4 init): decrypt the elementary streams
-	// per Apple's spec and re-emit a clean TS.
+	// Transport-stream SAMPLE-AES (no fMP4 init): decrypt the elementary
+	// streams the way Apple's spec describes and write out a clean TS.
 	if !it.isInit && dec == nil && it.key != nil && it.key.Method == manifest.EncSampleAES {
 		key, err := sampleAESKey(ctx, kc, keys, it.key)
 		if err != nil {
@@ -557,8 +571,9 @@ func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, track
 		}
 		data = stripFakeImageHeader(data)
 	}
-	// BBTS: whole-segment iQiyi-style TS cipher. The key is supplied out of band;
-	// the IV rides in each segment's own SDT. Media segments only (no init).
+	// BBTS: an iQiyi-style cipher over the whole TS segment. The key is supplied
+	// separately; the IV is carried in each segment's own SDT table. Media
+	// segments only, never the init.
 	if len(bbtsKey) > 0 && !it.isInit {
 		out, err := bbts.Decrypt(data, bbtsKey)
 		if err != nil {
@@ -566,25 +581,28 @@ func decryptSegment(ctx context.Context, kc *keyCache, dec *cencDecryptor, track
 		}
 		data = out
 	}
-	// CENC init: de-protect it (encv→avc1, drop sinf/pssh) so the muxed or raw
-	// output isn't flagged encrypted over now-plaintext samples.
+	// CENC init: remove its protection (rename encv to avc1, drop sinf and
+	// pssh) so the muxed or raw output is not marked encrypted while its
+	// samples are now plaintext.
 	if it.isInit && dec != nil {
 		data = mp4.SanitizeInit(data)
 	}
 	// fMP4 media: make the fragment agree with its init. A Smooth Streaming
-	// source has a synthesized init, so its PIFF fragments must be retagged to
-	// the init's track and given the tfdt they lack; a packaged DASH/HLS fragment
-	// already matches and passes through unchanged. Runs after the decrypt, which
-	// needs the original moof offsets.
+	// source has a synthesized init, so its PIFF fragments must be re-tagged
+	// with the init's track id and given the tfdt (decode time) box they lack.
+	// A packaged DASH or HLS fragment already matches and passes through
+	// unchanged. This runs after the decrypt, which needs the original moof
+	// offsets.
 	if !it.isInit && trackID != 0 {
 		data = mp4.NormalizeFragment(data, trackID)
 	}
 	return data, nil
 }
 
-// stripFakeImageHeader removes fake PNG/JPEG/GIF/BMP prefixes some CDNs
-// prepend to TS segments as crude obfuscation. The real TS/fMP4 payload
-// starts at the first 0x47 sync byte or 'ftyp'/'styp'/'moof' box.
+// stripFakeImageHeader removes the fake PNG, JPEG, GIF or BMP header some CDNs
+// put in front of TS segments as a crude disguise. The real TS or fMP4 payload
+// starts at the first 0x47 sync byte or at the first 'ftyp', 'styp' or 'moof'
+// box.
 func stripFakeImageHeader(b []byte) []byte {
 	if len(b) < 8 {
 		return b
@@ -669,7 +687,8 @@ func decryptAES128CBC(data, key, iv []byte) ([]byte, error) {
 	}
 	out := make([]byte, len(data))
 	cipher.NewCBCDecrypter(block, iv).CryptBlocks(out, data)
-	// PKCS7 unpad (tolerant: leave as-is when padding looks invalid)
+	// Remove the PKCS7 padding. Be tolerant: leave the data as it is when the
+	// padding looks invalid.
 	pad := int(out[len(out)-1])
 	if pad >= 1 && pad <= 16 && pad <= len(out) {
 		valid := true
@@ -688,19 +707,20 @@ func decryptAES128CBC(data, key, iv []byte) ([]byte, error) {
 
 // ---- ordered writer ----
 
-// pend records a downloaded-but-not-yet-committed segment: either an item whose
-// part file is on disk, or a live hole (failed segment, skipped).
+// pend is a segment that has been downloaded but not yet committed: either an
+// item whose part file is on disk, or a hole in a live stream (a failed
+// segment that was skipped).
 type pend struct {
 	it   item
 	hole bool
 }
 
 // commitInOrder drains results and commits segments in strict index order. It
-// is the single implementation of ordering and live-hole tolerance shared by
-// the file writer and the restream sink writer; only `commit` (what to do with
-// a ready segment) and `afterCommit` (per-segment bookkeeping, may be nil)
-// differ between them. Returns the first fatal error, or a missing-segments
-// error if the stream ended with gaps a non-live run can't tolerate.
+// is the one place that handles ordering and live holes, shared by the file
+// writer and the restream sink writer. The two differ only in `commit` (what
+// to do with a ready segment) and `afterCommit` (bookkeeping after each
+// segment; may be nil). It returns the first fatal error, or a missing-segments
+// error when the stream ended with gaps that a non-live run cannot accept.
 func commitInOrder(cfg Config, live bool, state *resumeState, results <-chan result,
 	commit func(idx int64, p pend) error, afterCommit func(next int64)) error {
 	pending := map[int64]pend{}
@@ -710,8 +730,9 @@ func commitInOrder(cfg Config, live bool, state *resumeState, results <-chan res
 			if failed == nil {
 				failed = fmt.Errorf("segment %d (%s): %w", r.it.idx, r.it.url, r.err)
 			}
-			// A stopped run cancels every in-flight fetch at once; dozens of
-			// "segment failed: context canceled" lines are noise, not failures.
+			// A stopped run cancels every fetch in flight at once. Dozens of
+			// "segment failed: context canceled" lines would be noise, since
+			// nothing really failed.
 			if !errors.Is(r.err, context.Canceled) {
 				cfg.Verbose("segment failed: %s: %v", r.it.url, r.err)
 			}
@@ -719,8 +740,8 @@ func commitInOrder(cfg Config, live bool, state *resumeState, results <-chan res
 				// live: the segment is gone; a hole keeps the stream moving
 				pending[r.it.idx] = pend{hole: true}
 			}
-			// VOD: no hole — the resume index must not advance past a failed
-			// segment, or resume would silently skip it
+			// VOD: no hole. The resume index must not move past a failed
+			// segment, or a resume would silently skip it.
 			continue
 		}
 		pending[r.it.idx] = pend{it: r.it}
@@ -743,7 +764,7 @@ func commitInOrder(cfg Config, live bool, state *resumeState, results <-chan res
 			}
 		}
 	}
-	// missing index means the segment failed to download
+	// an index still pending means that segment failed to download
 	if len(pending) > 0 && failed == nil {
 		failed = fmt.Errorf("%d segments missing at end of stream", len(pending))
 	}
@@ -753,10 +774,10 @@ func commitInOrder(cfg Config, live bool, state *resumeState, results <-chan res
 // writer commits segments to a single output file with resume checkpointing.
 func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath string, state *resumeState, kc *keyCache, dec *cencDecryptor, trackID uint32, results <-chan result) error {
 	// commit decrypts one segment's part file and appends it to the output.
-	// ponytail: reads the whole part file into memory to decrypt (CENC/AES need
-	// the full segment); peak memory is one segment, not one per worker. A
-	// stream-copy fast path for clear segments could drop that to O(buffer) if a
-	// pathological huge-clear-segment case ever shows up.
+	// ponytail: reads the whole part file into memory to decrypt it (CENC and
+	// AES need the full segment); peak memory is one segment instead of one per
+	// worker. A streaming copy for clear segments could cut that to one buffer
+	// if a huge clear segment ever turns up as a real problem.
 	commit := func(idx int64, p pend) error {
 		if p.hole {
 			return nil
@@ -771,13 +792,13 @@ func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath st
 		state.Offset += int64(len(data))
 		return nil
 	}
-	// Checkpoint on every commit. This process may be killed without warning (a
-	// raw-mode TUI turns Ctrl-C into a keypress, not a signal), so the state must
-	// match what's on disk *before* the kill: a stale offset would make
-	// openOutput truncate committed data and re-download it. The uncommitted tail
-	// still resumes from its part files, so a kill costs at most the one segment
-	// being written. The write is atomic and tiny; fsync stays periodic
-	// (power-loss hardening).
+	// Checkpoint after every commit. This process may be killed without warning
+	// (a TUI in raw mode turns Ctrl-C into a keypress instead of a signal), so
+	// the state file must match what is on disk before the kill happens. A
+	// stale offset would make openOutput truncate committed data and download
+	// it again. The uncommitted tail still resumes from its part files, so a
+	// kill costs at most the one segment being written. The write is atomic and
+	// tiny. fsync stays periodic; it is there to survive power loss.
 	afterCommit := func(next int64) {
 		state.save(outPath)
 		if next%20 == 0 {
@@ -817,11 +838,12 @@ func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, stat
 		if err := cfg.Sink.Segment(info, data); err != nil {
 			return err
 		}
-		// Pace a finite restream to real time: emit a short prime burst so players
-		// start without waiting, then hold each further segment to its own duration.
-		// Emitting in order here means the sleep backpressures the whole pipeline
-		// down to the source's natural rate — the download stops racing ahead, so
-		// the live output never floods. A live source is already paced; skip it.
+		// Pace a finite restream to real time: send a short burst first so
+		// players can start without waiting, then hold each further segment
+		// for its own duration. Because segments are emitted in order here,
+		// the sleep slows the whole pipeline down to the source's natural rate.
+		// The download stops racing ahead, so the live output never floods. A
+		// live source is already paced; skip it.
 		if cfg.PaceRealtime && info.Duration > 0 {
 			emitted++
 			if emitted <= pacePrimeSegments {
@@ -846,16 +868,17 @@ func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, stat
 	return commitInOrder(cfg, live, state, results, commit, nil)
 }
 
-// pacePrimeSegments is how many segments a paced restream emits back-to-back
-// before throttling to real time, so a joining player fills its buffer at once
-// instead of waiting one segment-duration per segment for playback to start.
+// pacePrimeSegments is how many segments a paced restream sends back to back
+// before slowing to real time. A player that joins then fills its buffer at
+// once instead of waiting one segment duration per segment before playback
+// starts.
 const pacePrimeSegments = 3
 
-// readDecrypt reads a committed segment's part file, decrypts it in place, and
-// deletes the part file. Shared by both writers. The part file goes even when
-// the decrypt fails: a worker killed and restarted across a bad stream would
-// otherwise leave its segments behind, and 1430 of those directories once ate
-// 43 GB nobody could see.
+// readDecrypt reads a committed segment's part file, decrypts it in place and
+// deletes the part file. Both writers use it. The part file is deleted even
+// when the decrypt fails. Otherwise a worker killed and restarted on a bad
+// stream would leave its segments behind, and 1430 of those directories once
+// took up 43 GB that nobody could see.
 func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, trackID uint32, outPath string, idx int64, it item) ([]byte, error) {
 	part := partPath(cfg.PartDir, outPath, idx)
 	data, err := os.ReadFile(part)
@@ -871,12 +894,12 @@ func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecrypt
 
 // ---- plain file ----
 
-// DownloadFile downloads a plain file whose stream is either one whole-object
-// segment (single connection) or consecutive byte-range chunks of the object
-// (parallel, resumable — the ordinary segment pipeline). A server that passed
-// the range probe but then answers a chunk with the whole object is caught by
-// the worker (ErrRangeIgnored) and the download restarts on one connection,
-// resuming from whatever contiguous prefix was already committed.
+// DownloadFile downloads a plain file. Its stream is either one whole-object
+// segment (a single connection) or consecutive byte-range chunks of the object
+// (parallel and resumable, through the ordinary segment pipeline). A server
+// that passed the range probe but then answers a chunk with the whole object is
+// caught by the worker (ErrRangeIgnored), and the download restarts on one
+// connection, resuming from whatever unbroken prefix was already committed.
 func DownloadFile(ctx context.Context, cfg Config, st *manifest.Stream, outPath string) error {
 	if cfg.Verbose == nil {
 		cfg.Verbose = func(string, ...any) {}
@@ -915,11 +938,11 @@ func DownloadFile(ctx context.Context, cfg Config, st *manifest.Stream, outPath 
 	return DownloadStream(ctx, cfg, &single, outPath, nil)
 }
 
-// fileURL is a direct file's current download URL, re-resolvable from the URL
-// the user gave. IPTV panels (Xtream Codes / XUI) and signed-redirect hosts
-// redirect to a short-lived token URL; a long chunked download outlives it and
-// its later chunks are refused (406, 403). Requesting the origin again mints a
-// fresh token.
+// fileURL is a direct file's current download URL, which can be resolved again
+// from the URL the user gave. IPTV panels (Xtream Codes, XUI) and hosts with
+// signed redirects send us to a token URL that expires soon. A long chunked
+// download outlives it, and its later chunks are refused (406, 403).
+// Requesting the origin again gives a fresh token.
 type fileURL struct {
 	origin string
 	mu     sync.Mutex
@@ -933,8 +956,8 @@ func (f *fileURL) get() string {
 }
 
 // refresh replaces stale with a freshly resolved URL. Workers refused on the
-// same stale URL share one re-resolve: the lock is held across the request, so
-// the rest wait for it and then find cur already moved on.
+// same stale URL share one re-resolve: the lock is held while the request
+// runs, so the others wait for it and then find cur already changed.
 func (f *fileURL) refresh(ctx context.Context, c *httpx.Client, stale string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -952,7 +975,8 @@ func (f *fileURL) refresh(ctx context.Context, c *httpx.Client, stale string) er
 
 // ---- single big file ----
 
-// downloadSingleFile streams one URL to disk with byte-offset resume.
+// downloadSingleFile streams one URL to disk, resuming from the bytes already
+// on disk.
 func downloadSingleFile(ctx context.Context, cfg Config, st *manifest.Stream, outPath string) error {
 	u := st.Segments[0].URL
 	var offset int64
@@ -1045,8 +1069,8 @@ func TempDir(outPath, root string) string {
 
 // TempStreamPath is the raw file one stream downloads to inside its download's
 // TempDir: <type>-<id><ext>, for example video-1.mp4 or subtitles-en.rawsub.
-// Stream ids repeat across manifests ("video=3000000", "1"), which is why the
-// folder, not the file name, is what keeps concurrent downloads apart.
+// Stream ids repeat across manifests ("video=3000000", "1"), so the folder is
+// what keeps concurrent downloads apart; the file name alone could not.
 func TempStreamPath(dir string, st *manifest.Stream, ext string) string {
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", st.Type, sanitize(st.ID), ext))
 }

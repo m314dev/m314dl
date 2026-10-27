@@ -8,33 +8,35 @@ import (
 	"fmt"
 )
 
-// Scheme is a CENC protection scheme (ISO/IEC 23001-7).
+// Scheme is one of the CENC encryption schemes from ISO/IEC 23001-7. The
+// scheme says which AES mode is used and whether a crypt:skip block pattern
+// applies.
 type Scheme string
 
 const (
-	SchemeCENC Scheme = "cenc" // AES-128 CTR, full subsample
-	SchemeCBC1 Scheme = "cbc1" // AES-128 CBC, full subsample
-	SchemeCENS Scheme = "cens" // AES-128 CTR, pattern
-	SchemeCBCS Scheme = "cbcs" // AES-128 CBC, pattern, constant IV
+	SchemeCENC Scheme = "cenc" // AES-128 CTR mode, whole subsample encrypted
+	SchemeCBC1 Scheme = "cbc1" // AES-128 CBC mode, whole subsample encrypted
+	SchemeCENS Scheme = "cens" // AES-128 CTR mode with a block pattern
+	SchemeCBCS Scheme = "cbcs" // AES-128 CBC mode, block pattern, constant IV
 )
 
-// InitInfo is the protection metadata extracted from an init segment's tenc
-// and schm boxes. One per track (audio and video carry their own).
+// InitInfo holds the protection settings read from an init segment's tenc and
+// schm boxes. There is one per track; audio and video each carry their own.
 type InitInfo struct {
 	Scheme         Scheme
 	DefaultKID     [16]byte
-	PerSampleIVLen int    // 0, 8 or 16; 0 => constant IV (cbcs)
-	CryptByteBlock int    // pattern: encrypted 16-byte blocks per run
-	SkipByteBlock  int    // pattern: clear 16-byte blocks per run
+	PerSampleIVLen int    // 0, 8 or 16 bytes; 0 means one constant IV (cbcs)
+	CryptByteBlock int    // pattern: how many 16-byte blocks in a row are encrypted
+	SkipByteBlock  int    // pattern: how many 16-byte blocks after them are left clear
 	ConstantIV     []byte // used when PerSampleIVLen == 0
 	Protected      bool
 }
 
-// isCTR reports whether the scheme uses AES-CTR (vs AES-CBC).
+// isCTR reports whether the scheme uses AES-CTR. The other two use AES-CBC.
 func (s Scheme) isCTR() bool { return s == SchemeCENC || s == SchemeCENS }
 
-// ParseInit extracts CENC protection info from an fMP4 init segment.
-// Returns (nil, nil) when the segment is not encrypted.
+// ParseInit reads the CENC protection info from a fragmented MP4 (fMP4) init
+// segment. It returns (nil, nil) when the segment is not encrypted.
 func ParseInit(initSeg []byte) (*InitInfo, error) {
 	stsd, ok := find(initSeg, "moov", "trak", "mdia", "minf", "stbl", "stsd")
 	if !ok {
@@ -44,7 +46,7 @@ func ParseInit(initSeg []byte) (*InitInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	// stsd: entry_count(4) then sample entries
+	// stsd payload: a 4-byte entry_count, then the sample entries
 	if len(entries) < 4 {
 		return nil, nil
 	}
@@ -99,19 +101,22 @@ func parseSinf(sinf box) (*InitInfo, error) {
 		return nil, errors.New("mp4: no tenc box")
 	}
 	if !haveScheme {
-		info.Scheme = SchemeCENC // default per spec when schm absent
+		info.Scheme = SchemeCENC // the spec's default when there is no schm box
 	}
 	return info, nil
 }
 
-// parseTenc reads the TrackEncryptionBox (ISO 23001-7 §8.2).
+// parseTenc reads the TrackEncryptionBox (tenc, ISO 23001-7 §8.2), which
+// holds the track's default encryption settings.
 func parseTenc(b box, info *InitInfo) error {
 	version, _, rest, err := fullBox(b.payload)
 	if err != nil {
 		return err
 	}
-	// rest: reserved(1), {reserved(1) | crypt/skip nibbles(1)}, isProtected(1),
-	//       perSampleIVSize(1), KID(16), [constIVsize(1), constIV(n)]
+	// Layout of rest: reserved(1), then one byte that is reserved in version 0
+	// and holds the crypt/skip nibbles in version 1, isProtected(1),
+	// perSampleIVSize(1), KID(16). When the IV size is 0 this is followed by
+	// constIVsize(1) and constIV(n).
 	if len(rest) < 20 {
 		return errors.New("mp4: short tenc")
 	}
@@ -135,15 +140,18 @@ func parseTenc(b box, info *InitInfo) error {
 	return nil
 }
 
-// subsample is one clear/encrypted split within a sample.
+// subsample is one piece of a sample: a run of clear bytes followed by a run
+// of encrypted bytes.
 type subsample struct {
 	clear     uint32
 	encrypted uint32
 }
 
-// DecryptFragment decrypts a fragmented-MP4 media segment (styp?/moof/mdat)
-// in place using key. info comes from the track's init segment. The buffer is
-// mutated: encrypted sample bytes are replaced with plaintext.
+// DecryptFragment decrypts a fragmented MP4 media segment in place with key.
+// A segment is an optional styp box followed by moof/mdat pairs (the moof
+// holds the sample table, the mdat holds the sample bytes). info comes from
+// the track's init segment. The buffer is changed: encrypted sample bytes are
+// overwritten with plaintext.
 func DecryptFragment(frag []byte, info *InitInfo, key []byte) error {
 	if len(key) != 16 {
 		return fmt.Errorf("mp4: CENC key is %d bytes, want 16", len(key))
@@ -152,7 +160,8 @@ func DecryptFragment(frag []byte, info *InitInfo, key []byte) error {
 	if err != nil {
 		return err
 	}
-	// Walk top-level boxes, remembering each moof and its following mdat.
+	// Walk the top-level boxes. Remember each moof, then decrypt when the mdat
+	// that follows it arrives.
 	var moofOff int64 = -1
 	var moof box
 	var perr error
@@ -163,7 +172,7 @@ func DecryptFragment(frag []byte, info *InitInfo, key []byte) error {
 			moofOff = b.off
 		case "mdat":
 			if moofOff < 0 {
-				return true // stray mdat
+				return true // an mdat with no moof before it; skip it
 			}
 			mdatData := frag[b.off+b.hdrLen : b.off+b.hdrLen+int64(len(b.payload))]
 			if err := decryptTrafs(frag, moof, moofOff, b.off, mdatData, info, block); err != nil {
@@ -177,7 +186,8 @@ func DecryptFragment(frag []byte, info *InitInfo, key []byte) error {
 	return perr
 }
 
-// decryptTrafs handles every traf in one moof, decrypting into mdatData.
+// decryptTrafs decrypts the samples of every traf (track fragment) in one
+// moof. The sample bytes live in mdatData.
 func decryptTrafs(frag []byte, moof box, moofOff, mdatOff int64, mdatData []byte, info *InitInfo, block cipher.Block) error {
 	var ferr error
 	moof.children(func(tf box) bool {
@@ -193,10 +203,11 @@ func decryptTrafs(frag []byte, moof box, moofOff, mdatOff int64, mdatData []byte
 	return ferr
 }
 
-// trunRun is one trun's contribution to a traf: its sample sizes and where its
-// (contiguous) sample data begins. A traf may carry several truns; their sample
-// data may sit in different, non-adjacent regions of the mdat, while senc/saiz
-// describe every sample of the traf as one global in-order list.
+// trunRun is what one trun (track run) adds to a traf: its sample sizes and
+// where its sample data begins. The samples of one trun sit next to each other
+// in the mdat. A traf may hold several truns, and their data can sit in
+// separate, non-adjacent parts of the mdat. senc and saiz, on the other hand,
+// list every sample of the traf as one list in trun order.
 type trunRun struct {
 	sizes   []uint32
 	dataOff int64
@@ -224,8 +235,8 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 		case "tfhd":
 			baseIsMoof, tfhdBaseDataOff, haveTfhdBaseDataOff, tfhdDefaultSize, haveTfhdDefaultSize = parseTfhd(b)
 		case "trun":
-			// Collect every trun in order (not just the last): senc/saiz index
-			// samples globally across all of them.
+			// Keep every trun, in order. senc and saiz number the samples across
+			// all truns of the traf, so each one is needed to line them up.
 			if sizes, off, ok := parseTrunWithDefault(b, tfhdDefaultSize, haveTfhdDefaultSize); ok {
 				hasOff := len(b.payload) >= 4 && b.payload[3]&0x01 != 0
 				truns = append(truns, trunRun{sizes: sizes, dataOff: off, hasOff: hasOff})
@@ -233,8 +244,9 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 		case "senc":
 			sencIVs, sencSubs, haveSenc = parseSencAuto(b.payload, info.PerSampleIVLen)
 		case "uuid":
-			// PIFF 1.1 SampleEncryptionBox: senc's ancestor, same layout after the
-			// 16-byte extended type, plus optional AlgorithmID/IV_size/KID overrides.
+			// The PIFF 1.1 SampleEncryptionBox is the older form of senc. After
+			// the 16-byte extended type it has the same layout as senc, plus
+			// optional AlgorithmID/IV_size/KID overrides.
 			if isUUID(b, uuidPiffSenc) {
 				sencIVs, sencSubs, haveSenc = parsePiffSenc(b, info.PerSampleIVLen)
 			}
@@ -249,7 +261,8 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 		return nil // no samples described; nothing to do
 	}
 
-	// Resolve where sample data begins, relative to the whole fragment buffer.
+	// Work out the base that trun data offsets are measured from, as a position
+	// in the whole fragment buffer.
 	var base int64
 	switch {
 	case baseIsMoof:
@@ -257,17 +270,19 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 	case haveTfhdBaseDataOff:
 		base = tfhdBaseDataOff
 	default:
-		base = moofOff // default-base-is-moof is the fragmented norm
+		base = moofOff // no flag set: measure from the moof, the usual fMP4 layout
 	}
 	mdatBase := mdatOff + mdatHeaderLen(frag, mdatOff)
 
-	// senc/saiz describe the traf's samples as one global list, in trun order.
+	// senc and saiz describe all samples of the traf as one list in trun order,
+	// so count them all.
 	total := 0
 	for _, t := range truns {
 		total += len(t.sizes)
 	}
 
-	// Recover per-sample IVs + subsamples: prefer senc, else saiz/saio.
+	// Get each sample's IV and subsample layout. Use senc when present,
+	// otherwise the aux info that saiz/saio point to.
 	ivs := sencIVs
 	subs := sencSubs
 	if !haveSenc {
@@ -278,12 +293,13 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 		}
 	}
 
-	// Walk samples globally: trun order, then sample order. Each trun's data
-	// begins at base + its data_offset (its samples are contiguous from there); a
-	// trun that omits data_offset continues where the previous one ended.
+	// Visit the samples in trun order, then sample order within each trun. A
+	// trun's data begins at base + its data_offset and its samples follow one
+	// another from there. A trun with no data_offset continues where the
+	// previous one ended.
 	i := 0
 	var pos int64
-	iv := make([]byte, 16) // reused per sample; decryptSample copies it before use
+	iv := make([]byte, 16) // reused per sample; decryptSample copies it first
 	for k, t := range truns {
 		if k == 0 || t.hasOff {
 			pos = base + t.dataOff - mdatBase
@@ -312,14 +328,16 @@ func decryptOneTraf(frag []byte, traf box, moofOff, mdatOff int64, mdatData []by
 	return nil
 }
 
-// fillSampleIV writes the 16-byte IV/counter for sample i into iv (reused across
-// samples; decryptSample's cipher constructors copy it, so reuse is safe).
+// fillSampleIV writes the 16-byte IV for sample i into iv. (In CTR mode the IV
+// is the starting counter; in CBC mode it starts the chain.) The same buffer
+// is reused for every sample; the cipher constructors in decryptSample copy
+// it, so that is safe.
 func fillSampleIV(iv []byte, ivs [][]byte, i int, info *InitInfo) {
 	for j := range iv {
 		iv[j] = 0
 	}
 	if i < len(ivs) && len(ivs[i]) > 0 {
-		copy(iv, ivs[i]) // 8-byte IVs left-align, low bytes stay zero
+		copy(iv, ivs[i]) // an 8-byte IV fills the first 8 bytes; the rest stay zero
 		return
 	}
 	if len(info.ConstantIV) > 0 {
@@ -327,7 +345,7 @@ func fillSampleIV(iv []byte, ivs [][]byte, i int, info *InitInfo) {
 	}
 }
 
-// decryptSample decrypts one sample in place per the active scheme.
+// decryptSample decrypts one sample in place, following the scheme in info.
 func decryptSample(sample, iv []byte, subs []subsample, info *InitInfo, block cipher.Block) error {
 	if info.Scheme.isCTR() {
 		return decryptCTR(sample, iv, subs, info, block)
@@ -335,8 +353,9 @@ func decryptSample(sample, iv []byte, subs []subsample, info *InitInfo, block ci
 	return decryptCBC(sample, iv, subs, info, block)
 }
 
-// decryptCTR handles cenc (no pattern) and cens (pattern). Only encrypted
-// subsample bytes consume keystream; clear bytes pass through.
+// decryptCTR handles cenc (no pattern) and cens (pattern). Only the encrypted
+// bytes of each subsample use up keystream; clear bytes are left as they are
+// and do not advance the stream.
 func decryptCTR(sample, iv []byte, subs []subsample, info *InitInfo, block cipher.Block) error {
 	stream := cipher.NewCTR(block, iv)
 	patterned := info.Scheme == SchemeCENS && (info.CryptByteBlock > 0 || info.SkipByteBlock > 0)
@@ -353,7 +372,7 @@ func decryptCTR(sample, iv []byte, subs []subsample, info *InitInfo, block ciphe
 	}
 	pos := 0
 	for _, s := range subs {
-		pos += int(s.clear) // skip clear bytes (no keystream consumed)
+		pos += int(s.clear) // skip the clear bytes; they use no keystream
 		e := pos + int(s.encrypted)
 		if e > len(sample) {
 			return errors.New("subsample exceeds sample")
@@ -364,7 +383,8 @@ func decryptCTR(sample, iv []byte, subs []subsample, info *InitInfo, block ciphe
 	return nil
 }
 
-// decryptCBC handles cbc1 (full) and cbcs (pattern, constant IV per subsample).
+// decryptCBC handles cbc1 (every block encrypted) and cbcs (block pattern, and
+// the same constant IV restarts the chain for each subsample).
 func decryptCBC(sample, iv []byte, subs []subsample, info *InitInfo, block cipher.Block) error {
 	patterned := info.Scheme == SchemeCBCS && (info.CryptByteBlock > 0 || info.SkipByteBlock > 0)
 	decRange := func(buf []byte) {
@@ -391,7 +411,8 @@ func decryptCBC(sample, iv []byte, subs []subsample, info *InitInfo, block ciphe
 	return nil
 }
 
-// decryptCBCFull decrypts whole 16-byte blocks (trailing partial left clear).
+// decryptCBCFull decrypts all whole 16-byte blocks. A partial block at the end
+// is left as it is.
 func decryptCBCFull(buf, iv []byte, block cipher.Block) {
 	n := len(buf) - len(buf)%16
 	if n == 0 {
@@ -400,16 +421,18 @@ func decryptCBCFull(buf, iv []byte, block cipher.Block) {
 	cipher.NewCBCDecrypter(block, iv[:16]).CryptBlocks(buf[:n], buf[:n])
 }
 
-// applyPatternCBC decrypts with the cbcs crypt:skip block pattern. CBC chains
-// continuously across the encrypted blocks; skipped blocks are untouched. IV
-// starts at the given (constant) IV for this protected range.
+// applyPatternCBC decrypts with the cbcs crypt:skip block pattern: cryptBlocks
+// encrypted 16-byte blocks, then skipBlocks clear ones, repeating. The CBC
+// chain runs on across the encrypted blocks only; skipped blocks are not
+// touched. The chain starts from the given constant IV for this range.
 func applyPatternCBC(buf, iv []byte, block cipher.Block, cryptBlocks, skipBlocks int) {
 	dec := cipher.NewCBCDecrypter(block, iv[:16])
-	// skip=0 means no blocks are skipped: every 16-byte block is encrypted and
-	// CBC-chained, a pure CBC run over the whole range. Decrypt all whole blocks
-	// (a trailing partial block is left clear, per cbcs). The old code decrypted
-	// only the first crypt run (cryptBlocks*16 bytes) then broke, leaving the rest
-	// of every sample encrypted for a (1,0) pattern while (1,9) was unaffected.
+	// skip=0 means nothing is skipped: every 16-byte block is encrypted and
+	// chained, so this is plain CBC over the whole range. Decrypt all whole
+	// blocks; a partial block at the end stays clear, as cbcs requires. An
+	// earlier version decrypted only the first crypt run (cryptBlocks*16 bytes)
+	// and then stopped, which left the rest of every sample encrypted for a
+	// (1,0) pattern. A (1,9) pattern was not affected.
 	if skipBlocks == 0 {
 		n := len(buf) - len(buf)%16
 		if n > 0 {
@@ -429,8 +452,8 @@ func applyPatternCBC(buf, iv []byte, block cipher.Block, cryptBlocks, skipBlocks
 	}
 }
 
-// applyPatternCTR decrypts with the cens crypt:skip pattern under one CTR
-// stream. Skipped blocks advance neither ciphertext position via keystream.
+// applyPatternCTR decrypts with the cens crypt:skip pattern using one CTR
+// stream. Skipped blocks are jumped over and use no keystream.
 func applyPatternCTR(buf []byte, stream cipher.Stream, cryptBlocks, skipBlocks int) {
 	unit := (cryptBlocks + skipBlocks) * 16
 	pos := 0
@@ -485,8 +508,9 @@ func parseTfhd(b box) (baseIsMoof bool, baseDataOff int64, haveBaseDataOff bool,
 	return baseIsMoof, baseDataOff, haveBaseDataOff, defaultSize, haveDefaultSize
 }
 
-// parseTrun reads a trun without a tfhd fallback. Kept for callers that only
-// need the explicit fields; CENC decryption uses parseTrunWithDefault below.
+// parseTrun reads a trun using only the fields written in the trun itself,
+// with no default sample size from the tfhd. It is kept for callers that only
+// need those fields; CENC decryption uses parseTrunWithDefault below.
 func parseTrun(b box) (sizes []uint32, dataOff int64, ok bool) {
 	return parseTrunWithDefault(b, 0, false)
 }
@@ -551,11 +575,13 @@ func parseTrunWithDefault(b box, defaultSampleSize uint32, haveDefaultSampleSize
 	return sizes, dataOff, true
 }
 
-// parseSencAuto parses a senc payload with the init's IV size, falling back to
-// the other common size (8 ↔ 16) when the entries don't tile the box with the
-// declared one. A Smooth Streaming init is synthesized and its tenc IV size is a
-// guess; a wrong guess would otherwise decrypt to silent garbage. The exact-fit
-// check runs first; a box that fits neither size keeps the lenient parse.
+// parseSencAuto parses a senc payload using the IV size from the init. If the
+// entries do not fill the box exactly with that size, it tries the other
+// common size (8 instead of 16, or 16 instead of 8). This matters for Smooth
+// Streaming: its init is built by us, and the tenc IV size in it is a guess. A
+// wrong guess would decrypt to garbage with no error. The exact-fit check runs
+// first; if neither size fits exactly, the declared size is used without the
+// exact-fit requirement.
 func parseSencAuto(payload []byte, ivLen int) (ivs [][]byte, subs [][]subsample, ok bool) {
 	if ivs, subs, ok = parseSencPayload(payload, ivLen, true); ok {
 		return ivs, subs, true
@@ -568,9 +594,10 @@ func parseSencAuto(payload []byte, ivLen int) (ivs [][]byte, subs [][]subsample,
 	return parseSencPayload(payload, ivLen, false)
 }
 
-// parsePiffSenc parses the PIFF SampleEncryptionBox (uuid A2394F52-…): after
-// the extended type it is a senc, except that flag 0x1 prefixes an
-// AlgorithmID(3)/IV_size(1)/KID(16) override whose IV size wins.
+// parsePiffSenc parses the PIFF SampleEncryptionBox (uuid A2394F52-...). After
+// the 16-byte extended type it looks like a senc, except that when flag 0x1 is
+// set an AlgorithmID(3)/IV_size(1)/KID(16) override comes first, and its IV
+// size takes priority over the one from the init.
 func parsePiffSenc(b box, ivLen int) ([][]byte, [][]subsample, bool) {
 	p := b.payload[16:]
 	_, flags, rest, err := fullBox(p)
@@ -582,14 +609,15 @@ func parsePiffSenc(b box, ivLen int) ([][]byte, [][]subsample, bool) {
 			return nil, nil, false
 		}
 		ivLen = int(rest[3])
-		// re-emit as a plain senc payload: version/flags then the entries
+		// rebuild as a plain senc payload: version and flags, then the entries
 		p = append(append([]byte(nil), p[:4]...), rest[20:]...)
 	}
 	return parseSencAuto(p, ivLen)
 }
 
-// parseSencPayload reads senc entries. With exact set, the entries must consume
-// the payload precisely (used to validate an IV-size guess).
+// parseSencPayload reads the senc entries. When exact is set, the entries must
+// use up the payload with nothing left over; that check is how an IV-size
+// guess is tested.
 func parseSencPayload(payload []byte, ivLen int, exact bool) (ivs [][]byte, subs [][]subsample, ok bool) {
 	_, flags, rest, err := fullBox(payload)
 	if err != nil || len(rest) < 4 {
@@ -598,7 +626,8 @@ func parseSencPayload(payload []byte, ivLen int, exact bool) (ivs [][]byte, subs
 	count := binary.BigEndian.Uint32(rest)
 	rest = rest[4:]
 	useSub := flags&0x000002 != 0
-	// ivLen == 0 means constant-IV (cbcs): senc entries carry no per-sample IV.
+	// ivLen == 0 means a constant IV (cbcs), so the entries carry no per-sample
+	// IV.
 	ivs = make([][]byte, 0, count)
 	subs = make([][]subsample, 0, count)
 	for i := uint32(0); i < count; i++ {
@@ -642,7 +671,7 @@ func parseSaiz(b box) (defaultSize uint8, sizes []uint8, ok bool) {
 		if len(rest) < 8 {
 			return 0, nil, false
 		}
-		rest = rest[8:] // aux_info_type + parameter
+		rest = rest[8:] // aux_info_type and its parameter, 4 bytes each
 	}
 	if len(rest) < 5 {
 		return 0, nil, false
@@ -694,16 +723,18 @@ func parseSaio(b box) []int64 {
 	return offs
 }
 
-// readAuxInfo recovers per-sample IVs and subsamples from the saiz/saio-located
-// CENC sample auxiliary information (used when there is no senc box).
+// readAuxInfo reads each sample's IV and subsample list from the CENC sample
+// auxiliary information. saiz gives the size of each entry and saio says where
+// the entries start. This path is used when there is no senc box.
 func readAuxInfo(frag []byte, moofOff int64, saioOffsets []int64, saizDefault uint8, saizSizes []uint8, haveSaiz bool, nSamples int, info *InitInfo) ([][]byte, [][]subsample, error) {
 	if len(saioOffsets) == 0 || !haveSaiz {
-		return nil, nil, nil // no aux info; samples fully encrypted, IV from tenc
+		return nil, nil, nil // no aux info: whole samples encrypted, IV from tenc
 	}
-	// saio offset is relative to the moof (default-base-is-moof / typical).
+	// The saio offset is measured from the start of the moof (the usual
+	// default-base-is-moof case).
 	auxBase := moofOff + saioOffsets[0]
 	perEntry := len(saioOffsets) == nSamples
-	ivLen := info.PerSampleIVLen // 0 for constant-IV (cbcs): entry is pure subsample data
+	ivLen := info.PerSampleIVLen // 0 for a constant IV (cbcs): entry is subsample data only
 	ivs := make([][]byte, 0, nSamples)
 	subs := make([][]subsample, 0, nSamples)
 	cur := auxBase

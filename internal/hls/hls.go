@@ -12,7 +12,7 @@ import (
 	"github.com/m314dev/m314dl/internal/manifest"
 )
 
-// IsHLS sniffs playlist content.
+// IsHLS reports whether body starts like an M3U8 playlist.
 func IsHLS(body []byte) bool {
 	return strings.HasPrefix(strings.TrimLeft(string(body[:min(64, len(body))]), "\uFEFF \t\r\n"), "#EXTM3U")
 }
@@ -55,12 +55,13 @@ func parseAttrs(s string) map[string]string {
 	return attrs
 }
 
-// AppendURLParams, when set, makes resolve() carry the parent playlist's query
-// string onto any child (variant playlist, segment, key, init) that has none of
-// its own. Some CDNs sign the master URL with a path-scoped token in the query
-// and serve the relative children only when that same query rides along; plain
-// URL resolution drops it and those children 403. Off by default — inheriting a
-// query is wrong for sites that sign each URL separately — so a caller opts in.
+// AppendURLParams, when set, makes resolve() copy the parent playlist's query
+// string onto any child URL (variant playlist, segment, key, init) that has no
+// query of its own. Some CDNs sign the master URL with a path-scoped token in
+// the query and serve the relative children only when that same query comes
+// along; plain URL resolution drops it and those children fail with 403. It is
+// off by default, because inheriting a query is wrong for sites that sign each
+// URL separately, so a caller has to opt in.
 var AppendURLParams bool
 
 func resolve(base, ref string) string {
@@ -109,7 +110,7 @@ func ParseMaster(body []byte, baseURL string) (*manifest.Master, error) {
 			a := parseAttrs(line[len("#EXT-X-STREAM-INF:"):])
 			vi++
 			st := &manifest.Stream{Type: manifest.Video, ID: fmt.Sprintf("v%d", vi)}
-			// prefer AVERAGE-BANDWIDTH for honest sorting
+			// prefer AVERAGE-BANDWIDTH so streams sort by their real average rate
 			if v := a["AVERAGE-BANDWIDTH"]; v != "" {
 				st.Bandwidth, _ = strconv.ParseInt(v, 10, 64)
 			}
@@ -172,7 +173,7 @@ func ParseMedia(body []byte, baseURL string, st *manifest.Stream) error {
 		return fmt.Errorf("hls: not an M3U8 playlist")
 	}
 	st.Segments = st.Segments[:0]
-	st.Live = true // until ENDLIST/VOD seen
+	st.Live = true // until an ENDLIST or VOD tag is seen
 	var (
 		curKey   *manifest.Key
 		curInit  *manifest.InitMap
@@ -234,7 +235,7 @@ func ParseMedia(body []byte, baseURL string, st *manifest.Stream) error {
 				r := rng
 				seg.Range = &r
 			} else {
-				nextByte = 0 // byterange chains only across consecutive ranged segments
+				nextByte = 0 // ranges chain only across consecutive ranged segments
 			}
 			st.Segments = append(st.Segments, seg)
 			seq++
@@ -264,10 +265,10 @@ func parseKey(attrs, baseURL string) (*manifest.Key, error) {
 	default:
 		k.Method = manifest.EncMethod(method)
 	}
-	// Widevine/PlayReady keyformats mean CENC (fMP4) regardless of METHOD. A
-	// FairPlay SAMPLE-AES stream (com.apple.streamingkeydelivery / skd://) is
-	// left as SAMPLE-AES: its raw key is user-supplied and it decrypts natively —
-	// as cbcs for fMP4, or the transport-stream SAMPLE-AES path for TS.
+	// Widevine/PlayReady keyformats mean CENC (fMP4) whatever METHOD says. A
+	// FairPlay SAMPLE-AES stream (com.apple.streamingkeydelivery / skd://) stays
+	// SAMPLE-AES: its raw key comes from the user and it decrypts natively, as
+	// cbcs for fMP4 or through the transport-stream SAMPLE-AES path for TS.
 	switch kf := a["KEYFORMAT"]; {
 	case strings.Contains(kf, "urn:uuid:edef8ba9"), // widevine
 		strings.Contains(kf, "urn:uuid:9a04f079"): // playready
@@ -313,7 +314,8 @@ func hasVideoCodec(codecs string) bool {
 	return false
 }
 
-// parseByteRange parses "length[@offset]"; without offset it starts at prev.
+// parseByteRange parses "length[@offset]". Without an offset the range starts
+// at prev.
 func parseByteRange(s string, prev int64) (manifest.ByteRange, int64) {
 	var length, offset int64
 	if i := strings.IndexByte(s, '@'); i >= 0 {

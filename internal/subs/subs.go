@@ -1,6 +1,6 @@
 // Package subs normalizes downloaded subtitle streams into clean SRT/VTT.
-// Parsing is deliberately lenient: real-world TTML/VTT is often
-// non-compliant and a subtitle glitch must never fail a finished download.
+// Parsing is lenient on purpose: real-world TTML/VTT often breaks the rules,
+// and a subtitle glitch must never fail a finished download.
 package subs
 
 import (
@@ -25,7 +25,7 @@ const (
 	KindVTT Kind = iota
 	KindTTML
 	KindSRT
-	KindFMP4 // wvtt/stpp inside fMP4 — extracted natively
+	KindFMP4 // wvtt/stpp inside fMP4; extracted natively
 	KindUnknown
 )
 
@@ -75,9 +75,9 @@ func parseTime(h, m, s, ms string) float64 {
 	return hh*3600 + mm*60 + ss + msf/1000
 }
 
-// parseVTT handles plain VTT/SRT and concatenated VTT segments (repeated
-// WEBVTT headers are just skipped; duplicate cues across segment overlap
-// are deduped later).
+// parseVTT handles plain VTT/SRT and VTT segments joined end to end (repeated
+// WEBVTT headers are skipped; duplicate cues from overlapping segments are
+// removed later).
 func parseVTT(text string) []Cue {
 	var cues []Cue
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
@@ -98,9 +98,9 @@ func parseVTT(text string) []Cue {
 			i = j
 		}
 		// Strip WebVTT cue tags (<c.white>, <v Speaker>, inline <00:00.000>
-		// timestamps, …) and decode entities (&rlm;, &amp;, …) — SRT has no
-		// concept of either, so left in they show up as literal garbage in the
-		// player. Same normalisation the TTML path already does.
+		// timestamps and so on) and decode entities (&rlm;, &amp; and so on).
+		// SRT has neither, so if they are left in they show up as literal
+		// garbage in the player. The TTML path does the same normalisation.
 		txt := strings.TrimSpace(strings.Join(body, "\n"))
 		txt = html.UnescapeString(tagRe.ReplaceAllString(txt, ""))
 		if txt = strings.TrimSpace(txt); txt != "" && end > start {
@@ -116,8 +116,9 @@ var tagRe = regexp.MustCompile(`<[^>]*>`)
 var brRe = regexp.MustCompile(`<br\s*/?>`)
 var tickRateRe = regexp.MustCompile(`tickRate="(\d+)"`)
 
-// parseTTML regex-parses <p begin end> cues — survives the tag-mismatch and
-// namespace chaos that kills strict XML parsers on real streams.
+// parseTTML pulls <p begin end> cues out with regular expressions. That
+// survives the mismatched tags and namespace chaos that kill strict XML parsers
+// on real streams.
 func parseTTML(text string) []Cue {
 	tickRate := 0.0
 	if m := tickRateRe.FindStringSubmatch(text); m != nil {
@@ -167,8 +168,8 @@ func parseTTMLTime(v string, tickRate float64) float64 {
 	return 0
 }
 
-// dedupe sorts by time and merges exact duplicates plus identical adjacent
-// cues from overlapping live segments.
+// dedupe sorts cues by time and merges exact duplicates, as well as identical
+// cues that sit next to each other because live segments overlap.
 func dedupe(cues []Cue) []Cue {
 	sort.SliceStable(cues, func(i, j int) bool { return cues[i].Start < cues[j].Start })
 	var out []Cue
@@ -190,13 +191,14 @@ func dedupe(cues []Cue) []Cue {
 	return out
 }
 
-// Rebase shifts all cues so the first starts at zero (live wall-clock fix).
+// Rebase shifts all cues so the first one starts at zero. This fixes live
+// streams whose cue times are wall-clock times.
 func Rebase(cues []Cue) []Cue {
 	if len(cues) == 0 {
 		return cues
 	}
 	off := cues[0].Start
-	if off < 3600 { // only rebase absurd offsets (wall-clock/PTS epochs)
+	if off < 3600 { // only shift absurd offsets (wall-clock or PTS epochs)
 		return cues
 	}
 	for i := range cues {
@@ -216,7 +218,7 @@ func fmtVTTTime(t float64) string {
 	return fmt.Sprintf("%02d:%02d:%02d.%03d", ms/3600000, ms/60000%60, ms/1000%60, ms%1000)
 }
 
-// WriteSRT / WriteVTT render cues to a file.
+// WriteSRT and WriteVTT write the cues to a file in that format.
 func WriteSRT(path string, cues []Cue) error {
 	var b strings.Builder
 	for i, c := range cues {

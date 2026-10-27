@@ -1,8 +1,9 @@
 // Package mss parses Smooth Streaming manifests (SmoothStreamingMedia XML)
-// into the manifest model. A Smooth presentation has no init segments: the
-// codec setup lives in each QualityLevel's CodecPrivateData, so Parse
-// synthesizes an fMP4 init per track and hands it to the engine as a data: URL,
-// which the shared HTTP client serves like any other init fetch.
+// into the manifest model. A Smooth presentation has no init segments. The
+// codec setup lives in each QualityLevel's CodecPrivateData attribute, so
+// Parse builds an fMP4 init (the header that tells a player how to decode the
+// track) for each track and hands it to the engine as a data: URL, which the
+// shared HTTP client serves like any other init fetch.
 package mss
 
 import (
@@ -87,9 +88,9 @@ type cXML struct {
 
 // ---- parsing ----
 
-// Parse converts a Smooth Streaming manifest into the unified model. Every
-// (StreamIndex × QualityLevel) becomes one Stream with its segments populated
-// and a synthesized init.
+// Parse converts a Smooth Streaming manifest into the shared model. Every
+// QualityLevel of every StreamIndex becomes one Stream, with its segments
+// filled in and a synthesized init.
 func Parse(body []byte, manifestURL string) (*manifest.Master, error) {
 	var doc ssmXML
 	if err := xml.Unmarshal(body, &doc); err != nil {
@@ -173,10 +174,11 @@ func Parse(body []byte, manifestURL string) (*manifest.Master, error) {
 
 type chunk struct{ t, d uint64 }
 
-// timeline expands the <c t d r> list: t defaults to the previous chunk's end,
-// r is the total number of chunks of duration d (Smooth semantics, unlike
-// DASH's "additional repeats"), and a missing d is taken from the next chunk's
-// start or the presentation end.
+// timeline expands the <c t d r> list into one chunk per entry. A missing t
+// means the chunk starts where the previous one ended. r is the total number
+// of chunks of duration d (Smooth counts the first one; in DASH, r means
+// "additional repeats"). A missing d runs to the next chunk's start, or to the
+// end of the presentation.
 func timeline(cs []cXML, total uint64) []chunk {
 	var out []chunk
 	var cur uint64
@@ -217,8 +219,9 @@ func mediaType(s string) manifest.MediaType {
 	return manifest.Unknown
 }
 
-// expandTemplate fills the StreamIndex Url pattern. Both the spec's spellings
-// ({start time}/{start_time}, {bitrate}/{Bitrate}) appear in the wild.
+// expandTemplate fills in the StreamIndex Url pattern. Both spellings from the
+// spec ({start time} and {start_time}, {bitrate} and {Bitrate}) appear in the
+// wild.
 func expandTemplate(tmpl string, bitrate int64, t uint64) string {
 	r := strings.NewReplacer(
 		"{bitrate}", strconv.FormatInt(bitrate, 10),
@@ -243,8 +246,8 @@ func resolveURL(base, ref string) string {
 
 // ---- init synthesis ----
 
-// synthesizeInit builds the track's init from its codec private data and
-// returns it with the RFC 6381 codecs string.
+// synthesizeInit builds the track's init segment from its CodecPrivateData and
+// returns it together with the RFC 6381 codecs string.
 func synthesizeInit(ql *qlXML, st *manifest.Stream, timescale uint32, key *manifest.Key) ([]byte, string, error) {
 	spec := mp4.InitSpec{TrackID: 1, Timescale: timescale, Language: st.Language}
 	if key != nil {
@@ -284,7 +287,7 @@ func synthesizeInit(ql *qlXML, st *manifest.Stream, timescale uint32, key *manif
 		}
 		spec.Audio = &mp4.AudioSpec{Channels: uint16(channels), SampleRate: uint32(rate), ASC: asc}
 		if fourcc == "AACH" || fourcc == "AACP" {
-			objType = 5 // HE-AAC signals SBR; the ASC's base object type is still LC
+			objType = 5 // HE-AAC adds SBR; the ASC's base object type still says LC
 		}
 		codecs = fmt.Sprintf("mp4a.40.%d", objType)
 	default:
@@ -293,8 +296,8 @@ func synthesizeInit(ql *qlXML, st *manifest.Stream, timescale uint32, key *manif
 	return mp4.BuildInit(spec), codecs, nil
 }
 
-// splitAnnexB splits a start-code-delimited H.264 parameter-set blob into its
-// SPS (type 7) and PPS (type 8) NAL units.
+// splitAnnexB splits an H.264 parameter-set blob, where each unit begins with
+// a 00 00 01 start code, into its SPS (type 7) and PPS (type 8) NAL units.
 func splitAnnexB(b []byte) (sps, pps [][]byte) {
 	var nals [][]byte
 	start := -1
@@ -324,7 +327,8 @@ func splitAnnexB(b []byte) (sps, pps [][]byte) {
 	return sps, pps
 }
 
-// trimZeros drops the trailing zero byte of a 4-byte start code's leading 00.
+// trimZeros drops trailing zero bytes. A 4-byte start code (00 00 00 01) leaves
+// its leading 00 at the end of the unit before it.
 func trimZeros(b []byte) []byte {
 	for len(b) > 0 && b[len(b)-1] == 0 {
 		b = b[:len(b)-1]
@@ -334,8 +338,8 @@ func trimZeros(b []byte) []byte {
 
 var aacRates = []int{96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350}
 
-// buildASC makes a 2-byte AAC-LC AudioSpecificConfig from the manifest's
-// sampling rate and channel count.
+// buildASC makes a 2-byte AAC-LC AudioSpecificConfig (the small header that
+// describes an AAC stream) from the manifest's sampling rate and channel count.
 func buildASC(rate, channels int) []byte {
 	idx := 3 // 48000 when the rate is not a standard one
 	for i, r := range aacRates {
@@ -349,12 +353,13 @@ func buildASC(rate, channels int) []byte {
 }
 
 // readASC reads the object type, sampling rate and channel configuration from
-// an AudioSpecificConfig (the 5/4/4-bit header, with the escape forms).
+// an AudioSpecificConfig: a 5-bit, 4-bit and 4-bit header, including the
+// escape forms for larger values.
 func readASC(asc []byte) (objType, rate, channels int) {
 	if len(asc) < 2 {
 		return 2, 0, 0
 	}
-	// the fields we need sit in the first 37 bits at most; pad to a full word
+	// the fields we need fit in the first 37 bits at most; pad to a full 64 bits
 	bits := binary.BigEndian.Uint64(append(append([]byte(nil), asc...), make([]byte, 8)...)[:8])
 	pos := 0
 	take := func(n int) int {
@@ -379,11 +384,11 @@ func readASC(asc []byte) (objType, rate, channels int) {
 
 var kidRe = regexp.MustCompile(`<KID(?:\s[^>]*?\bVALUE="([^"]+)"[^>]*)?>(?:([^<]*)</KID>)?`)
 
-// playReadyKID extracts the default KID from a PlayReady ProtectionHeader: the
-// base64 PlayReady Object holds a UTF-16LE WRMHEADER document whose KID is a
-// base64 GUID in little-endian layout, byte-swapped here to the CENC form. The
-// zero KID means none was found; the -key KID (or a single bare key) then
-// stands in.
+// playReadyKID extracts the default KID (key id) from a PlayReady
+// ProtectionHeader. The base64 PlayReady Object holds a UTF-16LE WRMHEADER XML
+// document whose KID is a base64 GUID in little-endian layout; the bytes are
+// swapped here into the CENC form. An all-zero KID means none was found, and
+// the -key KID (or a single bare key) then stands in.
 func playReadyKID(headers []protHeaderXML) [16]byte {
 	var zero [16]byte
 	for _, h := range headers {
@@ -402,7 +407,7 @@ func playReadyKID(headers []protHeaderXML) [16]byte {
 			}
 			var kid [16]byte
 			copy(kid[:], guid)
-			// GUID → CENC KID: the first three fields are little-endian.
+			// GUID to CENC KID: the first three fields are little-endian.
 			kid[0], kid[1], kid[2], kid[3] = kid[3], kid[2], kid[1], kid[0]
 			kid[4], kid[5] = kid[5], kid[4]
 			kid[6], kid[7] = kid[7], kid[6]
@@ -412,9 +417,9 @@ func playReadyKID(headers []protHeaderXML) [16]byte {
 	return zero
 }
 
-// playReadyRecords decodes the rights-management (type 1) records of a
-// PlayReady Object as text. When the record framing doesn't parse, the whole
-// blob is decoded instead so an unframed header still yields its KID.
+// playReadyRecords decodes the rights management records (type 1) of a
+// PlayReady Object as text. When the record framing does not parse, the whole
+// blob is decoded instead, so a header without framing still yields its KID.
 func playReadyRecords(raw []byte) []string {
 	var docs []string
 	if len(raw) >= 10 {

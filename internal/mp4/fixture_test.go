@@ -10,9 +10,10 @@ import (
 	"testing"
 )
 
-// fixtureDir points at shaka-packaged CENC/CBCS test streams. Override with
-// M314_FIXTURES. The test skips when the fixtures or mp4decrypt are absent, so
-// it never blocks CI but proves byte-exact parity locally.
+// fixtureDir returns the folder of test streams packaged with shaka in the
+// CENC and cbcs schemes. Set M314_FIXTURES to point somewhere else. The test
+// skips when the fixtures or mp4decrypt are missing, so it never blocks CI,
+// while still proving byte-exact parity on a machine that has them.
 func fixtureDir() string {
 	if d := os.Getenv("M314_FIXTURES"); d != "" {
 		return d
@@ -41,8 +42,9 @@ func mdatOf(buf []byte) []byte {
 	return nil
 }
 
-// TestDecryptParityWithMp4decrypt decrypts real shaka fragments natively and
-// asserts the resulting mdat is byte-identical to mp4decrypt's.
+// TestDecryptParityWithMp4decrypt decrypts real shaka fragments with our own
+// code and checks that the resulting mdat is identical, byte for byte, to
+// what mp4decrypt produces.
 func TestDecryptParityWithMp4decrypt(t *testing.T) {
 	dir := fixtureDir()
 	if _, err := os.Stat(filepath.Join(dir, "dash-cenc", "v_init.mp4")); err != nil {

@@ -1,5 +1,6 @@
-// Package curl parses a copy-as-curl command line into a URL and headers, so a
-// user can paste a browser's "Copy as cURL" instead of hand-typing every -H.
+// Package curl turns a copy-as-curl command line into a URL and a set of
+// headers. A user can paste the browser's "Copy as cURL" output instead of
+// typing every -H flag by hand.
 package curl
 
 import (
@@ -8,13 +9,14 @@ import (
 	"strings"
 )
 
-// Parse extracts the request URL and headers from a curl command. It reads the
-// URL (`--url X`, `--url=X`, or the first bare http(s) argument) and every
-// header (`-H`/`--header`), and folds `-A`/`--user-agent`, `-e`/`--referer`, and
-// `-b`/`--cookie` into their header equivalents. Flags it doesn't use are
-// ignored; the ones that take a value are skipped so their value can't be
-// mistaken for the URL. Header keys are canonicalized so a later -H on the CLI
-// overrides cleanly.
+// Parse pulls the request URL and the headers out of a curl command. The URL
+// comes from `--url X`, `--url=X`, or the first bare http(s) argument. Every
+// `-H`/`--header` becomes a header. `-A`/`--user-agent`, `-e`/`--referer` and
+// `-b`/`--cookie` are turned into the matching headers (User-Agent, Referer,
+// Cookie). Other flags are ignored. For flags that take a value, the value is
+// skipped as well, so it is never mistaken for the URL. Header keys are put in
+// canonical form ("user-agent" becomes "User-Agent"), so a later -H given on
+// our own command line replaces the same header cleanly.
 func Parse(cmd string) (rawURL string, headers map[string]string, err error) {
 	toks, err := tokenize(cmd)
 	if err != nil {
@@ -31,7 +33,8 @@ func Parse(cmd string) (rawURL string, headers map[string]string, err error) {
 			set(k, v)
 		}
 	}
-	// next returns the following token (a flag's value) and advances i.
+	// next returns the token after the current one (a flag's value) and moves
+	// i past it.
 	i := 0
 	next := func() string {
 		if i+1 < len(toks) {
@@ -40,7 +43,8 @@ func Parse(cmd string) (rawURL string, headers map[string]string, err error) {
 		}
 		return ""
 	}
-	// valueFlags take an argument we skip past (so it isn't read as the URL).
+	// valueFlags are flags that take a value. We skip that value so it is not
+	// read as the URL.
 	valueFlags := map[string]bool{
 		"-X": true, "--request": true, "-d": true, "--data": true,
 		"--data-raw": true, "--data-binary": true, "--data-ascii": true,
@@ -65,17 +69,18 @@ func Parse(cmd string) (rawURL string, headers map[string]string, err error) {
 		case strings.HasPrefix(t, "--user-agent="):
 			set("User-Agent", strings.TrimPrefix(t, "--user-agent="))
 		case t == "-e" || t == "--referer":
-			ref, _, _ := strings.Cut(next(), ";") // curl allows "url;auto"
+			ref, _, _ := strings.Cut(next(), ";") // curl allows "url;auto"; keep the url
 			set("Referer", ref)
 		case t == "-b" || t == "--cookie":
-			if c := next(); strings.Contains(c, "=") { // a cookie string, not a file
+			if c := next(); strings.Contains(c, "=") { // "k=v" means a cookie string, not a file
 				set("Cookie", c)
 			}
 		case valueFlags[t]:
-			next() // consume and drop the value
+			next() // skip the flag's value
 		case strings.HasPrefix(t, "-"):
-			// An unused flag (--compressed, -sSL, -k, …); ignore, keep its
-			// neighbours. Bundled short flags never carry the URL.
+			// A flag we do not use (--compressed, -sSL, -k and so on). Skip it
+			// and leave the tokens around it alone. Bundled short flags like
+			// -sSL never carry the URL.
 		default:
 			if rawURL == "" && looksLikeURL(t) {
 				rawURL = t
@@ -92,9 +97,10 @@ func looksLikeURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
-// tokenize splits a shell-style command line, honoring single quotes (literal),
-// double quotes (backslash escapes the next byte), backslash escapes outside
-// quotes, and a trailing "\<newline>" line continuation.
+// tokenize splits a shell-style command line into words. It follows the shell
+// rules: single quotes keep their contents as they are, inside double quotes a
+// backslash escapes the next byte, a backslash outside quotes escapes the next
+// byte, and a backslash right before a newline joins the two lines.
 func tokenize(s string) ([]string, error) {
 	var toks []string
 	var cur strings.Builder
@@ -136,7 +142,7 @@ func tokenize(s string) ([]string, error) {
 			i = j + 1
 		case '\\':
 			if i+1 < len(s) {
-				if s[i+1] == '\n' { // line continuation
+				if s[i+1] == '\n' { // backslash-newline: join the two lines
 					i += 2
 					continue
 				}

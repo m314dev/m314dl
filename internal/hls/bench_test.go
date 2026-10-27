@@ -8,8 +8,8 @@ import (
 	"github.com/m314dev/m314dl/internal/manifest"
 )
 
-// BenchmarkParseMedia measures media-playlist parse throughput on a long VOD
-// playlist (3000 segments with EXT-X-MAP and byte ranges).
+// BenchmarkParseMedia measures how fast a long VOD media playlist is parsed
+// (3000 segments with EXT-X-MAP and byte ranges).
 func BenchmarkParseMedia(b *testing.B) {
 	const n = 3000
 	var sb strings.Builder

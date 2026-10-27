@@ -1,4 +1,4 @@
-// Package scrape extracts stream manifest URLs from arbitrary web pages.
+// Package scrape finds stream manifest URLs inside ordinary web pages.
 package scrape
 
 import (
@@ -10,18 +10,20 @@ import (
 	"github.com/m314dev/m314dl/internal/httpx"
 )
 
-// absolute URLs in page source / inline JSON (handles \/ escaping)
+// absRe finds absolute manifest URLs in page source and inline JSON, where a
+// slash may be written as \/.
 var absRe = regexp.MustCompile(`https?:(?:\\?/){2}[^\s"'<>\\]+?(?:\.(?:m3u8|mpd)|\.isml?/[Mm]anifest)(?:\?[^\s"'<>\\]*)?`)
 
-// relative manifest paths in src/href/file/source attributes
+// attrRe finds relative manifest paths in attributes such as src, href, file
+// and source.
 var attrRe = regexp.MustCompile(`(?:src|href|file|source|data-src|content)\s*=\s*["']([^"']+?(?:\.(?:m3u8|mpd)|\.isml?/[Mm]anifest)(?:\?[^"']*)?)["']`)
 
 var iframeRe = regexp.MustCompile(`<iframe[^>]+src\s*=\s*["']([^"']+)["']`)
 
-// Find fetches pageURL and returns candidate manifest URLs (deduped, page
-// order). Follows iframes one level deep.
-// ponytail: static HTML+JSON scan only; JS-built URLs need a headless
-// browser — add CDP sniffing if this misses too much.
+// Find fetches pageURL and returns the manifest URLs it finds, in page order
+// with duplicates removed. It follows iframes one level deep.
+// ponytail: static HTML+JSON scan only; a URL that JavaScript builds at run
+// time needs a headless browser. Add CDP sniffing if this misses too much.
 func Find(ctx context.Context, client *httpx.Client, pageURL string) ([]string, error) {
 	urls, err := findInPage(ctx, client, pageURL)
 	if err != nil {
@@ -30,7 +32,7 @@ func Find(ctx context.Context, client *httpx.Client, pageURL string) ([]string, 
 	if len(urls) > 0 {
 		return urls, nil
 	}
-	// one level of iframes
+	// nothing on the page itself: look one level down, into its iframes
 	body, finalURL, err := client.FetchBytes(ctx, pageURL, "")
 	if err != nil {
 		return nil, err

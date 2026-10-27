@@ -42,7 +42,7 @@ func TestPlanChunks(t *testing.T) {
 	if got := planChunks(3*fileChunk + 1); got[3].End-got[3].Start != 0 {
 		t.Fatalf("last chunk should be the 1-byte remainder: %+v", got[3])
 	}
-	// huge: slice count capped, slices grown to cover
+	// huge file: the slice count is capped and the slices grow to cover it
 	huge := int64(fileChunk) * fileMaxChunks * 10
 	if got := planChunks(huge); len(got) > fileMaxChunks || got[len(got)-1].End != huge-1 {
 		t.Fatalf("huge: %d chunks, last end %d", len(got), got[len(got)-1].End)
@@ -69,8 +69,8 @@ func TestFileName(t *testing.T) {
 			t.Errorf("fileName(%q, %q) = %q, want %q", c.cd, c.url, got, c.want)
 		}
 	}
-	// Redirect to an extensionless token path: the given URL names the file.
-	// One with an extension of its own wins over the given URL's.
+	// A redirect to a token path with no extension: the given URL names the file.
+	// A final URL with an extension of its own wins over the given URL's name.
 	plain := &http.Response{Header: http.Header{}}
 	if got := fileName(plain, "http://ott/movie/u/p/835115.mkv", "http://157.1.1.1/Z3VjV2tyVTJn"); got != "835115.mkv" {
 		t.Errorf("token redirect: got %q, want 835115.mkv", got)
@@ -84,9 +84,9 @@ func TestFileName(t *testing.T) {
 	}
 }
 
-// blob is a deterministic multi-slice file body. It opens with a PNG magic and
-// carries TS sync bytes 188 apart so the engine's fake-image-header strip would
-// mangle it if the file path weren't verbatim.
+// blob is a fixed multi-slice file body. It opens with the PNG magic bytes and
+// carries TS sync bytes (0x47) 188 bytes apart, so the engine's fake image
+// header stripping would mangle it if the file path did not copy bytes as is.
 func blob(n int) []byte {
 	b := make([]byte, n)
 	for i := range b {
@@ -99,7 +99,7 @@ func blob(n int) []byte {
 	return b
 }
 
-// fileServer serves the detection/download fixtures.
+// fileServer serves the fixtures for the detection and download tests.
 func fileServer(t *testing.T, big []byte) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -108,7 +108,7 @@ func fileServer(t *testing.T, big []byte) *httptest.Server {
 		w.Header().Set("Content-Type", "application/octet-stream") // CDNs do this
 		fmt.Fprint(w, master)
 	})
-	// A CDN that force-downloads every object (Tencent COS) sends a real HLS
+	// A CDN that forces a download of every object (Tencent COS) sends a real HLS
 	// master with Content-Disposition: attachment. The body wins over the header.
 	mux.HandleFunc("/forced.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-mpegURL")
@@ -146,7 +146,7 @@ func fileServer(t *testing.T, big []byte) *httptest.Server {
 		w.(http.Flusher).Flush() // no Content-Length: chunked transfer
 		w.Write(big)
 	})
-	// advertises ranges, ignores them
+	// advertises ranges but ignores them
 	mux.HandleFunc("/liar", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -184,14 +184,14 @@ func TestLoadManifestDetect(t *testing.T) {
 		{"/playlist.m3u8", "hls", 0, ""},
 		{"/forced.m3u8", "hls", 0, ""}, // attachment must not beat a manifest body
 		{"/page.html", "hls", 0, ""},
-		{"/json", "hls", 0, ""}, // textual non-HTML still scrapes
+		{"/json", "hls", 0, ""}, // text that is not HTML is still scraped
 		{"/blob.bin", FileKind, 3, "blob.bin"},
 		{"/redir", FileKind, 3, "blob.bin"}, // final URL names the file
 		{"/small.bin", FileKind, 1, "small.bin"},
 		{"/notes.txt", FileKind, 1, "notes.txt"}, // attachment beats text
 		{"/chunked", FileKind, 1, "chunked"},     // unknown length
-		{"/liar", FileKind, 1, "liar"},           // ranges advertised, not honored
-		{"/quiet", FileKind, 3, "quiet"},         // ranges honored, not advertised
+		{"/liar", FileKind, 1, "liar"},           // ranges advertised but not honored
+		{"/quiet", FileKind, 3, "quiet"},         // ranges honored but not advertised
 	}
 	for _, c := range cases {
 		m, kind, err := LoadManifest(context.Background(), client, srv.URL+c.path, logv)
@@ -221,8 +221,9 @@ func TestLoadManifestDetect(t *testing.T) {
 	}
 }
 
-// End to end: detection → plan → engine → byte-exact file, on a server that
-// slices, one that ignores ranges, and one with no length at all.
+// End to end: detection, then planning, then the engine, down to a file that
+// matches byte for byte. Runs against a server that slices, one that ignores
+// ranges, and one with no length at all.
 func TestDownloadFileEndToEnd(t *testing.T) {
 	big := blob(2*fileChunk + 12345)
 	srv := fileServer(t, big)

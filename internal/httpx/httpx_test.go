@@ -20,12 +20,12 @@ func TestParseRetryAfter(t *testing.T) {
 	if d := parseRetryAfter("-3"); d != 0 {
 		t.Fatalf("negative: got %v", d)
 	}
-	// HTTP-date in the future yields a positive, bounded duration
+	// an HTTP date in the future gives a positive wait no longer than the gap
 	future := time.Now().Add(10 * time.Second).UTC().Format(http.TimeFormat)
 	if d := parseRetryAfter(future); d <= 0 || d > 11*time.Second {
 		t.Fatalf("http-date: got %v", d)
 	}
-	// past date → 0
+	// a date in the past gives 0
 	if d := parseRetryAfter(time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)); d != 0 {
 		t.Fatalf("past date: got %v", d)
 	}
@@ -34,7 +34,7 @@ func TestParseRetryAfter(t *testing.T) {
 func TestFetchBytesExPressure(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if hits.Add(1) <= 2 { // first two attempts get rate-limited
+		if hits.Add(1) <= 2 { // the first two attempts are rate limited
 			w.Header().Set("Retry-After", "0")
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
@@ -59,7 +59,8 @@ func TestFetchBytesExPressure(t *testing.T) {
 	}
 }
 
-// Open shares FetchBytes's retry policy but hands back the response unread.
+// Open uses the same retry policy as FetchBytes and hands back the response
+// with its body unread.
 func TestOpenRetriesThenReturnsUnreadBody(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -109,8 +110,9 @@ func TestFetchBytesPermanentNoRetry(t *testing.T) {
 }
 
 func TestCarriesManifestCookieToSegments(t *testing.T) {
-	// Disney+ sets an auth cookie on the manifest that segments require. The
-	// default (no -cookies file) client must carry it across requests.
+	// Disney+ sets an auth cookie on the manifest response, and the segments
+	// require it. The default client (no -cookies file) must carry it across
+	// requests.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/manifest.mpd" {
 			http.SetCookie(w, &http.Cookie{Name: "hdntl", Value: "tok"})

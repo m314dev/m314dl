@@ -15,7 +15,7 @@ func TestDataURL(t *testing.T) {
 	if err != nil || string(body) != "hello" || final != "data:video/mp4;base64,aGVsbG8=" {
 		t.Fatalf("base64 data URL: body=%q final=%q err=%v", body, final, err)
 	}
-	// a ranged GET (what the segment worker issues) answers the whole payload
+	// a ranged GET (what the segment worker sends) gets the whole payload back
 	resp, err := c.RangeGet(context.Background(), "data:,a%20b", "bytes=1-")
 	if err != nil {
 		t.Fatal(err)

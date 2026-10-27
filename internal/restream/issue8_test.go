@@ -19,8 +19,9 @@ import (
 	"github.com/m314dev/m314dl/internal/source"
 )
 
-// The issue's MAX source uses CICP, while works.xml uses Dolby's hex mask.
-// A value is meaningful only together with its original scheme.
+// The issue's MAX source uses a CICP channel index, while works.xml uses
+// Dolby's hex mask. A value is meaningful only together with its original
+// scheme.
 func TestDASHAudioChannelConfigurationRoundTrip(t *testing.T) {
 	for _, tc := range []struct{ name, scheme, value, location string }{
 		{"max", "urn:mpeg:mpegB:cicp:ChannelConfiguration", "6", "representation"},
@@ -99,8 +100,8 @@ func TestDASHRefusesIncompletePresentation(t *testing.T) {
 	}
 }
 
-// A generated tone proves clear EAC3 survives the real download + DASH output
-// path and is decodable by a player that supports EAC3. This is not a claim
+// A generated tone proves clear EAC3 survives the real download and DASH output
+// path and can be decoded by a player that supports EAC3. This is not a claim
 // about browser codec support or the reporter's encrypted media.
 func TestEAC3DASHPlayback(t *testing.T) {
 	ffmpeg, err := exec.LookPath("ffmpeg")

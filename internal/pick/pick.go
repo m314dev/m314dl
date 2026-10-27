@@ -1,4 +1,4 @@
-// Package pick sorts and selects streams from filter expressions.
+// Package pick sorts streams and selects among them using filter expressions.
 package pick
 
 import (
@@ -12,8 +12,9 @@ import (
 	"github.com/m314dev/m314dl/internal/manifest"
 )
 
-// Sort orders: video by height then bandwidth desc; audio by default flag,
-// channels, bandwidth desc; subs stable.
+// Sort orders the streams, best first. Video sorts by height, then bandwidth,
+// both descending. Audio sorts by the default flag, then channel count, then
+// bandwidth, all descending. Subtitles keep their order.
 func Sort(streams []*manifest.Stream) {
 	sort.SliceStable(streams, func(i, j int) bool {
 		a, b := streams[i], streams[j]
@@ -39,12 +40,13 @@ func Sort(streams []*manifest.Stream) {
 	})
 }
 
-// Expr is a parsed selector: "best", "worst", "all", "bestN", or
-// colon-separated filters, optionally with "for=best|worst|all|bestN".
-// Regex keys: id, lang, name, codecs, res, range, channel (use key!=regex to
+// Expr is a parsed selector: "best", "worst", "all", "bestN", or filters
+// separated by colons, optionally with "for=best|worst|all|bestN".
+// Regex keys: id, lang, name, codecs, res, range, channel (write key!=regex to
 // negate). Numeric keys: bwmin/bwmax (kbps), segsmin/segsmax (segment count),
-// plistdurmin/plistdurmax (seconds or "20m"). Numeric filters treat an unknown
-// value (e.g. HLS segment count before playlist expansion) as passing.
+// plistdurmin/plistdurmax (seconds, or a duration like "20m"). A numeric
+// filter lets a stream through when the value is unknown (for example the HLS
+// segment count before the playlist is expanded).
 type Expr struct {
 	take    string // best / worst / all / bestN / worstN
 	takeN   int
@@ -55,7 +57,7 @@ type Expr struct {
 type filter struct {
 	key string
 	re  *regexp.Regexp
-	num float64 // for numeric keys (bandwidth bps, segment count, duration s)
+	num float64 // for numeric keys: bandwidth in bps, segment count, or seconds
 	neg bool    // key!=regex: keep streams that do NOT match
 }
 
@@ -82,8 +84,8 @@ func ParseExpr(s string) (*Expr, error) {
 		}
 		k = strings.ToLower(strings.TrimSpace(k))
 		v = strings.TrimSpace(v)
-		// key!=regex negates the match (RE2 has no negative lookahead, so this
-		// is how you express a deny-list).
+		// key!=regex negates the match. Go's RE2 regex engine has no negative
+		// lookahead, so this is how a deny list is written.
 		neg := false
 		if strings.HasSuffix(k, "!") {
 			neg = true
@@ -107,7 +109,7 @@ func ParseExpr(s string) (*Expr, error) {
 			}
 			e.filters = append(e.filters, filter{key: k, num: float64(n * 1000)})
 		case "hmin", "hmax", "wmin", "wmax":
-			// Numeric height/width bounds. A regex on res= cannot express "up
+			// Numeric height and width bounds. A regex on res= cannot say "up
 			// to 720p": a source publishing 768x432, 640x360 and 480x270 has
 			// nothing matching "720" at all, so a quality preference written
 			// that way silently selects no video and the viewer gets sound
@@ -142,8 +144,8 @@ func ParseExpr(s string) (*Expr, error) {
 	return e, nil
 }
 
-// parseDurationSeconds accepts a bare number (seconds) or a Go duration like
-// "20m"/"1h30m".
+// parseDurationSeconds accepts a bare number of seconds or a Go duration such
+// as "20m" or "1h30m".
 func parseDurationSeconds(v string) (float64, error) {
 	if f, err := strconv.ParseFloat(v, 64); err == nil {
 		return f, nil
@@ -155,8 +157,8 @@ func parseDurationSeconds(v string) (float64, error) {
 	return d.Seconds(), nil
 }
 
-// match reports whether st passes every filter. With relax set, the
-// height/width bounds are skipped: they are a quality preference, and when they
+// match reports whether st passes every filter. With relax set, the height and
+// width bounds are skipped: they are a quality preference, and when they
 // exclude everything the caller falls back to the nearest rendition.
 func (e *Expr) match(st *manifest.Stream, relax bool) bool {
 	for _, f := range e.filters {
@@ -208,7 +210,7 @@ func (e *Expr) match(st *manifest.Stream, relax bool) bool {
 			}
 			continue
 		case "segsmin":
-			// unknown count (HLS before media-playlist expansion) passes
+			// an unknown count (HLS before the media playlist is expanded) passes
 			if n := len(st.Segments); n > 0 && float64(n) < f.num {
 				return false
 			}
@@ -236,7 +238,8 @@ func (e *Expr) match(st *manifest.Stream, relax bool) bool {
 	return true
 }
 
-// Apply filters+takes from a pre-sorted same-type slice.
+// Apply runs the filters and the take over a slice of streams that share one
+// type and are already sorted.
 func (e *Expr) Apply(streams []*manifest.Stream) []*manifest.Stream {
 	if e.none {
 		return nil
@@ -270,10 +273,10 @@ func isDimKey(k string) bool {
 	return k == "hmin" || k == "hmax" || k == "wmin" || k == "wmax"
 }
 
-// nearest handles a height/width bound that excluded every stream — hmax=720
-// against a source that only publishes 1080p. Failing there turns a quality
-// preference into a dead channel, so fall back to the single rendition closest
-// to the bound. Filters other than the bounds still apply.
+// nearest handles a height or width bound that excluded every stream, such as
+// hmax=720 against a source that only publishes 1080p. Failing there would turn
+// a quality preference into a dead channel, so it falls back to the single
+// rendition closest to the bound. Filters other than the bounds still apply.
 func (e *Expr) nearest(streams []*manifest.Stream) []*manifest.Stream {
 	var bounds []filter
 	for _, f := range e.filters {
@@ -323,9 +326,9 @@ func (e *Expr) nearest(streams []*manifest.Stream) []*manifest.Stream {
 	return []*manifest.Stream{best}
 }
 
-// Select applies the three expressions with HLS group awareness: when the
-// chosen video names an audio/subtitle rendition group, candidates from that
-// group are preferred so "best audio" belongs to the picked variant.
+// Select applies the three expressions and knows about HLS groups: when the
+// chosen video names an audio or subtitle rendition group, candidates from
+// that group are preferred, so "best audio" belongs to the picked variant.
 func Select(streams []*manifest.Stream, ve, ae, se *Expr) []*manifest.Stream {
 	Sort(streams)
 	byType := map[manifest.MediaType][]*manifest.Stream{}
@@ -350,9 +353,9 @@ func Select(streams []*manifest.Stream, ve, ae, se *Expr) []*manifest.Stream {
 			}
 		}
 	}
-	// default audio: best rendition per language; audio-only variants are
-	// player fallbacks — only used when there are no renditions and the
-	// picked video carries no muxed audio
+	// default audio: the best rendition per language. Audio-only variants
+	// are player fallbacks, used only when there are no renditions and the
+	// picked video carries no muxed audio.
 	if ae == nil {
 		renditions, variants := splitAudio(audioPool)
 		switch {
@@ -367,7 +370,7 @@ func Select(streams []*manifest.Stream, ve, ae, se *Expr) []*manifest.Stream {
 		out = append(out, ae.Apply(audioPool)...)
 	}
 	if se == nil {
-		out = append(out, subPool...) // subtitles are cheap: default all
+		out = append(out, subPool...) // subtitles are small: take them all by default
 	} else {
 		out = append(out, se.Apply(subPool)...)
 	}
@@ -410,7 +413,7 @@ func inGroup(streams []*manifest.Stream, group string) []*manifest.Stream {
 func bestPerLanguage(streams []*manifest.Stream) []*manifest.Stream {
 	seen := map[string]bool{}
 	var out []*manifest.Stream
-	for _, st := range streams { // pre-sorted best-first
+	for _, st := range streams { // already sorted, best first
 		if !seen[st.Language] {
 			seen[st.Language] = true
 			out = append(out, st)
@@ -421,6 +424,6 @@ func bestPerLanguage(streams []*manifest.Stream) []*manifest.Stream {
 
 // IsNone reports whether the expression asks for no stream of its kind at all
 // ("none"). Callers use it to tell "the operator wants no video" apart from "a
-// video selection that happened to match nothing" — the second is a fault, the
-// first is a choice.
+// video selection that happened to match nothing". The first is a choice and
+// the second is a fault.
 func (e *Expr) IsNone() bool { return e != nil && e.none }

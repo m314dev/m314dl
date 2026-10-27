@@ -1,16 +1,16 @@
 // Package restream turns the engine's ordered, decrypted segment stream into a
-// live HLS presentation served over HTTP — a downloader becomes a re-streamer.
+// live HLS presentation served over HTTP. A downloader becomes a re-streamer.
 //
 // The design deliberately inverts the usual worker model. Instead of piping a
 // clear stream into FFmpeg and letting it segment and pace the output, the
 // packager receives whole segments already decrypted and in playback order
 // (that is exactly what engine.Sink delivers) and does only what a live HLS
 // origin must do: keep a rolling window of segments in memory, renumber them
-// under its own monotonic sequence, and rewrite the media playlist after each
-// one. No subprocess, no -re pacing (the source's own segment cadence paces
-// it), no continuity-counter surgery (segments are copied whole, never
-// re-muxed), and segments are held once and shared by every viewer rather than
-// buffered per-connection.
+// under its own always-increasing sequence, and rewrite the media playlist
+// after each one. There is no subprocess, no -re pacing (the source's own
+// segment cadence paces it) and no continuity-counter surgery (segments are
+// copied whole, never re-muxed). Segments are held once and shared by every
+// viewer instead of being buffered per connection.
 package restream
 
 import (
@@ -31,29 +31,31 @@ import (
 const (
 	// windowSize is how many segments stay visible in each media playlist. Six
 	// is the common live default: enough for a player to build its buffer,
-	// small enough to keep latency near three target-durations.
+	// small enough to keep latency near three target durations.
 	windowSize = 6
-	// tailExtra keeps a few just-evicted segments on hand so a viewer still
-	// mid-download of the oldest visible segment finds it instead of a 404.
+	// tailExtra keeps a few just-evicted segments on hand, so a viewer still
+	// downloading the oldest visible segment finds it instead of a 404.
 	tailExtra = 3
-	// audioGroup / subsGroup are the HLS rendition-group ids the master's video
-	// variants reference. A single group per media type is all a restream needs.
+	// audioGroup and subsGroup are the HLS rendition-group ids that the
+	// master's video variants reference. One group per media type is all a
+	// restream needs.
 	audioGroup = "aud"
 	subsGroup  = "subs"
 )
 
 // Publisher holds every track of one live presentation and renders its
-// playlists. Tracks are added once at startup, then only their segment windows
-// change, so the track list itself needs no lock after setup.
+// playlists. Tracks are added once at startup; after that only their segment
+// windows change, so the track list itself needs no lock after setup.
 type Publisher struct {
 	tracks []*Track
 	byID   map[string]*Track
 	start  time.Time
-	now    func() time.Time // wall clock; tests substitute
+	now    func() time.Time // wall clock; tests swap in their own
 
-	// ver bumps on every segment/init/end across all tracks; the DASH manifest
-	// body and each track's media playlist are cached and rebuilt only when it
-	// changes, so many pollers on a long VOD never each re-walk every segment.
+	// ver goes up on every segment, init or end across all tracks. The DASH
+	// manifest body and each track's media playlist are cached and rebuilt
+	// only when it changes, so many pollers on a long VOD do not each re-walk
+	// every segment.
 	ver       atomic.Int64
 	cacheMu   sync.Mutex
 	dashCache []byte
@@ -64,8 +66,8 @@ func NewPublisher() *Publisher {
 	return &Publisher{byID: map[string]*Track{}, start: time.Now(), now: time.Now}
 }
 
-// AddTrack registers a track and returns the engine.Sink that feeds it. Call
-// before serving; the returned sink is written by exactly one download stream.
+// AddTrack registers a track and returns the engine.Sink that feeds it. Call it
+// before serving; exactly one download stream writes the returned sink.
 func (p *Publisher) AddTrack(t *Track) engine.Sink {
 	t.ver = &p.ver
 	p.tracks = append(p.tracks, t)
@@ -79,7 +81,7 @@ func (p *Publisher) Track(id string) (*Track, bool) {
 	return t, ok
 }
 
-// End marks every track's playlist finished (appends EXT-X-ENDLIST), used when
+// End marks every track's playlist finished (appends EXT-X-ENDLIST). Used when
 // the source stream ends or the operator stops recording.
 func (p *Publisher) End() {
 	for _, t := range p.tracks {
@@ -90,9 +92,9 @@ func (p *Publisher) End() {
 	p.ver.Add(1)
 }
 
-// Ready reports whether every track has published at least one segment, i.e.
-// the presentation is playable. Used to hold the "serving at ..." banner until
-// there is actually something to serve.
+// Ready reports whether every track has published at least one segment, that
+// is, whether the presentation can be played. Used to hold back the "serving
+// at ..." banner until there is actually something to serve.
 func (p *Publisher) Ready() bool {
 	for _, t := range p.tracks {
 		t.mu.RLock()
@@ -105,11 +107,11 @@ func (p *Publisher) Ready() bool {
 	return len(p.tracks) > 0
 }
 
-// WaitReady blocks until Ready (or every track has ended, or ctx/timeout
-// expire). A manifest published before a track has its first segment carries
-// an empty SegmentTimeline, and dash.js never recovers from initializing on
-// one — it neither errors nor refreshes — so the first manifest request holds
-// for the second or two the first segments take instead.
+// WaitReady blocks until Ready (or until every track has ended, or ctx or the
+// timeout expire). A manifest published before a track has its first segment
+// carries an empty SegmentTimeline, and dash.js never recovers from
+// initializing on one: it neither errors nor refreshes. So the first manifest
+// request waits the second or two the first segments take instead.
 // ponytail: 100ms polling; a broadcast channel if request volume ever matters.
 func (p *Publisher) WaitReady(ctx context.Context, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
@@ -162,8 +164,8 @@ func (p *Publisher) Stats() []Stats {
 
 // Track is one rendition (a video variant, an audio rendition, …). It owns a
 // rolling in-memory window of segments and renders its own media playlist. It
-// implements engine.Sink: Init/Segment are called in playback order by the
-// engine's ordered writer.
+// implements engine.Sink: the engine's ordered writer calls Init and Segment
+// in playback order.
 type Track struct {
 	ID  string
 	typ manifest.MediaType
@@ -185,17 +187,17 @@ type Track struct {
 	spoolDir   string // VOD only: where segment files live (the run's tmpDir)
 	segExt     string // "ts" | "m4s"
 
-	channelScheme string // DASH audio descriptor scheme, preserved with channels
+	channelScheme string // DASH audio descriptor scheme, kept together with channels
 
-	ver *atomic.Int64 // shared publisher version; bumped per segment/init/end
+	ver *atomic.Int64 // shared publisher version; goes up on every segment, init or end
 
 	mu          sync.RWMutex
 	init        []byte
 	initAt      time.Time
 	segs        []*segment
-	byName      map[string]*segment // name -> segment, so lookup is O(1) not a scan
+	byName      map[string]*segment // name -> segment, so a lookup is O(1) instead of a scan
 	targetDur   float64
-	seq         int64 // output media sequence of the next segment (monotonic; never reset)
+	seq         int64 // output media sequence of the next segment (only ever goes up; never reset)
 	nextStartMS int64 // running presentation time in ms for the next segment (DASH timeline)
 	published   int64 // total ever published (for stats)
 	ended       bool
@@ -217,7 +219,7 @@ type segment struct {
 
 // TrackFromStream builds a Track from a selected stream. id is a short,
 // URL-safe identifier assigned by the caller (e.g. "video", "audio-fr"). live
-// selects the output shape: a rolling in-memory window (live) or a seekable
+// picks the output shape: a rolling in-memory window (live), or a seekable
 // growing playlist whose segments are spooled to files under spoolDir so the
 // whole asset never sits in RAM (VOD; spoolDir is unused for live).
 func TrackFromStream(id string, st *manifest.Stream, live bool, spoolDir string) *Track {
@@ -236,8 +238,8 @@ func TrackFromStream(id string, st *manifest.Stream, live bool, spoolDir string)
 	}
 }
 
-// spoolPath is where a VOD segment's bytes live on disk. Filenames are
-// prefixed with the track id so every track can share the run's tmpDir.
+// spoolPath is where a VOD segment's bytes live on disk. Filenames start with
+// the track id so every track can share the run's tmpDir.
 func (t *Track) spoolPath(name string) string {
 	return filepath.Join(t.spoolDir, t.ID+"-"+name)
 }
@@ -250,7 +252,8 @@ func segmentIsFMP4(st *manifest.Stream) bool {
 	return strings.Contains(u, ".m4s") || strings.Contains(u, ".mp4") || strings.Contains(u, ".cmf")
 }
 
-// Init implements engine.Sink: stores the fMP4 initialization segment.
+// Init implements engine.Sink: stores the fMP4 initialization segment (the
+// headers a player needs before it can decode any media segment).
 func (t *Track) Init(data []byte) error {
 	buf := append([]byte(nil), data...)
 	t.mu.Lock()
@@ -261,23 +264,24 @@ func (t *Track) Init(data []byte) error {
 	return nil
 }
 
-// bumpVer invalidates the cached playlist/manifest bodies after a change.
+// bumpVer marks the cached playlist and manifest bodies stale after a change.
 func (t *Track) bumpVer() {
 	if t.ver != nil {
 		t.ver.Add(1)
 	}
 }
 
-// Segment implements engine.Sink: appends one segment (rolling in-memory
-// window for live, spool file for VOD) and trims anything aged out. Renumbers
-// under the track's own monotonic sequence so a source that rewinds its media
-// sequence cannot wedge or rewind output.
+// Segment implements engine.Sink: appends one segment (to the rolling
+// in-memory window for live, to a spool file for VOD) and trims anything that
+// has aged out. It renumbers under the track's own always-increasing sequence,
+// so a source that rewinds its media sequence cannot wedge or rewind the
+// output.
 func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 	// Only the engine's ordered writer calls Segment, so t.seq is stable here
 	// without the lock (readers take RLock; only this goroutine writes it).
 	// Spooling before taking the lock keeps a multi-MB disk write from
-	// blocking playlist renders, and means a segment is only ever listed once
-	// its file is complete — the HTTP handler can never see a partial write.
+	// blocking playlist renders. It also means a segment is only listed once
+	// its file is complete, so the HTTP handler can never see a partial write.
 	name := fmt.Sprintf("%06d.%s", t.seq, t.segExt)
 	if !t.live {
 		if err := os.WriteFile(t.spoolPath(name), data, 0o644); err != nil {
@@ -289,8 +293,8 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// A zero/missing source duration would emit an EXTINF of 0 and break player
-	// pacing; fall back to the largest duration seen (or a 2s default).
+	// A zero or missing source duration would emit an EXTINF of 0 and break
+	// player pacing. Fall back to the largest duration seen (or a 2s default).
 	if dur <= 0 {
 		if dur = t.targetDur; dur <= 0 {
 			dur = 2.0
@@ -318,20 +322,20 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 	t.published++
 	t.bumpVer()
 
-	// Live: trim beyond window+tail; the tail keeps just-evicted segments
-	// fetchable a moment longer for clients mid-download of the oldest visible
-	// one. VOD keeps every segment — the bytes are on disk, so RAM stays flat
-	// however long the asset is. Evicted slots are nilled so their segment
-	// data can be garbage-collected (a bare reslice would pin it in the
-	// backing array).
+	// Live: trim beyond window+tail. The tail keeps just-evicted segments
+	// fetchable a moment longer for clients still downloading the oldest
+	// visible one. VOD keeps every segment: the bytes are on disk, so RAM
+	// stays flat however long the asset is. Evicted slots are set to nil so
+	// their segment data can be garbage-collected (a bare reslice would keep
+	// it alive in the backing array).
 	if max := windowSize + tailExtra; t.live && len(t.segs) > max {
 		t.evictOldestLocked(len(t.segs) - max)
 	}
 	return nil
 }
 
-// evictOldestLocked drops the n oldest segments from the live window,
-// releasing them for GC. Caller holds t.mu.
+// evictOldestLocked drops the n oldest segments from the live window and
+// releases them for GC. Caller holds t.mu.
 func (t *Track) evictOldestLocked(n int) {
 	for i := 0; i < n; i++ {
 		delete(t.byName, t.segs[i].name)
@@ -351,7 +355,7 @@ func (t *Track) visibleLocked() []*segment {
 
 // segmentByName returns a segment for the HTTP layer: in-memory bytes for a
 // live window segment, a spool-file path for a VOD one. Only names present in
-// the segment table resolve, so the path can never leave the spool.
+// the segment table resolve, so the path can never point outside the spool.
 func (t *Track) segmentByName(name string) (data []byte, path string, modtime time.Time, ok bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -419,7 +423,7 @@ func (t *Track) mediaPlaylist() []byte {
 	}
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", td)
 	// VOD: an EVENT playlist is append-only from sequence 0, so players may
-	// seek anywhere in what has been published while it keeps growing; it
+	// seek anywhere in what has been published while it keeps growing. It
 	// becomes a complete seekable asset once ENDLIST lands below.
 	if !t.live {
 		b.WriteString("#EXT-X-PLAYLIST-TYPE:EVENT\n")
@@ -447,10 +451,10 @@ func (t *Track) mediaPlaylist() []byte {
 
 // ─── master playlist ─────────────────────────────────────────────────────────
 
-// masterPlaylist renders the multivariant playlist: audio/subtitle renditions
-// as EXT-X-MEDIA, video variants as EXT-X-STREAM-INF referencing them. It is
-// regenerated per request, so BANDWIDTH self-corrects from measured bitrate as
-// segments arrive rather than being pinned to a guess.
+// masterPlaylist renders the multivariant playlist: audio and subtitle
+// renditions as EXT-X-MEDIA, video variants as EXT-X-STREAM-INF that reference
+// them. It is built again on every request, so BANDWIDTH corrects itself from
+// the measured bitrate as segments arrive instead of staying pinned to a guess.
 func (p *Publisher) masterPlaylist() []byte {
 	var audio, subs, video []*Track
 	for _, t := range p.tracks {
@@ -518,8 +522,8 @@ func (p *Publisher) masterPlaylist() []byte {
 		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:%s\n%s/index.m3u8\n", strings.Join(attrs, ","), v.ID)
 	}
 
-	// Audio-only presentation (no video variant): still needs a STREAM-INF or
-	// players see an empty master. Point it at the first audio rendition.
+	// Audio-only presentation (no video variant): it still needs a STREAM-INF,
+	// or players see an empty master. Point it at the first audio rendition.
 	if len(video) == 0 && haveAudio {
 		a := audio[0]
 		a.mu.RLock()

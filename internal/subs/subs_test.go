@@ -34,7 +34,8 @@ func TestVTTConcatDedupe(t *testing.T) {
 }
 
 func TestVTTStripsTagsAndEntities(t *testing.T) {
-	// OSN: <c.white> cue tags; dsnp_ar: &rlm; entity — both must be gone.
+	// OSN uses <c.white> cue tags; dsnp_ar uses the &rlm; entity. Both must be
+	// gone.
 	vtt := "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<c.white>hello</c>\n\n" +
 		"00:00:03.000 --> 00:00:04.000\n&rlm;مرحبا &amp; more\n"
 	cues := parseVTT(vtt)
@@ -47,7 +48,7 @@ func TestVTTStripsTagsAndEntities(t *testing.T) {
 	if strings.Contains(cues[1].Text, "&rlm;") || strings.Contains(cues[1].Text, "&amp;") {
 		t.Fatalf("entities not decoded: %q", cues[1].Text)
 	}
-	if cues[1].Text != "‏مرحبا & more" {   // &rlm; → U+200F, &amp; → &
+	if cues[1].Text != "‏مرحبا & more" { // &rlm; decodes to U+200F and &amp; to &
 		t.Fatalf("cue1 = %q", cues[1].Text)
 	}
 }
@@ -71,7 +72,8 @@ func TestTTML(t *testing.T) {
 	}
 }
 
-// broken XML (unclosed tags) must still yield cues — lenient by design
+// Broken XML (unclosed tags) must still yield cues; the parser is lenient by
+// design.
 func TestTTMLLenient(t *testing.T) {
 	broken := `<tt><body><p begin="1s" end="2s">ok</p><p begin="3s">no end attr` // malformed tail
 	cues := parseTTML(broken)

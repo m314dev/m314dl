@@ -15,11 +15,12 @@ import (
 	"github.com/m314dev/m314dl/internal/httpx"
 )
 
-// partPath is where a segment's raw (still-encrypted, still-fake-header) bytes
-// stream to before the writer decrypts and appends them. Derived from the
-// output so concurrent downloads never collide, and stable across reruns so a
-// killed download resumes from the partial bytes already on disk. With dir set
-// (Config.PartDir) the part files live there instead of beside the output.
+// partPath is the file a segment's raw bytes stream into before the writer
+// decrypts them and appends them to the output. Raw means still encrypted and
+// still carrying any fake image header. The name comes from the output path,
+// so concurrent downloads never collide, and it is the same on every rerun, so
+// a killed download resumes from the partial bytes already on disk. With dir
+// set (Config.PartDir) the part files live there instead of beside the output.
 func partPath(dir, outPath string, idx int64) string {
 	if dir != "" {
 		outPath = filepath.Join(dir, filepath.Base(outPath))
@@ -27,13 +28,15 @@ func partPath(dir, outPath string, idx int64) string {
 	return fmt.Sprintf("%s.part%d", outPath, idx)
 }
 
-// downloadSegment streams one segment's raw body to its part file, resuming from
-// whatever bytes are already there via HTTP byte ranges, retrying transient
-// failures. It does NOT decrypt — the writer does that in index order, one
-// segment at a time, so peak memory is one segment rather than one per worker.
-// Returns the count of rate-limit (429/5xx) responses seen, for the controller.
+// downloadSegment streams one segment's raw body into its part file. It
+// resumes from whatever bytes are already there, using HTTP byte ranges, and
+// retries failures that may be temporary. It does not decrypt. The writer does
+// that in index order, one segment at a time, so peak memory is one segment
+// instead of one per worker. It returns the number of rate-limit responses
+// (429 or 5xx) it saw, for the controller.
 func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, path string) (int, error) {
-	// segment byte-range (HLS EXT-X-BYTERANGE / DASH SegmentBase); else whole object
+	// The segment's byte range (HLS EXT-X-BYTERANGE or DASH SegmentBase), or
+	// the whole object when there is none.
 	var segStart, segEnd int64 = 0, -1
 	if it.rng != nil {
 		segStart, segEnd = it.rng.Start, it.rng.End
@@ -68,14 +71,15 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			u = cfg.fileURL.get() // another worker may have re-resolved it
 		}
 		rngHdr := resumeRange(it.rng != nil, segStart, segEnd, have)
-		// Per-attempt idle watchdog: a throttling CDN (common when concurrency is
-		// pushed high) often holds the connection open and sends nothing rather
-		// than returning 429. Without this the read below blocks forever and the
-		// whole download stalls at 0 B/s. The watchdog cancels this attempt if no
-		// byte arrives for segIdleTimeout — headers or body — so the retry loop
-		// resumes from the bytes already on disk. ctx.Err() stays nil (only the
-		// child was cancelled), which is exactly why these paths must treat a
-		// cancelled attempt as retryable, not fatal.
+		// Idle watchdog for this attempt. A CDN that is throttling us (common
+		// when concurrency is pushed high) often keeps the connection open and
+		// sends nothing, instead of returning 429. Without the watchdog the read
+		// below would block forever and the whole download would sit at 0 B/s.
+		// The watchdog cancels this attempt when no byte arrives for
+		// segIdleTimeout, whether headers or body, so the retry loop picks up
+		// from the bytes already on disk. ctx.Err() stays nil because only the
+		// child context was cancelled. That is why the paths below must retry a
+		// cancelled attempt instead of failing the segment.
 		reqCtx, cancel := context.WithCancel(ctx)
 		wd := time.AfterFunc(segIdleTimeout, cancel)
 		resp, err := cfg.Client.RangeGet(reqCtx, u, rngHdr)
@@ -110,9 +114,10 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			have = 0
 			continue
 		case resp.StatusCode == http.StatusOK && it.rng != nil && segStart > 0 && resp.ContentLength != segLen:
-			// Ranged segment answered with the whole object (a 200 whose length is
-			// not the slice's). Writing it as the segment would put the object's
-			// head where this slice belongs, so refuse rather than corrupt.
+			// A ranged segment was answered with the whole object: a 200 whose
+			// length is not the slice's. Writing that as the segment would put
+			// the start of the object where this slice belongs, so refuse
+			// instead of corrupting the output.
 			resp.Body.Close()
 			wd.Stop()
 			cancel()
@@ -120,8 +125,9 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			os.Remove(path) // empty; don't litter the output dir
 			return pressure, ErrRangeIgnored
 		case resp.StatusCode == http.StatusOK && it.rng != nil && segLen >= 0:
-			// Slice from offset 0 answered with the whole object: it starts where
-			// the slice starts, so keep the slice's length and drop the rest.
+			// A slice starting at offset 0 was answered with the whole object.
+			// The object starts where the slice starts, so keep the slice's
+			// length of it and drop the rest.
 			body = io.LimitReader(resp.Body, segLen)
 		case resp.StatusCode >= 400:
 			code := resp.StatusCode
@@ -133,8 +139,9 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			if httpx.Retriable(code) {
 				pressure++
 			}
-			// A refused token (see fileURL): re-resolve once per segment. Once,
-			// so a server refusing for another reason still fails the segment.
+			// The token was refused (see fileURL): resolve the URL again, once
+			// per segment. Only once, so a server that refuses for some other
+			// reason still fails the segment.
 			if (code == http.StatusNotAcceptable || code == http.StatusForbidden) &&
 				cfg.fileURL != nil && !refreshed && ctx.Err() == nil {
 				refreshed = true
@@ -152,8 +159,9 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			continue
 		}
 
-		// 2xx: stream the body to disk, counting bytes as they arrive. Each byte
-		// received re-arms the watchdog, so a live-but-slow transfer is never cut.
+		// 2xx: stream the body to disk, counting bytes as they arrive. Every
+		// byte received resets the watchdog, so a slow transfer that is still
+		// alive is never cut.
 		n, rerr := streamBody(body, f, cfg.Progress, ctl, func() {
 			wd.Reset(segIdleTimeout)
 		})
@@ -162,17 +170,19 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 		cancel()
 		have += n
 		if rerr == nil && segLen >= 0 && have < segLen {
-			// A 206 shorter than the slice asked for (some CDNs cap a range's
-			// length): not done yet. Retry below picks up at the bytes we have.
+			// A 206 shorter than the slice we asked for (some CDNs cap the
+			// length of a range). We are not done yet; the retry below picks up
+			// from the bytes we have.
 			rerr = io.ErrUnexpectedEOF
 		}
 		if rerr == nil {
 			return pressure, nil // complete
 		}
-		// mid-body failure (including a watchdog cancel): retry, resuming from the
-		// bytes we kept. A watchdog stall counts as rate-limit pressure. Note the
-		// guard is on the PARENT ctx — a watchdog-cancelled attempt leaves it nil,
-		// so it retries; a user abort cancels the parent and stops.
+		// The body failed part way through (a watchdog cancel counts): retry,
+		// resuming from the bytes we kept. A watchdog stall counts as rate-limit
+		// pressure. The guard checks the parent ctx on purpose: a watchdog
+		// cancel leaves it nil, so we retry, while a user abort cancels the
+		// parent and we stop.
 		if attempt >= cfg.Client.Retries() || ctx.Err() != nil {
 			return pressure, fmt.Errorf("read body: %w", rerr)
 		}
@@ -183,18 +193,20 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 	}
 }
 
-// ErrRangeIgnored reports a server that answered a byte-range request for a
-// slice past offset 0 with 200 and the whole object. The segment fails rather
-// than corrupting the output; DownloadFile falls back to one connection.
+// ErrRangeIgnored means a server answered a byte-range request for a slice
+// past offset 0 with a 200 and the whole object. The segment fails instead of
+// corrupting the output, and DownloadFile falls back to one connection.
 var ErrRangeIgnored = errors.New("server ignored Range request")
 
-// segIdleTimeout bounds how long a single segment fetch may receive no bytes
-// before it is abandoned and retried. Generous enough that a slow-but-alive
-// link is never cut, short enough that a silently-throttled connection self-heals
-// instead of stalling the whole download at 0 B/s.
+// segIdleTimeout is how long one segment fetch may go without receiving any
+// bytes before it is abandoned and retried. It is long enough that a slow link
+// that is still alive is never cut, and short enough that a connection being
+// silently throttled recovers on its own instead of stalling the whole download
+// at 0 B/s.
 const segIdleTimeout = 30 * time.Second
 
-// resumeRange builds the Range header to fetch the not-yet-downloaded tail.
+// resumeRange builds the Range header that asks for the part not downloaded
+// yet.
 func resumeRange(ranged bool, segStart, segEnd, have int64) string {
 	if ranged {
 		start := segStart + have
@@ -214,8 +226,9 @@ func resumeRange(ranged bool, segStart, segEnd, have int64) string {
 // buffers alone took 15% of its CPU time.
 var copyBufs = sync.Pool{New: func() any { b := make([]byte, 1<<20); return &b }}
 
-// streamBody copies body into f, reporting bytes to progress and the controller
-// as they arrive (smooth throughput, and a live counter during a huge segment).
+// streamBody copies body into f and reports bytes to the progress line and the
+// controller as they arrive. That keeps the throughput reading smooth and the
+// byte counter moving during a very large segment.
 func streamBody(body io.Reader, f *os.File, prog *Progress, ctl *controller, keepalive func()) (int64, error) {
 	bp := copyBufs.Get().(*[]byte)
 	defer copyBufs.Put(bp)
@@ -225,7 +238,7 @@ func streamBody(body io.Reader, f *os.File, prog *Progress, ctl *controller, kee
 		n, rerr := body.Read(buf)
 		if n > 0 {
 			if keepalive != nil {
-				keepalive() // bytes arrived — re-arm the idle watchdog
+				keepalive() // bytes arrived: reset the idle watchdog
 			}
 			if _, werr := f.Write(buf[:n]); werr != nil {
 				return total, werr
@@ -247,8 +260,9 @@ func streamBody(body io.Reader, f *os.File, prog *Progress, ctl *controller, kee
 	}
 }
 
-// retryWait sleeps with exponential backoff+jitter, or the (capped) Retry-After
-// when the server supplied one. Returns false if ctx is cancelled while waiting.
+// retryWait sleeps before a retry. The wait doubles each time, with some random
+// jitter added, unless the server sent a Retry-After, which is used instead
+// (capped). It returns false if ctx is cancelled while waiting.
 func retryWait(ctx context.Context, backoff *time.Duration, retryAfter time.Duration) bool {
 	wait := *backoff + time.Duration(rand.Int64N(int64(*backoff/2)))
 	if retryAfter > 0 {

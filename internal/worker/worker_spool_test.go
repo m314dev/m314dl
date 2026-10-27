@@ -9,10 +9,10 @@ import (
 
 // A worker clears its own staging area on startup.
 //
-// A channel removes its directory when it stops, but a killed or restarted
-// process never does — and the leftovers are invisible, unbounded, and sit on
-// the same disk the live segments are being written to. One restart-heavy day
-// left 1430 directories and 43GB behind.
+// A channel removes its directory when it stops, but a process that is killed
+// or restarted never does. The leftovers are invisible, grow without limit,
+// and sit on the same disk the live segments are being written to. One day
+// with many restarts left 1430 directories and 43GB behind.
 func TestAWorkerClearsItsSpoolOnStartup(t *testing.T) {
 	base := t.TempDir()
 
@@ -79,9 +79,10 @@ func TestSpoolHonoursSpoolDir(t *testing.T) {
 	}
 }
 
-// Without -spool-dir the spool lands in the current directory — real disk in
-// the normal case — never in the system temp dir, which is tmpfs (RAM) on
-// most Linux hosts and was where a large VOD restream got OOM-killed.
+// Without -spool-dir the spool lands in the current directory, which is real
+// disk in the normal case. It never goes in the system temp dir, which is
+// tmpfs (RAM) on most Linux hosts and is where a large VOD restream once got
+// OOM-killed.
 func TestSpoolDefaultsToCurrentDir(t *testing.T) {
 	cwd := t.TempDir()
 	t.Chdir(cwd)

@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// bigMPD builds a multi-period, multi-representation on-demand MPD with n
-// SegmentTimeline entries per representation — a realistic large manifest.
+// bigMPD builds a multi-period, multi-representation on-demand MPD with segs
+// SegmentTimeline entries per representation, a realistic large manifest.
 func bigMPD(periods, reps, segs int) []byte {
 	var b strings.Builder
 	b.WriteString(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:cenc="urn:mpeg:cenc:2013" type="static" mediaPresentationDuration="PT2H">`)
@@ -29,7 +29,7 @@ func bigMPD(periods, reps, segs int) []byte {
 	return []byte(b.String())
 }
 
-// BenchmarkParse measures MPD parse throughput on a large manifest (4 periods ×
+// BenchmarkParse measures how fast a large MPD is parsed (4 periods ×
 // 6 renditions × 100 segments = 2400 <S> entries).
 func BenchmarkParse(b *testing.B) {
 	mpd := bigMPD(4, 6, 100)

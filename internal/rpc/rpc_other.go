@@ -4,6 +4,7 @@ package rpc
 
 import "os/exec"
 
-// hardenCmd is a no-op off Linux, where Pdeathsig isn't available. Graceful
-// shutdown still stops children; only hard-crash orphan-reaping is Linux-only.
+// hardenCmd does nothing off Linux, where Pdeathsig is not available. A
+// graceful shutdown still stops the children; only the cleanup of orphans
+// after a hard crash is limited to Linux.
 func hardenCmd(cmd *exec.Cmd) {}

@@ -2,7 +2,7 @@ package mp4
 
 import "testing"
 
-// buildSidx assembles a version-0 SegmentIndexBox with the given references.
+// buildSidx builds a version 0 SegmentIndexBox holding the given references.
 func buildSidx(timescale, firstOffset uint32, refs []SidxRef) []byte {
 	body := concatBytes(fullBoxHdr(0, 0), be32(1), be32(timescale), be32(0), be32(firstOffset), be16(0), be16(uint16(len(refs))))
 	for _, r := range refs {
@@ -29,11 +29,12 @@ func TestParseSidx(t *testing.T) {
 			t.Fatalf("ref %d = %+v, want %+v", i, s.Refs[i], want[i])
 		}
 	}
-	// a leading unrelated box (styp) before the sidx is skipped
+	// An unrelated box (styp) in front of the sidx is skipped.
 	if s2, err := ParseSidx(append(Box("styp", []byte("dash")), buf...)); err != nil || s2.End != int64(len(buf))+12 {
 		t.Fatalf("sidx after styp: %v %+v", err, s2)
 	}
-	// hierarchical references are refused rather than misread as media
+	// A hierarchical reference (top bit of the size set) is refused; reading it
+	// as media would be wrong.
 	if _, err := ParseSidx(buildSidx(48000, 0, []SidxRef{{Size: 0x80000010, Duration: 1}})); err == nil {
 		t.Fatal("hierarchical sidx should be rejected")
 	}

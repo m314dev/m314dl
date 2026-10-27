@@ -1,10 +1,10 @@
 package mss_test
 
 // End-to-end tests against a real Smooth Streaming presentation. ffmpeg's
-// smoothstreaming muxer writes the genuine article — Manifest, PIFF fragments
-// with tfxd/tfrf and no tfdt — so nothing here is hand-rolled except the
-// PlayReady header (ffmpeg encrypts with plain CENC; the PlayReady framing is
-// the parser's job and is unit-tested separately). Skipped without ffmpeg.
+// smoothstreaming muxer writes the real thing (a Manifest, and PIFF fragments
+// with tfxd/tfrf boxes and no tfdt), so nothing here is built by hand except
+// the PlayReady header. ffmpeg encrypts with plain CENC; the PlayReady framing
+// is the parser's job and has its own unit tests. Skipped without ffmpeg.
 
 import (
 	"bytes"
@@ -60,16 +60,17 @@ func run(t *testing.T, name string, args ...string) string {
 	return string(out)
 }
 
-// x264 settings shared by every encode so the SPS/PPS (and hence the manifest's
-// CodecPrivateData) are identical across fixtures.
+// videoArgs are the x264 settings shared by every encode, so the SPS/PPS (and
+// with them the manifest's CodecPrivateData) are identical across fixtures.
 var videoArgs = []string{"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-t", "4",
 	"-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-g", "25", "-keyint_min", "25",
 	"-sc_threshold", "0", "-b:v", "200k"}
 
 // genSmooth writes a one-track Smooth presentation under dir and returns its
-// StreamIndex element. Video and audio are packaged separately: ffmpeg shifts
-// every stream by the AAC priming delay when they share a muxer, which puts the
-// first video fragment at a nonzero time its Manifest doesn't declare.
+// StreamIndex element. Video and audio are packaged separately because ffmpeg
+// shifts every stream by the AAC priming delay when they share a muxer, which
+// puts the first video fragment at a nonzero time its Manifest does not
+// declare.
 func genSmooth(t *testing.T, ffmpeg, dir, kind string) string {
 	t.Helper()
 	args := append([]string{"-hide_banner", "-loglevel", "error"}, videoArgs...)
@@ -133,7 +134,7 @@ func newClient(t *testing.T) *httpx.Client {
 
 func logv(format string, args ...any) {}
 
-// load goes through the shared dispatcher so the kind sniffing is covered too.
+// load goes through the shared loader so the format detection is covered too.
 func load(t *testing.T, client *httpx.Client, u string) []*manifest.Stream {
 	t.Helper()
 	master, kind, err := source.LoadManifest(context.Background(), client, u, logv)
@@ -273,8 +274,8 @@ func TestE2ERestream(t *testing.T) {
 		})
 	}
 
-	// MPEG-TS output: the fMP4 tracks are remuxed by a long-lived ffmpeg into
-	// one transport stream fanned out to viewers.
+	// MPEG-TS output: a long-running ffmpeg remuxes the fMP4 tracks into one
+	// transport stream that is sent to every viewer.
 	t.Run("ts", func(t *testing.T) {
 		selected := load(t, client, srv.URL+"/Manifest")
 		tmp := t.TempDir()
@@ -284,8 +285,9 @@ func TestE2ERestream(t *testing.T) {
 		}
 		hs := httptest.NewServer(handler)
 		defer hs.Close()
-		// A viewer joins the broadcast and reads until it ends — which is when
-		// the sources are done and the presentation is ended, as the run loop does.
+		// A viewer joins the broadcast and reads until it ends, which happens
+		// when the sources are done and the presentation is ended, as in the
+		// run loop.
 		viewer := make(chan []byte, 1)
 		go func() {
 			for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
@@ -334,16 +336,17 @@ func firstSegment(t *testing.T, playlist string) string {
 }
 
 // TestE2ECENC encrypts the same video with ffmpeg's CENC (cenc-aes-ctr, 8-byte
-// IVs, subsample-encrypted H.264 — the PIFF/PlayReady layout minus the uuid
-// box, which the mp4 package tests cover), serves the fragments under a
-// PlayReady-protected manifest, and checks the native decrypt matches ffmpeg's
-// own decryption of the source bit for bit.
+// IVs, H.264 encrypted per subsample; this is the PIFF/PlayReady layout minus
+// the uuid box, which the mp4 package tests cover), serves the fragments under
+// a PlayReady-protected manifest, and checks that the native decryption
+// matches ffmpeg's own decryption of the source bit for bit.
 func TestE2ECENC(t *testing.T) {
 	ffmpeg, _ := requireTools(t)
 	srv, root, manifestText := fixture(t, ffmpeg)
 	client := newClient(t)
 
-	// encrypted ismv → one fragment file per moof/mdat pair, named by its tfxd time
+	// split the encrypted ismv into one fragment file per moof/mdat pair, named
+	// by its tfxd time
 	ismv := filepath.Join(t.TempDir(), "enc.ismv")
 	args := append([]string{"-hide_banner", "-loglevel", "error"}, videoArgs...)
 	args = append(args, "-encryption_scheme", "cenc-aes-ctr", "-encryption_key", cencKey, "-encryption_kid", cencKID,
@@ -399,7 +402,7 @@ func TestE2ECENC(t *testing.T) {
 	}
 
 	raw := filepath.Join(t.TempDir(), "video.mp4")
-	// no key → refused up front, nothing downloaded
+	// no key: refused up front, nothing downloaded
 	if err := engine.DownloadStream(context.Background(), engine.Config{Client: client}, video, raw, nil); err == nil || !strings.Contains(err.Error(), "no key") {
 		t.Fatalf("keyless download: %v", err)
 	}
@@ -422,7 +425,7 @@ func TestE2ECENC(t *testing.T) {
 	}
 }
 
-// tfxdTime reads the PIFF fragment time out of a moof's traf.
+// tfxdTime reads the PIFF fragment start time out of a moof's traf box.
 func tfxdTime(t *testing.T, moof []byte) string {
 	t.Helper()
 	ext := []byte{0x6d, 0x1d, 0x9b, 0x05, 0x42, 0xd5, 0x44, 0xe6, 0x80, 0xe2, 0x14, 0x1d, 0xaf, 0xf7, 0x57, 0xb2}

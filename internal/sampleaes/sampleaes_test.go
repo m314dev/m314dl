@@ -20,9 +20,9 @@ func newBlock(t *testing.T) cipher.Block {
 	return b
 }
 
-// applyEP re-inserts H.264 emulation-prevention bytes (the inverse of the
-// package's discardEP): a 0x03 is added before any byte <= 0x03 that follows two
-// consecutive zero bytes. Used only by the test encryptor — production
+// applyEP puts H.264 emulation-prevention bytes back (the inverse of the
+// package's discardEP): a 0x03 is inserted before any byte <= 0x03 that follows
+// two zero bytes in a row. Only the test encryptor uses it; production
 // decryption never re-escapes.
 func applyEP(data []byte) []byte {
 	out := make([]byte, 0, len(data)+len(data)/50+4)
@@ -61,11 +61,12 @@ func encryptAAC(frame []byte, block cipher.Block, iv []byte) {
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(frame[start:end], frame[start:end])
 }
 
-// encryptAVCNAL mirrors a SAMPLE-AES encoder (e.g. Bento4's mp42hls): it
+// encryptAVCNAL mirrors a SAMPLE-AES encoder (for example Bento4's mp42hls): it
 // encrypts the 1-in-10 block pattern in place over the clear NAL, then applies
 // start-code emulation prevention over the already-encrypted NAL. The decoder
-// removes that one EP layer and decrypts, recovering the original NAL exactly —
-// no re-escaping. (Verified against real Bento4-encrypted streams.)
+// removes that one EP layer and decrypts, which recovers the original NAL
+// exactly, with no re-escaping. (Verified against real Bento4-encrypted
+// streams.)
 func encryptAVCNAL(nal []byte, block cipher.Block, iv []byte) []byte {
 	if len(nal) == 0 {
 		return nal
@@ -93,18 +94,20 @@ func encryptAVCNAL(nal []byte, block cipher.Block, iv []byte) []byte {
 	return applyEP(buf)
 }
 
-// canonicalNAL builds a canonically emulation-prevented NAL from a raw body.
+// canonicalNAL builds a NAL with standard emulation prevention from a raw body.
 func canonicalNAL(nalType byte, body []byte) []byte {
 	return applyEP(append([]byte{nalType & 0x1f}, body...))
 }
 
-// deterministic pseudo-random body with embedded start-code-like patterns.
+// body builds a deterministic pseudo-random payload with start-code-like byte
+// runs inside it.
 func body(n int) []byte {
 	b := make([]byte, n)
 	for i := range b {
 		b[i] = byte(i*37 + 11)
 	}
-	// sprinkle 00 00 0x runs to exercise emulation prevention on both sides.
+	// add 00 00 0x runs so emulation prevention is exercised on both the
+	// encrypt and the decrypt side.
 	for _, p := range []int{40, 41, 42, 70, 71, 72, 100, 101, 102} {
 		if p+2 < n {
 			b[p], b[p+1], b[p+2] = 0, 0, byte(p%4)
@@ -136,7 +139,7 @@ func TestAVCNALRoundTrip(t *testing.T) {
 			if !bytes.Equal(dec, nal) {
 				t.Fatalf("round trip mismatch: got %d bytes, want %d", len(dec), len(nal))
 			}
-			// something must actually have been encrypted for large NALs.
+			// large NALs must really have been encrypted.
 			if tc.n >= 200 && bytes.Equal(enc, nal) {
 				t.Fatalf("nal was not encrypted")
 			}
@@ -146,7 +149,8 @@ func TestAVCNALRoundTrip(t *testing.T) {
 
 func TestAVCNALNotEncrypted(t *testing.T) {
 	block := newBlock(t)
-	// too small (<=48) and non-VCL types pass through untouched.
+	// NALs that are too small (<=48 bytes) and non-VCL types (not slice data)
+	// pass through untouched.
 	for _, tc := range []struct {
 		typ byte
 		n   int
@@ -216,7 +220,7 @@ func TestAACRoundTrip(t *testing.T) {
 			if !bytes.Equal(enc, orig) {
 				t.Fatalf("aac round trip mismatch (payload=%d crc=%v)", tc.payload, tc.crc)
 			}
-			// header + 16-byte leader must never change.
+			// the header and the 16-byte leader must never change.
 			hdr := 7
 			if tc.crc {
 				hdr = 9
@@ -279,7 +283,7 @@ func buildPAT(cc byte) []byte {
 }
 
 func buildPMT(cc byte, vType, aType byte) []byte {
-	// section body without length/crc filled yet
+	// section body; the length and CRC are filled in below
 	body := []byte{
 		0x02, 0x00, 0x00, 0x00, 0x01, 0xc1, 0x00, 0x00,
 		byte(0xe0 | (videoPID>>8)&0x1f), byte(videoPID & 0xff), // PCR PID
@@ -309,7 +313,7 @@ func pesWrap(streamID byte, es []byte) []byte {
 }
 
 // packetizePES splits a PES onto pid using the same rules as the decoder's
-// packetize (first packet PUSI, adaptation stuffing on the last).
+// packetize (the first packet has PUSI set, the last gets adaptation stuffing).
 func packetizePES(pid uint16, pes []byte) []byte {
 	first := []byte{sync, byte(pid>>8)&0x1f | 0x40, byte(pid), 0x10}
 	return packetize(pid, first, pes)
@@ -377,11 +381,11 @@ func TestDecryptTransportStream(t *testing.T) {
 
 	// clear samples
 	clearNALs := [][]byte{
-		canonicalNAL(9, []byte{0x10}),   // AUD (not encrypted)
-		canonicalNAL(7, body(30)),       // SPS (not encrypted)
-		canonicalNAL(5, body(5000)),     // IDR slice (encrypted)
-		canonicalNAL(1, body(1200)),     // non-IDR slice (encrypted)
-		canonicalNAL(1, body(40)),       // small slice (not encrypted, <=48)
+		canonicalNAL(9, []byte{0x10}), // AUD (not encrypted)
+		canonicalNAL(7, body(30)),     // SPS (not encrypted)
+		canonicalNAL(5, body(5000)),   // IDR slice (encrypted)
+		canonicalNAL(1, body(1200)),   // non-IDR slice (encrypted)
+		canonicalNAL(1, body(40)),     // small slice (not encrypted, <=48)
 	}
 	clearFrames := [][]byte{
 		makeADTS(600, false),
@@ -389,7 +393,7 @@ func TestDecryptTransportStream(t *testing.T) {
 		makeADTS(9, false), // no encrypted portion
 	}
 
-	// build the ENCRYPTED transport stream the way a packager would.
+	// build the encrypted transport stream the way a packager would.
 	encNALs := make([][]byte, len(clearNALs))
 	for i, n := range clearNALs {
 		encNALs[i] = encryptAVCNAL(append([]byte(nil), n...), block, testIV)
@@ -429,7 +433,7 @@ func TestDecryptTransportStream(t *testing.T) {
 	}
 	assertPMTClear(t, decTS)
 
-	// video ES must recover the original clear NALs exactly.
+	// the video ES must come back as the original clear NALs, exactly.
 	gotNALs := splitNALs(demuxES(decTS, videoPID))
 	if len(gotNALs) != len(clearNALs) {
 		t.Fatalf("got %d NALs, want %d", len(gotNALs), len(clearNALs))
@@ -440,7 +444,7 @@ func TestDecryptTransportStream(t *testing.T) {
 		}
 	}
 
-	// audio ES must recover the original clear ADTS frames exactly.
+	// the audio ES must come back as the original clear ADTS frames, exactly.
 	wantAudio := bytes.Join(clearFrames, nil)
 	if got := demuxES(decTS, audioPID); !bytes.Equal(got, wantAudio) {
 		t.Fatalf("audio ES mismatch: got %d bytes want %d", len(got), len(wantAudio))

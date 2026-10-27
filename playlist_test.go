@@ -16,9 +16,10 @@ import (
 	"github.com/m314dev/m314dl/internal/source"
 )
 
-// An IPTV list, from a URL: VOD titles land in <dir>/<group>/<title>.<ext>, the
-// live channel is never requested, and a rerun skips what is already done.
-// -titles 1 runs one title at a time; -titles 2 runs both at once.
+// An IPTV list fetched from a URL: VOD titles land in
+// <dir>/<group>/<title>.<ext>, the live channel is never requested, and a
+// second run skips what is already done. -titles 1 runs one title at a time;
+// -titles 2 runs both at once.
 func TestDownloadPlaylist(t *testing.T) {
 	for _, titles := range []int{1, 2} {
 		if got := playlistRun(t, titles); got != titles {
@@ -27,10 +28,10 @@ func TestDownloadPlaylist(t *testing.T) {
 	}
 }
 
-// playlistRun downloads a two-title list twice and returns the most titles
-// the server saw in flight at once.
+// playlistRun downloads a two-title list twice and returns the highest number
+// of titles the server saw in flight at once.
 func playlistRun(t *testing.T, titles int) int {
-	movie, episode := bytes.Repeat([]byte{0, 1, 2}, 1000), bytes.Repeat([]byte{0, 3}, 1000) // binary: a direct file
+	movie, episode := bytes.Repeat([]byte{0, 1, 2}, 1000), bytes.Repeat([]byte{0, 3}, 1000) // binary content: treated as a direct file
 	var mu sync.Mutex
 	hits := map[string]int{}
 	inFlight, maxInFlight := 0, 0
@@ -58,8 +59,8 @@ func playlistRun(t *testing.T, titles int) int {
 		inFlight++
 		maxInFlight = max(maxInFlight, inFlight)
 		mu.Unlock()
-		// Hold before answering: a title's next request waits on this answer,
-		// so only requests from different titles can be held at once.
+		// Wait before answering. A title's next request waits for this answer,
+		// so only requests from different titles can be waiting at the same time.
 		time.Sleep(100 * time.Millisecond)
 		mu.Lock()
 		inFlight--
@@ -129,7 +130,7 @@ func TestSelectEntries(t *testing.T) {
 	}
 }
 
-// writeList is a local M3U file, the other input form.
+// writeList writes a local M3U file, the other way a list can be given.
 func writeList(t *testing.T) string {
 	p := filepath.Join(t.TempDir(), "list.m3u")
 	os.WriteFile(p, []byte("#EXTM3U\n"+

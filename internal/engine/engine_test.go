@@ -56,8 +56,9 @@ func TestDecryptAES128(t *testing.T) {
 	}
 }
 
-// End-to-end: segments served over HTTP, one flaky segment (fails twice then
-// succeeds), verify ordered output and resume-state cleanup.
+// End to end: segments served over HTTP, with one flaky segment that fails
+// twice and then succeeds. Checks the output order and that the resume state
+// is cleaned up.
 func TestDownloadStreamOrderAndRetry(t *testing.T) {
 	var flakes atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -113,7 +114,7 @@ func TestDownloadStreamVODFailNoHole(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error for 404 segment")
 	}
-	// only the contiguous prefix before the failure may be committed
+	// only the unbroken prefix before the failure may be committed
 	b, _ := os.ReadFile(out)
 	if string(b) != "[/seg0]" {
 		t.Fatalf("committed %q, want only seg0", b)
@@ -169,9 +170,9 @@ func TestTempDirAndStreamPath(t *testing.T) {
 	}
 }
 
-// TestDownloadStreamResume simulates an interrupted run (checkpoint on disk)
-// and verifies the rerun skips already-done segments, appends byte-exact, and
-// seeds progress from the checkpoint instead of restarting at 0.
+// TestDownloadStreamResume simulates an interrupted run (a checkpoint on disk)
+// and checks that the rerun skips the segments already done, appends the exact
+// bytes, and seeds progress from the checkpoint instead of restarting at 0.
 func TestDownloadStreamResume(t *testing.T) {
 	var requested sync.Map
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -216,9 +217,9 @@ func TestDownloadStreamResume(t *testing.T) {
 	}
 }
 
-// TestIntraSegmentResume proves byte-range resume within a single segment: a
-// partial part file on disk is completed with a Range request, not re-fetched
-// from scratch.
+// TestIntraSegmentResume checks byte-range resume inside a single segment: a
+// partial part file on disk is completed with a Range request instead of being
+// fetched again from the start.
 func TestIntraSegmentResume(t *testing.T) {
 	content := func(i int) []byte { return bytes.Repeat([]byte{byte('A' + i)}, 100) }
 	var ranges sync.Map
@@ -274,9 +275,10 @@ func TestIntraSegmentResume(t *testing.T) {
 	}
 }
 
-// TestProgressTotalUpfront proves the segment total is published before
-// downloads complete, so the percentage denominator is final from the first
-// tick instead of inflating as segments trickle out (which slid the bar back).
+// TestProgressTotalUpfront checks that the segment total is published before
+// any download completes, so the percentage denominator is final from the
+// first tick instead of growing as segments trickle out (which used to slide
+// the bar backwards).
 func TestProgressTotalUpfront(t *testing.T) {
 	gate := make(chan struct{})
 	reached := make(chan struct{}, 8)
@@ -326,8 +328,9 @@ func (s *countingSink) Segment(SegmentInfo, []byte) error {
 }
 
 // PaceRealtime holds a finite restream to the source's real duration after a
-// short prime burst, so a VOD can't flood the live output. A lower-bound timing
-// check: the paced segments cannot finish faster than their own durations.
+// short prime burst, so a VOD cannot flood the live output. This is a lower
+// bound timing check: the paced segments cannot finish faster than their own
+// durations add up to.
 func TestSinkWriterPaceRealtime(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "[%s]", r.URL.Path)
@@ -379,8 +382,9 @@ func mpegCRC32(b []byte) uint32 {
 	return crc
 }
 
-// tsPkt builds one 188-byte TS packet, padding a short payload with adaptation
-// stuffing (matching how a real muxer fills the final packet of a PES).
+// tsPkt builds one 188-byte TS packet. A short payload is padded with
+// adaptation-field stuffing, the way a real muxer fills the final packet of a
+// PES.
 func tsPkt(pid uint16, pusi bool, payload []byte) []byte {
 	p := make([]byte, 188)
 	for i := range p {
@@ -460,8 +464,8 @@ func appendU32(b []byte, v uint32) []byte {
 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
-// End-to-end: a SAMPLE-AES transport stream routed through decryptSegment with a
-// user-supplied bare key is decrypted in place.
+// End to end: a SAMPLE-AES transport stream sent through decryptSegment with a
+// bare key from the user is decrypted in place.
 func TestDecryptSegmentSampleAESTS(t *testing.T) {
 	key := []byte("0123456789abcdef")
 	iv := []byte("ABCDEFGHIJKLMNOP")
@@ -563,11 +567,11 @@ func (s *recordingSink) Segment(_ SegmentInfo, data []byte) error {
 	return nil
 }
 
-// TestLiveSeenMapPrunedNoReEmit drives a live stream whose window slides forward
-// over many refreshes. The feeder's dedup map is pruned to the current window
-// each refresh (so it can't grow unbounded on a 24/7 channel); this asserts the
-// pruning never causes a segment still to be re-emitted or dropped — each is
-// delivered exactly once, in order.
+// TestLiveSeenMapPrunedNoReEmit drives a live stream whose window slides
+// forward over many refreshes. The feeder's map of seen segments is trimmed to
+// the current window on each refresh, so it cannot grow without limit on a
+// 24/7 channel. This test checks that the trimming never makes a segment be
+// sent twice or dropped: each one is delivered exactly once, in order.
 func TestLiveSeenMapPrunedNoReEmit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s", r.URL.Path) // echo path so the sink knows the segment
@@ -628,11 +632,11 @@ func mustClient(t *testing.T) *httpx.Client {
 	return c
 }
 
-// A commit error (here: the AES-128 key for segment 2 is a 404) must end
+// A commit error (here the AES-128 key for segment 2 is a 404) must end
 // DownloadStream even while the feeder still has segments to push. Before the
-// fix the writer died, the workers filled `results`, the feeder parked on
+// fix the writer died, the workers filled `results`, the feeder stopped on
 // `items`, and the process printed the same progress line forever with no
-// sockets open — seen fleet-wide as "hung" downloads.
+// sockets open. Across the fleet this showed up as "hung" downloads.
 func TestWriterErrorStopsPipeline(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/badkey" {
@@ -668,9 +672,10 @@ func TestWriterErrorStopsPipeline(t *testing.T) {
 	}
 }
 
-// AES-128 ciphertext is random bytes, so it can open FF D8 (JPEG) and hold
-// three 0x47s 188 apart by chance. The fake-header strip must not run on it:
-// it once chopped a 2084928-byte segment to 256222 and the decrypt failed.
+// AES-128 ciphertext looks like random bytes, so by chance it can start with
+// FF D8 (JPEG) and hold three 0x47 bytes 188 apart. The fake-header strip must
+// not run on it: it once cut a 2084928-byte segment down to 256222 bytes and
+// the decrypt failed.
 func TestAES128CiphertextNotTakenForFakeImage(t *testing.T) {
 	key := bytes.Repeat([]byte{7}, 16)
 	ct := make([]byte, 4096)

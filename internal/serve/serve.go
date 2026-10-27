@@ -1,10 +1,11 @@
-// Restream mode (-serve): download the selected streams and republish them live
-// over HTTP instead of writing a file. Two output shapes share one run loop:
+// Package serve is the restream mode (-serve): it downloads the selected
+// streams and republishes them live over HTTP instead of writing a file. Two
+// output shapes share one run loop:
 //
-//   - HLS (-serve-format hls, default): a multivariant playlist plus a rolling
-//     window of segments, one media playlist per track.
-//   - MPEG-TS (-serve-format ts): a single continuous transport stream fanned
-//     out to every viewer. Requires one muxed TS source track.
+//   - HLS (-serve-format hls, the default): a multivariant playlist plus a
+//     rolling window of segments, with one media playlist per track.
+//   - MPEG-TS (-serve-format ts): a single continuous transport stream that is
+//     copied out to every viewer. It needs one muxed TS source track.
 package serve
 
 import (
@@ -36,18 +37,19 @@ type Options struct {
 	Format     string // hls | ts | dash (-serve-format)
 	Transcode  string // ffmpeg output args for the ts remux path (-serve-transcode)
 	FFmpegPath string // -ffmpeg
-	SpoolDir   string // -spool-dir; "" = current directory (see SpoolBase)
+	SpoolDir   string // -spool-dir; "" means the current directory (see SpoolBase)
 }
 
-// SpoolBase resolves the directory restream spools are created under: the
-// -spool-dir override, else the current directory, else the system temp dir
-// if the current one isn't writable. The current directory is the default on
-// purpose: a seekable VOD spools the whole decrypted asset there, and the
-// system temp dir is tmpfs on most Linux hosts — RAM, not disk — so a large
-// restream that "spooled to disk" there was filling memory until the OOM
-// killer took the process. The current directory is real disk in the normal
-// case, a container's data volume included. Warns on stderr, without failing,
-// when the resolved location is RAM-backed anyway.
+// SpoolBase picks the directory that restream spools are created under: the
+// -spool-dir override if given, else the current directory, else the system
+// temp dir when the current directory is not writable. The current directory
+// is the default on purpose. A seekable VOD spools the whole decrypted asset
+// there, and on most Linux hosts the system temp dir is tmpfs, a filesystem
+// that lives in RAM. A large restream that "spooled to disk" there was filling
+// memory until the OOM killer took the process. The current directory is real
+// disk in the normal case, including a container's data volume. When the
+// chosen location is RAM-backed anyway, SpoolBase warns on stderr but does not
+// fail.
 func SpoolBase(override string) (string, error) {
 	base := override
 	if base != "" {
@@ -57,7 +59,7 @@ func SpoolBase(override string) (string, error) {
 	} else {
 		base = "."
 		if probe, err := os.MkdirTemp(base, ".m314dl-probe-*"); err != nil {
-			base = os.TempDir() // cwd not writable: still run, and warn below if tmpfs
+			base = os.TempDir() // cwd not writable: run anyway; warn below if tmpfs
 		} else {
 			os.Remove(probe)
 		}
@@ -71,17 +73,17 @@ func SpoolBase(override string) (string, error) {
 	return base, nil
 }
 
-// Presentation is the output-format-agnostic surface the run loop needs: how to
-// finish the stream and how to describe its liveness.
+// Presentation is the small interface the run loop needs from any output
+// format: how to end the stream and how to describe its live state.
 type Presentation interface {
 	End()
 	StatusLine() string
 }
 
-// job is one source stream wired to the sink that publishes it. pace holds a
-// finite source's emission to real time — needed only where the output has a
-// live edge to overrun (the TS broadcast); the seekable-VOD publisher spools
-// to disk and lets players pull at their own rate.
+// Job is one source stream wired to the sink that publishes it. pace slows a
+// finite source down to real time. That is needed only where the output has a
+// live edge that could be overrun (the TS broadcast); the seekable VOD
+// publisher spools to disk and lets players pull at their own rate.
 type Job struct {
 	st   *manifest.Stream
 	sink engine.Sink
@@ -89,8 +91,8 @@ type Job struct {
 	pace bool
 }
 
-// runRestream builds the output for the selected streams and hands off to the
-// blocking run loop (the one-shot `-serve` mode).
+// Run builds the output for the selected streams and hands over to the run
+// loop, which blocks until the restream ends (the one-shot `-serve` mode).
 func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 	selected []*manifest.Stream, keys map[[16]byte][]byte, bbtsKey []byte,
 	threadCeiling int, logv func(string, ...any)) error {
@@ -115,12 +117,12 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 	return serve(ctx, o, client, kind, jobs, pres, handler, path, keys, bbtsKey, threadCeiling, logv)
 }
 
-// buildOutputs turns selected streams into a ready-to-run output: the
-// Presentation (End/StatusLine), the HTTP handler that serves it, the media
-// path, and the per-stream download jobs (part files under tmpDir). It is the
-// single place that maps -serve-format onto a packager, shared by the one-shot
-// `-serve` mode and the multi-channel worker. Subtitles are skipped (no live
-// WebVTT segmentation yet).
+// BuildOutputs turns the selected streams into an output that is ready to run:
+// the Presentation (End/StatusLine), the HTTP handler that serves it, the media
+// path, and one download job per stream (with part files under tmpDir). It is
+// the one place that maps -serve-format onto a packager, and both the one-shot
+// `-serve` mode and the multi-channel worker use it. Subtitles are skipped
+// (there is no live WebVTT segmentation yet).
 func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv func(string, ...any)) (Presentation, http.Handler, string, []Job, error) {
 	if logv == nil {
 		logv = func(string, ...any) {}
@@ -131,8 +133,9 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 			logv("restream: skipping subtitle track %s (not supported yet)", st.ID)
 			continue
 		}
-		// Shared by -serve and worker mode, so both expose selected audio as
-		// well as video. No source URL, headers or content keys are logged here.
+		// Both -serve and worker mode run this, so both log the selected audio
+		// as well as the video. No source URL, headers or content keys are
+		// logged here.
 		logv("restream: selected track %s: %s", st.ID, st)
 		streams = append(streams, st)
 	}
@@ -143,13 +146,14 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 	switch o.Format {
 	case "ts", "mpegts":
 		if pure := singleMuxedTS(streams); pure != nil && o.Transcode == "" {
-			// Source is already a muxed TS: copy segments straight out, no ffmpeg.
+			// The source is already a muxed TS: copy the segments straight out,
+			// with no ffmpeg involved.
 			b := restream.NewTSBroadcaster()
 			jobs := []Job{{st: pure, sink: restream.NewTSSink(b), tmp: filepath.Join(tmpDir, "ts"+source.RawExt(pure)), pace: !pure.Live}}
 			return b, restream.NewTSServer(b), "/live.ts", jobs, nil
 		}
-		// fMP4 source, separate audio, or a transcode was asked for: remux with
-		// one long-lived ffmpeg feeding the broadcaster.
+		// An fMP4 source, a separate audio track, or a requested transcode: remux
+		// with one long-running ffmpeg that feeds the broadcaster.
 		ffmpeg, err := mux.FindFFmpeg(o.FFmpegPath)
 		if err != nil {
 			return nil, nil, "", nil, fmt.Errorf("ts output needs remuxing but ffmpeg not found (pass -ffmpeg <path>): %w", err)
@@ -182,16 +186,17 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 	}
 }
 
-// buildPublisherJobs wires each stream to a track in a new Publisher (shared by
-// the HLS and DASH paths, which differ only in the handler).
+// buildPublisherJobs wires each stream to a track in a new Publisher. The HLS
+// and DASH paths share it and differ only in the handler.
 //
-// The track shape follows the source. A live source rolls a bounded in-memory
-// window — a real live stream has no full timeline to seek. A finite source is
-// served as a seekable VOD: every segment is spooled decrypted to a file under
-// tmpDir and served from disk, so the whole timeline is seekable while RAM
-// holds only per-segment metadata. Neither shape is paced — live arrives at
-// its own cadence, and the VOD spool has no live edge to overrun, so players
-// pull from the growing on-disk playlist at their own rate.
+// The track shape follows the source. A live source keeps a bounded rolling
+// window in memory, because a real live stream has no full timeline to seek
+// in. A finite source is served as a seekable VOD: every segment is decrypted
+// and spooled to a file under tmpDir, then served from disk, so the whole
+// timeline is seekable while RAM holds only the metadata of each segment.
+// Neither shape is paced. Live arrives at its own rhythm, and the VOD spool
+// has no live edge to overrun, so players pull from the growing on-disk
+// playlist at their own rate.
 func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Publisher, []Job) {
 	pub := restream.NewPublisher()
 	namer := newNamer()
@@ -205,7 +210,7 @@ func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Pu
 }
 
 // serve runs the download jobs into their sinks while an HTTP server publishes
-// the result, until the source ends or the operator interrupts.
+// the result. It runs until the source ends or the operator interrupts it.
 func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
 	jobs []Job, pres Presentation, handler http.Handler, path string,
 	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
@@ -234,10 +239,10 @@ func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
 	statusStop := make(chan struct{})
 	go statusLoop(pres, statusStop)
 
-	// On cancel, end the presentation immediately. For the ffmpeg remux path this
-	// closes the input pipes, so a download goroutine blocked writing to a stalled
-	// ffmpeg unblocks with EPIPE and g.Wait can return. End is idempotent, so the
-	// post-Wait End below is harmless.
+	// On cancel, end the presentation at once. For the ffmpeg remux path this
+	// closes the input pipes, so a download goroutine stuck writing to a stalled
+	// ffmpeg gets EPIPE and g.Wait can return. Calling End twice is safe, so the
+	// second End after the wait below does no harm.
 	go func() {
 		<-ctx.Done()
 		pres.End()
@@ -258,8 +263,9 @@ func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
 		shutdown()
 		return err
 	}
-	// A finite source finished publishing on its own: keep serving the completed
-	// stream (HLS now carries EXT-X-ENDLIST) until the operator interrupts.
+	// A finite source finished publishing on its own. Keep serving the finished
+	// stream (the HLS playlist now carries EXT-X-ENDLIST) until the operator
+	// interrupts.
 	if ctx.Err() == nil {
 		fmt.Fprintln(os.Stderr, "source complete — serving until Ctrl-C")
 		<-ctx.Done()
@@ -270,8 +276,8 @@ func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
 }
 
 // RunJobs downloads every job's stream into its sink until the sources end or
-// ctx is cancelled. It is the shared run loop of the one-shot `-serve` mode and
-// the worker's per-channel goroutine.
+// ctx is cancelled. It is the run loop that the one-shot `-serve` mode and the
+// worker's per-channel goroutine share.
 func RunJobs(ctx context.Context, client *httpx.Client, kind string, jobs []Job,
 	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
 
@@ -282,9 +288,9 @@ func RunJobs(ctx context.Context, client *httpx.Client, kind string, jobs []Job,
 			cfg := engine.Config{
 				Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey,
 				Verbose: logv, Sink: j.sink,
-				// A finite TS-broadcast source downloads flat-out; pace it to real
-				// time so it doesn't flood the viewers' buffers. The publisher
-				// paths spool to disk instead and are never paced.
+				// A finite TS broadcast source downloads as fast as it can. Pace it
+				// to real time so it does not flood the viewers' buffers. The
+				// publisher paths spool to disk instead and are never paced.
 				PaceRealtime: j.pace,
 			}
 			refresh := source.RefreshFunc(client, kind, j.st, logv)
@@ -315,25 +321,25 @@ func statusLoop(pres Presentation, stop <-chan struct{}) {
 	}
 }
 
-// singleMuxedTS returns the one muxed TS video track that the pure-Go path can
-// copy straight out, or nil when the selection needs FFmpeg remuxing (an fMP4
-// source, or a separate audio track to mux in).
+// singleMuxedTS returns the one muxed TS video track that the pure Go path can
+// copy straight out. It returns nil when the selection needs FFmpeg to remux
+// (an fMP4 source, or a separate audio track to mux in).
 func singleMuxedTS(streams []*manifest.Stream) *manifest.Stream {
 	if len(streams) != 1 {
-		return nil // separate audio (or more) → must be muxed together → remux
+		return nil // separate audio (or more tracks) must be muxed together, so remux
 	}
 	st := streams[0]
 	if st.Type != manifest.Video {
 		return nil
 	}
 	if st.Init != nil || segmentIsFMP4TS(st) {
-		return nil // fMP4 → remux to TS
+		return nil // fMP4 has to be remuxed to TS
 	}
 	return st
 }
 
-// requireFMP4 rejects a DASH-output selection that contains a TS track: DASH
-// segments must be fMP4, and remuxing TS→fMP4 is a later phase.
+// requireFMP4 rejects a DASH output selection that contains a TS track. DASH
+// segments must be fMP4, and remuxing TS to fMP4 is left for a later phase.
 func requireFMP4(streams []*manifest.Stream) error {
 	for _, st := range streams {
 		if st.Init == nil && !segmentIsFMP4TS(st) {
@@ -351,8 +357,9 @@ func segmentIsFMP4TS(st *manifest.Stream) bool {
 	return strings.Contains(u, ".m4s") || strings.Contains(u, ".cmf")
 }
 
-// newNamer assigns short, URL-safe, unique track ids: "video", "video2",
-// "audio", "audio-fr", …. Readable ids make the playlist URLs self-describing.
+// newNamer returns a function that gives each track a short, unique, URL-safe
+// id: "video", "video2", "audio", "audio-fr" and so on. Readable ids make the
+// playlist URLs explain themselves.
 func newNamer() func(*manifest.Stream) string {
 	used := map[string]int{}
 	return func(st *manifest.Stream) string {
@@ -371,8 +378,8 @@ func newNamer() func(*manifest.Stream) string {
 	}
 }
 
-// displayAddr turns a listener address into something clickable, replacing a
-// wildcard/empty host with localhost.
+// displayAddr turns a listener address into one that can be clicked, with a
+// wildcard or empty host replaced by localhost.
 func displayAddr(addr net.Addr) string {
 	s := addr.String()
 	host, port, err := net.SplitHostPort(s)

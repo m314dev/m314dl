@@ -2,23 +2,25 @@ package mp4
 
 import "encoding/binary"
 
-// Init synthesis. A Smooth Streaming presentation ships no init segment: the
-// codec setup lives in the manifest (SPS/PPS, AudioSpecificConfig) and the
-// ftyp+moov a demuxer needs must be built from it. BuildInit does that for one
-// track, producing the same shape a packager's init has (so ParseInit,
-// SanitizeInit, ffmpeg and MSE players all read it), and NormalizeFragment
-// brings the PIFF fragments in line with it (track id, tfdt).
+// Building an init segment from scratch. A Smooth Streaming presentation has
+// no init segment. The codec setup (SPS/PPS for video, AudioSpecificConfig for
+// audio) lives in the manifest, and the ftyp+moov boxes a demuxer needs must
+// be built from it. BuildInit does that for one track and gives it the same
+// shape a packager's init has, so ParseInit, SanitizeInit, ffmpeg and MSE
+// players all read it. NormalizeFragment then brings the PIFF fragments in
+// line with that init (track id, tfdt).
 
-// InitSpec describes one track for BuildInit. Exactly one of Video/Audio is set.
+// InitSpec describes one track for BuildInit. Exactly one of Video or Audio is
+// set.
 type InitSpec struct {
 	TrackID   uint32
 	Timescale uint32
 	Language  string // ISO 639-2 three-letter code; anything else becomes "und"
 	Video     *VideoSpec
 	Audio     *AudioSpec
-	// Protection, when set, types the sample entry encv/enca with a sinf
-	// (frma, schm cenc, tenc) so the CENC decryptor finds the KID and IV size in
-	// the init exactly as it would in a packaged one.
+	// Protection, when set, marks the sample entry as encrypted (encv/enca) and
+	// adds a sinf box (frma, schm cenc, tenc), so the CENC decryptor finds the
+	// KID and IV size in this init just as it would in a packaged one.
 	Protection *ProtectionSpec
 }
 
@@ -39,7 +41,7 @@ type ProtectionSpec struct {
 	IVSize byte // per-sample IV size: 8 or 16
 }
 
-// Box wraps the concatenated parts in a box header.
+// Box joins parts and puts a box header (size + type) in front of them.
 func Box(typ string, parts ...[]byte) []byte {
 	n := 0
 	for _, p := range parts {
@@ -62,7 +64,7 @@ func be16(v uint16) []byte { b := make([]byte, 2); binary.BigEndian.PutUint16(b,
 func be32(v uint32) []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, v); return b }
 func be64(v uint64) []byte { b := make([]byte, 8); binary.BigEndian.PutUint64(b, v); return b }
 
-// unity is the identity transformation matrix every tkhd/mvhd carries.
+// unity is the identity transform matrix that every tkhd and mvhd carries.
 var unity = func() []byte {
 	m := make([]byte, 36)
 	binary.BigEndian.PutUint32(m[0:], 0x00010000)
@@ -71,8 +73,9 @@ var unity = func() []byte {
 	return m
 }()
 
-// BuildInit synthesizes a fragmented-MP4 initialization segment (ftyp + moov)
-// for one track. The moov has zero duration and an mvex/trex, as any fMP4 init.
+// BuildInit builds a fragmented MP4 init segment (ftyp + moov) for one track.
+// Like any fMP4 init, the moov has a duration of zero and an mvex box holding
+// a trex.
 func BuildInit(s InitSpec) []byte {
 	ftyp := Box("ftyp", []byte("isom"), be32(0), []byte("isomiso6dash"))
 	mvhd := Box("mvhd", fullBoxHdr(0, 0),
@@ -116,10 +119,11 @@ func buildTrak(s InitSpec) []byte {
 	return Box("trak", tkhd, Box("mdia", mdhd, hdlr, minf))
 }
 
-// visualEntry builds an avc1 (or encv) VisualSampleEntry with its avcC.
+// visualEntry builds an avc1 (or encv, when protected) VisualSampleEntry with
+// its avcC child box.
 func visualEntry(v *VideoSpec, prot *ProtectionSpec) []byte {
-	// SampleEntry(8) + VisualSampleEntry fields(70) = the 78-byte prefix
-	// sampleEntryChildren expects before child boxes.
+	// SampleEntry(8) + VisualSampleEntry fields(70) = the 78-byte prefix that
+	// sampleEntryChildren expects before the child boxes.
 	prefix := concatBytes(make([]byte, 6), be16(1),
 		make([]byte, 16), be16(v.Width), be16(v.Height),
 		be32(0x00480000), be32(0x00480000), be32(0), be16(1),
@@ -155,7 +159,8 @@ func avcC(v *VideoSpec) []byte {
 	return Box("avcC", p)
 }
 
-// audioEntry builds an mp4a (or enca) AudioSampleEntry with its esds.
+// audioEntry builds an mp4a (or enca, when protected) AudioSampleEntry with
+// its esds child box.
 func audioEntry(a *AudioSpec, prot *ProtectionSpec) []byte {
 	// SampleEntry(8) + AudioSampleEntry v0 fields(20) = the 28-byte prefix.
 	prefix := concatBytes(make([]byte, 6), be16(1), make([]byte, 8),
@@ -169,8 +174,9 @@ func audioEntry(a *AudioSpec, prot *ProtectionSpec) []byte {
 	return Box(typ, prefix, children)
 }
 
-// esds wraps an AudioSpecificConfig in the MPEG-4 descriptor chain
-// (ES → DecoderConfig(AAC) → DecoderSpecificInfo, then SLConfig).
+// esds wraps an AudioSpecificConfig in the chain of MPEG-4 descriptors: an ES
+// descriptor holding a DecoderConfig (AAC) that holds the DecoderSpecificInfo,
+// followed by an SLConfig.
 func esds(asc []byte) []byte {
 	desc := func(tag byte, body []byte) []byte {
 		return append([]byte{tag, byte(len(body))}, body...)
@@ -181,8 +187,9 @@ func esds(asc []byte) []byte {
 	return Box("esds", fullBoxHdr(0, 0), es)
 }
 
-// sinf is the protection scheme info for an encv/enca entry: original format,
-// cenc scheme, and the track encryption defaults.
+// sinf builds the protection info box for an encv/enca entry: the original
+// codec (frma), the cenc scheme (schm) and the track encryption defaults
+// (tenc).
 func sinf(orig string, prot *ProtectionSpec) []byte {
 	tenc := Box("tenc", fullBoxHdr(0, 0), []byte{0, 0, 1, prot.IVSize}, prot.KID[:])
 	return Box("sinf",
@@ -191,7 +198,8 @@ func sinf(orig string, prot *ProtectionSpec) []byte {
 		Box("schi", tenc))
 }
 
-// packLanguage encodes an ISO 639-2 code into the 15-bit mdhd form.
+// packLanguage packs a 3-letter ISO 639-2 code into the 15-bit form mdhd uses
+// (5 bits per letter).
 func packLanguage(lang string) uint16 {
 	if len(lang) != 3 {
 		lang = "und"
@@ -215,8 +223,9 @@ func concatBytes(parts ...[]byte) []byte {
 	return out
 }
 
-// SoleTrackID returns the track_ID of an init segment that carries exactly one
-// track, or 0 (no moov, or a muxed multi-track init).
+// SoleTrackID returns the track_ID of an init segment that has exactly one
+// track. It returns 0 when there is no moov or when the init carries several
+// tracks.
 func SoleTrackID(init []byte) uint32 {
 	moov, ok := find(init, "moov")
 	if !ok {
@@ -231,7 +240,7 @@ func SoleTrackID(init []byte) uint32 {
 		n++
 		if tkhd, ok := find(b.payload, "tkhd"); ok {
 			version, _, rest, err := fullBox(tkhd.payload)
-			off := 8 // v0: creation(4) modification(4)
+			off := 8 // version 0: creation(4) + modification(4) come before track_ID
 			if version == 1 {
 				off = 16
 			}
@@ -247,7 +256,7 @@ func SoleTrackID(init []byte) uint32 {
 	return id
 }
 
-// PIFF extended box types (Smooth Streaming fragments).
+// PIFF extended box types (uuid boxes found in Smooth Streaming fragments).
 var (
 	uuidTfxd     = []byte{0x6d, 0x1d, 0x9b, 0x05, 0x42, 0xd5, 0x44, 0xe6, 0x80, 0xe2, 0x14, 0x1d, 0xaf, 0xf7, 0x57, 0xb2}
 	uuidPiffSenc = []byte{0xa2, 0x39, 0x4f, 0x52, 0x5a, 0x9b, 0x4f, 0x14, 0xa2, 0x44, 0x6c, 0x42, 0x7c, 0x64, 0x8d, 0xf4}
@@ -257,16 +266,17 @@ func isUUID(b box, ext []byte) bool {
 	return b.typ == "uuid" && len(b.payload) >= 16 && string(b.payload[:16]) == string(ext)
 }
 
-// NormalizeFragment makes a media fragment consistent with a single-track init:
-// every tfhd's track_ID becomes trackID, and a traf that has no tfdt but a PIFF
-// tfxd gets a tfdt built from it (players and MSE need the decode time; ffmpeg
-// tolerates its absence, browsers do not). A fragment that already matches is
-// returned unchanged. Only single-traf moofs are retagged: a muxed fragment
-// against a one-track init is broken either way and is left alone.
+// NormalizeFragment makes a media fragment match a single-track init. Every
+// tfhd's track_ID becomes trackID, and a traf that has a PIFF tfxd box but no
+// tfdt gets a tfdt built from the tfxd. Players and MSE need that decode time:
+// ffmpeg copes without it, browsers do not. A fragment that already matches is
+// returned unchanged. Only moofs with a single traf are retagged; a muxed
+// fragment paired with a one-track init is broken either way and is left
+// alone.
 //
-// Inserting a tfdt grows the moof, so every trun's data_offset (measured from
-// the moof start) is bumped by the same amount, as StripFragmentProtection does
-// in the other direction.
+// Inserting a tfdt makes the moof bigger, so every trun's data_offset (which
+// is measured from the start of the moof) grows by the same amount. This is
+// the reverse of what StripFragmentProtection does when it shrinks the moof.
 func NormalizeFragment(frag []byte, trackID uint32) []byte {
 	changed := false
 	out := rebuildSeq(frag, func(b box) ([]byte, bool) {
@@ -278,7 +288,7 @@ func NormalizeFragment(frag []byte, trackID uint32) []byte {
 			if c.typ == "traf" {
 				trafs++
 				if needsTfdt(c) {
-					added += 8 + 4 + 8 // tfdt v1 box
+					added += 8 + 4 + 8 // size of a tfdt v1 box: header, version/flags, 64-bit time
 				}
 			}
 			return true
@@ -323,13 +333,13 @@ func NormalizeFragment(frag []byte, trackID uint32) []byte {
 		})), true
 	})
 	if !changed {
-		return frag // the packaged-fragment norm: no copy on the hot path
+		return frag // the usual case for packaged fragments; no copy on the hot path
 	}
 	return out
 }
 
-// needsTfdt reports whether a traf lacks tfdt but carries a PIFF tfxd to build
-// one from.
+// needsTfdt reports whether a traf has no tfdt but does carry a PIFF tfxd that
+// a tfdt can be built from.
 func needsTfdt(traf box) bool {
 	hasTfdt, hasTfxd := false, false
 	traf.children(func(d box) bool {
@@ -352,8 +362,9 @@ func trafTrackID(moof box) uint32 {
 	return binary.BigEndian.Uint32(tfhd.payload[4:])
 }
 
-// piffTime reads a tfxd box: fragment absolute time and duration in the track
-// timescale (32-bit in version 0, 64-bit in version 1).
+// piffTime reads a PIFF tfxd box and returns the fragment's absolute start
+// time and its duration, both in the track timescale. The fields are 32-bit
+// in version 0 and 64-bit in version 1.
 func piffTime(b box) (t, d uint64, ok bool) {
 	version, _, rest, err := fullBox(b.payload[16:])
 	if err != nil {

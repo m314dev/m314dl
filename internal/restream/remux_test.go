@@ -13,7 +13,7 @@ import (
 
 // Feed a real fMP4 rendition through the FFmpeg remux and confirm valid MPEG-TS
 // comes out. Exercises the pipe/fd wiring end to end; skips where ffmpeg or the
-// fixtures aren't present.
+// fixtures are not present.
 func TestRemuxFMP4ToTS(t *testing.T) {
 	ffmpeg, err := mux.FindFFmpeg("")
 	if err != nil {
@@ -44,7 +44,7 @@ func TestRemuxFMP4ToTS(t *testing.T) {
 			t.Fatalf("Segment %d: %v", i, err)
 		}
 	}
-	rem.End() // close inputs → ffmpeg flushes → pump publishes remaining output
+	rem.End() // closing the inputs makes ffmpeg flush; pump publishes the rest
 
 	// Collect whatever FFmpeg produced (poll up to a few seconds).
 	var out []byte
@@ -62,7 +62,7 @@ func TestRemuxFMP4ToTS(t *testing.T) {
 	if out[0] != 0x47 {
 		t.Fatalf("remux output is not MPEG-TS (first byte %#x)", out[0])
 	}
-	// Sanity: 188-byte packet alignment on the first few packets.
+	// Check 188-byte packet alignment on the first few packets.
 	for _, off := range []int{188, 376} {
 		if off < len(out) && out[off] != 0x47 {
 			t.Fatalf("TS packet misaligned at offset %d (%#x)", off, out[off])

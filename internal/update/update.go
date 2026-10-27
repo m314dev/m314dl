@@ -1,6 +1,6 @@
 // Package update checks GitHub for a newer released version, so a user running
 // an old binary is told one exists. It never blocks the real work and stays
-// silent on any error — a missed check is not worth a warning.
+// silent on any error, because a missed check is not worth a warning.
 package update
 
 import (
@@ -19,13 +19,13 @@ const (
 	// Page is where a user goes to get the new build.
 	Page       = "https://github.com/m314dev/m314dl/releases/latest"
 	releaseAPI = "https://api.github.com/repos/m314dev/m314dl/releases/latest"
-	// checkEvery bounds how often the network is hit: at most once a day.
+	// checkEvery limits how often the network is used: at most once a day.
 	checkEvery = 24 * time.Hour
 )
 
 // Check returns the latest release tag when it is newer than current, else "".
-// It consults a once-a-day cache under cacheDir before hitting the network, and
-// swallows every error (no network, GitHub down, malformed cache) — the caller
+// It reads a once-a-day cache under cacheDir before going to the network, and
+// swallows every error (no network, GitHub down, malformed cache). The caller
 // prints a notice only when a real newer version is found.
 func Check(ctx context.Context, current, cacheDir string) string {
 	cf := filepath.Join(cacheDir, "m314dl", "update-check.json")
@@ -56,7 +56,7 @@ func fetchLatestTag(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "m314dl") // GitHub rejects a request with no UA
+	req.Header.Set("User-Agent", "m314dl") // GitHub rejects a request with no User-Agent
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := (&http.Client{Timeout: 4 * time.Second}).Do(req)
 	if err != nil {
@@ -76,8 +76,8 @@ func fetchLatestTag(ctx context.Context) (string, error) {
 }
 
 // Newer reports whether latest is a higher version than current. Both are
-// dotted numeric versions with an optional leading "v" and any trailing
-// pre-release/build suffix, which is ignored (0.3.4, v0.3.4, 0.3.4-rc1).
+// dotted numeric versions with an optional leading "v". A trailing pre-release
+// or build suffix is ignored (0.3.4, v0.3.4, 0.3.4-rc1).
 func Newer(current, latest string) bool {
 	c, l := parse(current), parse(latest)
 	for i := 0; i < 3; i++ {
@@ -98,7 +98,7 @@ func parse(s string) [3]int {
 		n := 0
 		for _, ch := range part {
 			if ch < '0' || ch > '9' {
-				break // stop at the first non-digit (a "-rc1" suffix, say)
+				break // stop at the first non-digit, such as a "-rc1" suffix
 			}
 			n = n*10 + int(ch-'0')
 		}

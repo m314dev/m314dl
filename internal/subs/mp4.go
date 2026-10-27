@@ -5,9 +5,9 @@ import (
 	"strings"
 )
 
-// ExtractMdat walks top-level MP4 boxes and returns all mdat payloads
-// concatenated. For stpp tracks the payloads are whole TTML documents, which
-// parseTTML consumes directly — no ffmpeg needed.
+// ExtractMdat walks the top-level MP4 boxes and returns all mdat payloads
+// joined together. For stpp tracks the payloads are whole TTML documents, which
+// parseTTML reads directly, so no ffmpeg is needed.
 func ExtractMdat(b []byte) []byte {
 	var out []byte
 	for i := 0; i+8 <= len(b); {

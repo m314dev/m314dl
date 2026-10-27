@@ -27,7 +27,7 @@ func TestMediaPlaylistFMP4(t *testing.T) {
 
 	pl := string(pub.tracks[0].mediaPlaylist())
 	for _, want := range []string{
-		"#EXT-X-VERSION:6", // fMP4 requires v6 (worker shipped v3 here — bug)
+		"#EXT-X-VERSION:6", // fMP4 requires v6 (the worker shipped v3 here, a bug)
 		"#EXT-X-TARGETDURATION:6",
 		"#EXT-X-MEDIA-SEQUENCE:0",
 		"#EXT-X-MAP:URI=\"init.mp4\"",
@@ -62,8 +62,8 @@ func TestMediaPlaylistTS(t *testing.T) {
 	}
 }
 
-// The window keeps the newest windowSize segments; MEDIA-SEQUENCE advances
-// monotonically as older ones age out.
+// The window keeps the newest windowSize segments; MEDIA-SEQUENCE only ever
+// goes up as older ones age out.
 func TestWindowAndSequence(t *testing.T) {
 	pub := NewPublisher()
 	st := &manifest.Stream{Type: manifest.Video, ID: "v", Init: &manifest.InitMap{URL: "i"}}
@@ -88,8 +88,9 @@ func TestWindowAndSequence(t *testing.T) {
 	}
 }
 
-// A source that rewinds its media sequence must not rewind or wedge output —
-// the packager renumbers under its own monotonic counter (worker bug #18).
+// A source that rewinds its media sequence must not rewind or wedge the output.
+// The packager renumbers under its own always-increasing counter (worker bug
+// #18).
 func TestSourceSequenceRewindIgnored(t *testing.T) {
 	pub := NewPublisher()
 	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true, ""))
@@ -120,7 +121,7 @@ func TestZeroDurationFallback(t *testing.T) {
 	pub := NewPublisher()
 	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true, ""))
 	sink.Init([]byte("i"))
-	sink.Segment(engine.SegmentInfo{Duration: 0}, []byte("a")) // unknown → 2s default
+	sink.Segment(engine.SegmentInfo{Duration: 0}, []byte("a")) // unknown, so the 2s default
 	pl := string(pub.tracks[0].mediaPlaylist())
 	if !strings.Contains(pl, "#EXTINF:2.000,") {
 		t.Fatalf("zero duration should fall back to 2s\n%s", pl)
@@ -167,7 +168,7 @@ func TestMasterPlaylist(t *testing.T) {
 }
 
 // Writers (one per track) publish while HTTP handlers read playlists and
-// segments concurrently. Run under -race to prove the locking holds.
+// segments at the same time. Run under -race to prove the locking holds.
 func TestConcurrentServeAndWrite(t *testing.T) {
 	pub := NewPublisher()
 	vs := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, Init: &manifest.InitMap{URL: "i"}}, true, ""))
@@ -197,8 +198,8 @@ func TestConcurrentServeAndWrite(t *testing.T) {
 }
 
 // A finite (VOD) source keeps every segment (no rolling window) in an
-// append-only EVENT playlist that is seekable while it grows and, once ended,
-// gains EXT-X-ENDLIST.
+// append-only EVENT playlist. The playlist is seekable while it grows and, once
+// ended, gains EXT-X-ENDLIST.
 func TestVODKeepsAllSegments(t *testing.T) {
 	pub := NewPublisher()
 	st := &manifest.Stream{Type: manifest.Video, ID: "v", Init: &manifest.InitMap{URL: "i"}}
@@ -254,7 +255,7 @@ func TestServeEndpoints(t *testing.T) {
 	if rec := get("/video/000000.m4s"); rec.Code != 404 {
 		t.Fatalf("evicted segment should 404, got %d", rec.Code)
 	}
-	// a currently-visible segment serves with the right type + CORS
+	// a currently visible segment is served with the right type and CORS
 	rec := get("/video/000013.m4s")
 	if rec.Code != 200 || rec.Header().Get("Content-Type") != "video/mp4" {
 		t.Fatalf("visible segment: code=%d ctype=%s", rec.Code, rec.Header().Get("Content-Type"))
@@ -268,8 +269,8 @@ func TestServeEndpoints(t *testing.T) {
 }
 
 // A VOD track spools segment bytes to disk and holds only metadata in RAM, so
-// a long asset can't OOM; the HTTP handler serves the bytes back from the
-// spool file.
+// a long asset cannot run out of memory. The HTTP handler serves the bytes back
+// from the spool file.
 func TestVODSpoolsToDisk(t *testing.T) {
 	dir := t.TempDir()
 	pub := NewPublisher()

@@ -1,5 +1,6 @@
-// Package httpx is the shared HTTP layer: default headers, cookies, proxy,
-// and body-read-covering retries with exponential backoff.
+// Package httpx is the shared HTTP layer: default headers, cookies, proxy, and
+// retries with exponential backoff that also cover a failure while reading
+// the body.
 package httpx
 
 import (
@@ -27,9 +28,9 @@ type Options struct {
 	Headers    map[string]string
 	Proxy      string // http://, https://, socks5:// (user:pass@ supported)
 	CookieFile string // Netscape cookies.txt
-	Insecure   bool   // skip TLS verify — explicit opt-in only
+	Insecure   bool   // skip TLS certificate checks; only when the user asks for it
 	Timeout    time.Duration
-	Retries    int // per-request attempts beyond the first
+	Retries    int // extra attempts per request, after the first
 }
 
 type Client struct {
@@ -41,23 +42,27 @@ type Client struct {
 func New(o Options) (*Client, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.MaxConnsPerHost = 0
-	// Keep many connections warm in the idle pool so sustained high concurrency
-	// reuses TCP+TLS instead of re-handshaking per segment. Sized well above the
-	// usual -t so several concurrent streams (video+audio+subs) don't churn.
+	// Keep many connections open in the idle pool, so that many parallel
+	// requests reuse their TCP and TLS sessions instead of doing a new handshake
+	// per segment. The pool is sized well above the usual -t so several streams
+	// downloading at once (video, audio, subtitles) do not keep closing and
+	// reopening connections.
 	tr.MaxIdleConns = 512
 	tr.MaxIdleConnsPerHost = 256
-	// Deliberately DO NOT use HTTP/2. A CDN that offers h2 makes Go pool every
-	// concurrent segment request onto ONE TCP connection (h2 multiplexing). One
-	// TCP flow is throughput-limited by RTT and packet loss (≈ MSS/(RTT·√loss)),
-	// so on a real CDN it can't fill the pipe — invisible on localhost (RTT≈0),
-	// crippling over the network. HTTP/1.1 opens one connection per in-flight
-	// request instead, giving N independent flows (what N_m3u8DL/aria2/yt-dlp do)
-	// and ~N× the aggregate throughput.
+	// HTTP/2 is turned off on purpose. When a CDN offers h2, Go sends every
+	// parallel segment request over ONE TCP connection (h2 multiplexes them).
+	// The speed of a single TCP connection is limited by round-trip time and
+	// packet loss (roughly MSS/(RTT·√loss)), so on a real CDN one connection
+	// cannot fill the pipe. This is invisible on localhost, where RTT is about
+	// 0, and crippling over the network. HTTP/1.1 instead opens one connection
+	// per request in flight, which gives N independent TCP flows (what N_m3u8DL,
+	// aria2 and yt-dlp do) and about N times the total throughput.
 	//
-	// Disabling h2 takes BOTH steps: empty (non-nil) TLSNextProto stops Go's
-	// automatic h2 upgrade, AND the ALPN offer must advertise only http/1.1 —
-	// otherwise the server still selects h2 over TLS and answers a request Go
-	// parses as HTTP/1.1 with HTTP/2 frames ("malformed HTTP response \x00\x00..").
+	// Turning h2 off takes BOTH steps. An empty (non-nil) TLSNextProto stops
+	// Go's automatic h2 upgrade, AND the ALPN offer must list only http/1.1.
+	// Without the second step the server still picks h2 over TLS and answers
+	// with HTTP/2 frames that Go then tries to parse as HTTP/1.1 ("malformed
+	// HTTP response \x00\x00..").
 	tr.ForceAttemptHTTP2 = false
 	tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	tr.TLSClientConfig = &tls.Config{
@@ -71,9 +76,10 @@ func New(o Options) (*Client, error) {
 		}
 		tr.Proxy = http.ProxyURL(pu)
 	}
-	// A data: URL answers from its own payload: a manifest can carry an inline
-	// init segment (Smooth Streaming synthesizes one) and the engine fetches it
-	// through the same client, retries and all, with no special case.
+	// A data: URL carries its own payload inside the URL. A manifest can hold
+	// an inline init segment this way (Smooth Streaming synthesizes one), and
+	// the engine fetches it through this same client, retries included, with no
+	// special case.
 	tr.RegisterProtocol("data", dataTransport{})
 	hc := &http.Client{Transport: tr, Timeout: o.Timeout, CheckRedirect: noReferer}
 	if o.CookieFile != "" {
@@ -83,11 +89,11 @@ func New(o Options) (*Client, error) {
 		}
 		hc.Jar = jar
 	} else {
-		// In-memory jar so a Set-Cookie on the manifest is carried to the
-		// segment requests. Disney+ hands out an `hdntl` auth cookie on the
-		// manifest response and every segment 403s without it — the manifest
-		// is fetched first through this same client, so the cookie is already
-		// stored by the time segments download.
+		// An in-memory cookie jar, so a Set-Cookie on the manifest response is
+		// sent along with the segment requests. Disney+ hands out an `hdntl`
+		// auth cookie on the manifest response and every segment answers 403
+		// without it. The manifest is fetched first through this same client,
+		// so the cookie is already stored by the time the segments download.
 		hc.Jar, _ = cookiejar.New(nil)
 	}
 	headers := map[string]string{"User-Agent": DefaultUA}
@@ -102,8 +108,9 @@ func New(o Options) (*Client, error) {
 }
 
 // dataTransport serves data:[<mediatype>][;base64],<payload> URLs (RFC 2397)
-// as a 200 response. Range headers are ignored: the payload is tiny and the
-// caller already copes with a server that answers a ranged request in full.
+// as a 200 response. A Range header is ignored: the payload is tiny, and the
+// caller already copes with a server that answers a ranged request with the
+// whole body.
 type dataTransport struct{}
 
 func (dataTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -138,23 +145,24 @@ func (dataTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-// maxRedirects matches net/http's own default, which replacing CheckRedirect
-// would otherwise silently remove.
+// maxRedirects matches the default limit in net/http. Replacing CheckRedirect
+// would otherwise silently remove that limit.
 const maxRedirects = 10
 
-// noReferer follows redirects without the Referer header net/http adds by itself.
+// noReferer follows redirects without the Referer header that net/http adds on
+// its own.
 //
-// Go sets `Referer: <previous url>` on every request it makes while following a
-// redirect. Tokenized CDN URLs reject a request carrying one: a live DASH
-// manifest behind Akamai answers 200 when fetched directly and 403 through Go's
-// redirect, from the same address, the same second, with otherwise identical
-// headers. The failure looks nothing like its cause — the 403 body parses as a
-// manifest with no PSSH, so a DRM source simply never finds a key, and a clear
-// one reports the source as unavailable.
+// Go sets `Referer: <previous url>` on every request it makes while following
+// a redirect. CDN URLs that carry an access token reject a request with one:
+// a live DASH manifest behind Akamai answers 200 when fetched directly and 403
+// through Go's redirect, from the same address, in the same second, with
+// otherwise identical headers. The failure looks nothing like its cause. The
+// 403 body parses as a manifest with no PSSH, so a DRM source simply never
+// finds a key, and a clear one reports the source as unavailable.
 //
 // A downloader has no business inventing a Referer the caller did not set, so
-// this is unconditional. Any header the caller did set is still carried through
-// the redirect.
+// the header is always removed. Any header the caller did set is still carried
+// through the redirect.
 func noReferer(req *http.Request, via []*http.Request) error {
 	req.Header.Del("Referer")
 	if len(via) >= maxRedirects {
@@ -163,7 +171,7 @@ func noReferer(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// Do sends a request with default headers applied.
+// Do sends a request after filling in the default headers.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	for k, v := range c.headers {
 		if req.Header.Get(k) == "" {
@@ -173,20 +181,20 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return c.hc.Do(req)
 }
 
-// Retries is the configured per-request retry count.
+// Retries returns the configured number of retries per request.
 func (c *Client) Retries() int { return c.retries }
 
-// Retriable reports whether a status is worth retrying (exported for streaming
-// callers that run their own retry loop).
+// Retriable reports whether a status is worth retrying. It is exported for
+// streaming callers that run their own retry loop.
 func Retriable(status int) bool { return retriable(status) }
 
-// ParseRetryAfter parses a Retry-After header value (exported).
+// ParseRetryAfter parses a Retry-After header value (the exported form).
 func ParseRetryAfter(v string) time.Duration { return parseRetryAfter(v) }
 
-// RangeGet issues a single GET with the given Range header (default headers,
-// cookies and proxy applied) and returns the response for streaming. The caller
-// owns resp.Body and runs its own retry loop. No redirects-vs-headers subtlety
-// beyond the shared client's.
+// RangeGet sends a single GET with the given Range header (default headers,
+// cookies and proxy applied) and returns the response for streaming. The
+// caller owns resp.Body and runs its own retry loop. Redirects and headers
+// behave exactly as they do for the shared client; there is nothing extra.
 func (c *Client) RangeGet(ctx context.Context, rawURL, rangeHdr string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -212,23 +220,24 @@ func retriable(status int) bool {
 type StatusError struct {
 	Code       int
 	URL        string
-	RetryAfter time.Duration // parsed from the Retry-After header (0 if absent)
+	RetryAfter time.Duration // from the Retry-After header; 0 when absent
 }
 
 func (e *StatusError) Error() string { return fmt.Sprintf("HTTP %d: %s", e.Code, e.URL) }
 
-// FetchBytes GETs a URL (optionally with a Range header) and returns the full
-// body plus the final post-redirect URL.
+// FetchBytes GETs a URL (with a Range header when rangeHdr is set) and returns
+// the whole body plus the final URL after redirects.
 func (c *Client) FetchBytes(ctx context.Context, rawURL, rangeHdr string) ([]byte, string, error) {
 	body, finalURL, _, err := c.FetchBytesEx(ctx, rawURL, rangeHdr)
 	return body, finalURL, err
 }
 
 // FetchBytesEx is FetchBytes plus a pressure count: how many times the server
-// pushed back with a retriable status (429/503/…). The concurrency controller
-// uses it to back off before those retries turn into failures. Retries cover
-// connection errors, retriable statuses AND mid-body read errors, with
-// exponential backoff+jitter, and honor a Retry-After header when present.
+// pushed back with a retriable status (429, 503, and so on). The concurrency
+// controller uses it to slow down before those retries turn into failures.
+// Retries cover connection errors, retriable statuses AND errors partway
+// through reading the body. They back off exponentially with jitter and honor
+// a Retry-After header when present.
 func (c *Client) FetchBytesEx(ctx context.Context, rawURL, rangeHdr string) (body []byte, finalURL string, pressure int, err error) {
 	finalURL = rawURL
 	pressure, err = c.retry(ctx, func() error {
@@ -242,10 +251,11 @@ func (c *Client) FetchBytesEx(ctx context.Context, rawURL, rangeHdr string) (bod
 	return body, finalURL, pressure, nil
 }
 
-// Open GETs a URL (optionally with a Range header) with FetchBytes's retry
-// policy and hands back the response with its body unread, for a caller that
-// needs the headers before deciding whether to read the body at all. The
-// caller owns resp.Body; a mid-body read error is its to handle.
+// Open GETs a URL (with a Range header when rangeHdr is set) using the same
+// retry policy as FetchBytes, and hands back the response with its body
+// unread. It is for a caller that needs the headers before deciding whether to
+// read the body at all. The caller owns resp.Body, and a read error partway
+// through the body is the caller's to handle.
 func (c *Client) Open(ctx context.Context, rawURL, rangeHdr string) (*http.Response, error) {
 	var resp *http.Response
 	_, err := c.retry(ctx, func() error {
@@ -257,9 +267,10 @@ func (c *Client) Open(ctx context.Context, rawURL, rangeHdr string) (*http.Respo
 }
 
 // retry runs op until it succeeds, fails for good (a non-retriable status),
-// runs out of attempts, or ctx ends — exponential backoff with jitter, honoring
-// a capped Retry-After. Returns how many times the server pushed back with a
-// retriable status.
+// runs out of attempts, or ctx ends. The wait between attempts doubles each
+// time with some random jitter added, and a Retry-After header is honored up
+// to a cap. It returns how many times the server pushed back with a retriable
+// status.
 func (c *Client) retry(ctx context.Context, op func() error) (pressure int, err error) {
 	backoff := 500 * time.Millisecond
 	for attempt := 0; ; attempt++ {
@@ -269,7 +280,7 @@ func (c *Client) retry(ctx context.Context, op func() error) (pressure int, err 
 		var se *StatusError
 		isStatus := errors.As(err, &se)
 		if isStatus && retriable(se.Code) {
-			pressure++ // server pushed back — signal even if we recover
+			pressure++ // the server pushed back; count it even if we recover
 		}
 		permanent := isStatus && !retriable(se.Code)
 		if permanent || attempt >= c.retries || ctx.Err() != nil {
@@ -293,7 +304,8 @@ func (c *Client) retry(ctx context.Context, op func() error) (pressure int, err 
 	}
 }
 
-// openOnce sends one GET; a 4xx/5xx becomes a StatusError with the body drained.
+// openOnce sends one GET. A 4xx or 5xx status becomes a StatusError, with the
+// body drained and closed.
 func (c *Client) openOnce(ctx context.Context, rawURL, rangeHdr string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -314,7 +326,7 @@ func (c *Client) openOnce(ctx context.Context, rawURL, rangeHdr string) (*http.R
 	return resp, nil
 }
 
-// FinalURL is the post-redirect URL a response was served from.
+// FinalURL returns the URL a response was served from, after any redirects.
 func FinalURL(resp *http.Response, fallback string) string {
 	if resp.Request != nil && resp.Request.URL != nil {
 		return resp.Request.URL.String()
@@ -336,7 +348,8 @@ func (c *Client) fetchOnce(ctx context.Context, rawURL, rangeHdr string) ([]byte
 	return b, final, nil
 }
 
-// parseRetryAfter reads a Retry-After header (delta-seconds or HTTP-date).
+// parseRetryAfter reads a Retry-After header, which holds either a number of
+// seconds or an HTTP date.
 func parseRetryAfter(v string) time.Duration {
 	if v == "" {
 		return 0
@@ -355,7 +368,8 @@ func parseRetryAfter(v string) time.Duration {
 	return 0
 }
 
-// Head issues a HEAD request (no retries — callers treat failure as "unknown").
+// Head sends a HEAD request. There are no retries; callers treat a failure as
+// "unknown".
 func (c *Client) Head(ctx context.Context, rawURL string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
 	if err != nil {
@@ -369,7 +383,7 @@ func (c *Client) Head(ctx context.Context, rawURL string) (*http.Response, error
 	return resp, nil
 }
 
-// loadNetscapeCookies parses a cookies.txt file into a static jar.
+// loadNetscapeCookies reads a Netscape cookies.txt file into a static jar.
 func loadNetscapeCookies(path string) (http.CookieJar, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -404,9 +418,9 @@ func loadNetscapeCookies(path string) (http.CookieJar, error) {
 	return jar, sc.Err()
 }
 
-// staticJar matches cookies by domain suffix; read-only after load.
-// ponytail: no Set-Cookie persistence; swap for net/http/cookiejar + seed if
-// server-set cookies ever matter.
+// staticJar matches cookies by domain suffix. It is read-only once loaded.
+// ponytail: Set-Cookie headers are not stored; swap in net/http/cookiejar
+// seeded from the file if server-set cookies ever matter.
 type staticJar struct {
 	byHost map[string][]*http.Cookie
 }

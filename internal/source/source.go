@@ -1,6 +1,6 @@
-// Package source resolves an input (URL, web page, or local file) into a
-// manifest, and holds the small helpers that every mode — download, restream,
-// worker — needs for the streams that come out of it.
+// Package source turns an input (a URL, a web page, or a local file) into a
+// manifest. It also holds the small helpers that every mode (download,
+// restream, worker) needs for the streams that come out of it.
 package source
 
 import (
@@ -23,14 +23,15 @@ import (
 	"github.com/m314dev/m314dl/internal/scrape"
 )
 
-// localManifestPath returns the filesystem path when input is a local manifest
-// (a file:// URL, or a schemeless string that names an existing file) and ok.
+// localManifestPath returns the file path and true when input is a local
+// manifest: a file:// URL, or a string with no URL scheme that names an
+// existing file.
 func localManifestPath(input string) (string, bool) {
 	if strings.HasPrefix(input, "file://") {
 		return strings.TrimPrefix(input, "file://"), true
 	}
 	if u, err := url.Parse(input); err == nil && u.Scheme != "" {
-		return "", false // has a real URL scheme (http/https/…)
+		return "", false // has a real URL scheme such as http or https
 	}
 	if _, err := os.Stat(input); err == nil {
 		return input, true
@@ -38,9 +39,9 @@ func localManifestPath(input string) (string, bool) {
 	return "", false
 }
 
-// localBaseURL is the base against which relative segment URLs in a local
-// manifest resolve. Absolute segment URLs (the common case for signed
-// manifests) ignore it.
+// localBaseURL is the base URL that relative segment URLs in a local manifest
+// resolve against. Absolute segment URLs (the common case for signed
+// manifests) do not use it.
 func localBaseURL(path string) string {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -49,9 +50,10 @@ func localBaseURL(path string) string {
 	return "file://" + filepath.Dir(abs) + "/"
 }
 
-// ParseKeys parses -key values into a KID→key map. Each value is "KID:KEY"
-// (hex, KID dashes optional) or a bare "KEY" (stored under the zero KID, used
-// when exactly one key is given and the KID does not match).
+// ParseKeys parses -key values into a map from KID to key. Each value is
+// "KID:KEY" (both hex; dashes in the KID are optional) or a bare "KEY", which
+// is stored under the all-zero KID and used when exactly one key is given and
+// the KID does not match.
 func ParseKeys(vals []string) (map[[16]byte][]byte, error) {
 	if len(vals) == 0 {
 		return nil, nil
@@ -79,14 +81,14 @@ func ParseKeys(vals []string) (map[[16]byte][]byte, error) {
 	return out, nil
 }
 
-// LoadManifest fetches the input, sniffs HLS/DASH/MSS, and falls back to
-// scraping when the input is a web page. A direct file (anything binary, or
-// served as an attachment) comes back as a single-stream master of kind
-// FileKind whose segments are the file's byte ranges — see file.go. An IPTV
-// M3U list comes back as kind PlaylistKind — see playlist.go.
+// LoadManifest fetches the input, checks whether it is HLS, DASH or MSS, and
+// falls back to scraping when the input is a web page. A direct file (anything
+// binary, or anything served as an attachment) comes back as a one-stream
+// master of kind FileKind whose segments are the file's byte ranges; see
+// file.go. An IPTV M3U list comes back as kind PlaylistKind; see playlist.go.
 func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, logv func(string, ...any)) (*manifest.Master, string, error) {
-	// Local manifest file (path or file://): some providers sign the playlist
-	// per request and hand it over as text rather than a URL.
+	// Local manifest file (a path or file://): some providers sign the playlist
+	// per request and hand it over as text instead of a URL.
 	if path, ok := localManifestPath(inputURL); ok {
 		body, err := os.ReadFile(path)
 		if err != nil {
@@ -99,9 +101,9 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 		}
 		return nil, "", fmt.Errorf("local file %s is not an HLS/DASH/MSS manifest", path)
 	}
-	// Open rather than fetch: the headers and the first bytes say whether this
-	// is a file, and a multi-gigabyte file must not be read into memory to
-	// find that out.
+	// Open the response instead of fetching the whole body: the headers and the
+	// first bytes say whether this is a file, and a multi-gigabyte file must not
+	// be read into memory just to find that out.
 	resp, err := client.Open(ctx, inputURL, "")
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch %s: %w", inputURL, err)
@@ -119,7 +121,7 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 	}
 	body := append(head, rest...)
 	if err != nil {
-		// mid-body failure: FetchBytes retries the whole read
+		// the read failed partway through the body: FetchBytes retries it whole
 		if body, finalURL, err = client.FetchBytes(ctx, inputURL, ""); err != nil {
 			return nil, "", fmt.Errorf("fetch %s: %w", inputURL, err)
 		}
@@ -151,8 +153,8 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 	return nil, "", fmt.Errorf("scraped URL %s is not a recognizable manifest", first)
 }
 
-// parseManifest sniffs the manifest format and parses it; ok is false when the
-// body is none of them (a web page, most likely).
+// parseManifest detects the manifest format and parses it. ok is false when
+// the body is none of the known formats (most likely a web page).
 func parseManifest(body []byte, baseURL string) (m *manifest.Master, kind string, err error, ok bool) {
 	switch {
 	case hls.IsHLS(body) && isPlaylist(body):
@@ -170,7 +172,8 @@ func parseManifest(body []byte, baseURL string) (m *manifest.Master, kind string
 	return nil, "", nil, false
 }
 
-// RefreshFunc re-fetches a live stream's playlist so the engine sees new segments.
+// RefreshFunc returns a function that re-fetches a live stream's playlist so
+// the engine sees new segments.
 func RefreshFunc(client *httpx.Client, kind string, st *manifest.Stream, logv func(string, ...any)) engine.RefreshFunc {
 	return func(ctx context.Context) (*manifest.Stream, error) {
 		body, finalURL, err := client.FetchBytes(ctx, st.PlaylistURL, "")
@@ -185,8 +188,8 @@ func RefreshFunc(client *httpx.Client, kind string, st *manifest.Stream, logv fu
 			}
 			return &fresh, nil
 		}
-		// DASH and Smooth: the whole manifest is re-parsed and the track found by
-		// its (stable) ID.
+		// DASH and Smooth: re-parse the whole manifest and find the track again
+		// by its ID, which stays the same across refreshes.
 		var m *manifest.Master
 		if kind == "mss" {
 			m, err = mss.Parse(body, finalURL)
@@ -206,7 +209,7 @@ func RefreshFunc(client *httpx.Client, kind string, st *manifest.Stream, logv fu
 	}
 }
 
-// RawExt is the extension for a stream's raw downloaded payload.
+// RawExt returns the file extension for a stream's raw downloaded data.
 func RawExt(st *manifest.Stream) string {
 	if st.Type == manifest.Subtitles {
 		return ".rawsub"
@@ -223,5 +226,5 @@ func RawExt(st *manifest.Stream) string {
 
 var tagBad = regexp.MustCompile(`[^\w.\-]+`)
 
-// SanitizeTag makes a language/name tag safe for filenames and URLs.
+// SanitizeTag makes a language or name tag safe to use in filenames and URLs.
 func SanitizeTag(s string) string { return tagBad.ReplaceAllString(s, "_") }

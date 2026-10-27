@@ -35,9 +35,10 @@ func TestStripFragmentProtection(t *testing.T) {
 		t.Fatal("nothing was removed")
 	}
 
-	// The regression: shrinking the moof shifts the mdat earlier, so trun's
-	// data_offset must drop by exactly the bytes removed, or the demuxer reads
-	// samples from the wrong place. Original data_offset here is 100 (set above).
+	// The regression check: a smaller moof moves the mdat earlier, so the trun's
+	// data_offset must drop by exactly the number of bytes removed. Otherwise
+	// the demuxer reads samples from the wrong place. The original data_offset
+	// here is 100 (set above).
 	const origOff = 100
 	var newOff int32
 	walk(out, func(b box) bool {
@@ -55,8 +56,8 @@ func TestStripFragmentProtection(t *testing.T) {
 }
 
 func TestSanitizeInit(t *testing.T) {
-	// sinf{frma='avc1', schm, schi{tenc}} inside an encv sample entry, plus a
-	// sibling avcC (codec config) that must survive, and a moov-level pssh.
+	// An encv sample entry holding sinf{frma='avc1', schm, schi{tenc}} next to
+	// an avcC (codec config) that must survive, plus a pssh at moov level.
 	sinf := mkBox("sinf", concat(
 		mkBox("frma", []byte("avc1")),
 		mkFullBox("schm", 0, 0, concat([]byte("cenc"), u32(0x10000))),
@@ -89,8 +90,8 @@ func TestSanitizeInit(t *testing.T) {
 }
 
 func TestSanitizeEAC3InitPreservesCodecConfig(t *testing.T) {
-	// Encrypted EAC3 uses an enca entry just like encrypted AAC, but must be
-	// restored to ec-3 with its dec3 decoder configuration intact.
+	// Encrypted EAC3 uses an enca entry, the same as encrypted AAC. After
+	// sanitizing it must come back as ec-3 with its dec3 decoder config intact.
 	dec3 := mkBox("dec3", []byte{0x04, 0x00, 0x20, 0x0f, 0x00})
 	sinf := mkBox("sinf", concat(
 		mkBox("frma", []byte("ec-3")),

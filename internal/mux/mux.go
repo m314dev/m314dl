@@ -1,4 +1,5 @@
-// Package mux merges downloaded raw streams into the final container via ffmpeg.
+// Package mux runs ffmpeg to merge the downloaded raw streams into the final
+// output file.
 package mux
 
 import (
@@ -27,9 +28,10 @@ func exeName(name string) string {
 	return name
 }
 
-// FindFFmpeg resolves the ffmpeg binary. An explicit path (from -ffmpeg) wins —
-// it may be an absolute/relative path or a bare name found on PATH; otherwise it
-// looks next to our binary, then on PATH.
+// FindFFmpeg finds the ffmpeg binary. An explicit value (from the -ffmpeg
+// flag) always wins. It may be an absolute path, a relative path, or a bare
+// name found on PATH. Without one, FindFFmpeg looks next to our own binary
+// first, then on PATH.
 func FindFFmpeg(explicit string) (string, error) {
 	if explicit != "" {
 		if p, err := exec.LookPath(explicit); err == nil {
@@ -46,7 +48,8 @@ func FindFFmpeg(explicit string) (string, error) {
 	return exec.LookPath("ffmpeg")
 }
 
-// subtitle codec by output container
+// subCodec returns the subtitle codec to use for the output container, chosen
+// by file extension. An empty result means no -c:s flag is passed.
 func subCodec(ext string) string {
 	switch ext {
 	case ".mp4", ".m4v", ".mov":
@@ -59,8 +62,9 @@ func subCodec(ext string) string {
 	return ""
 }
 
-// Mux merges inputs into outPath (container from extension). Stream copy, no
-// re-encode. Returns ffmpeg stderr tail on failure.
+// Mux merges inputs into outPath. The container type comes from the file
+// extension. Streams are copied as they are, with no re-encoding. On failure
+// the error carries the last part of ffmpeg's stderr output.
 func Mux(ffmpeg string, inputs []Input, outPath string) error {
 	if len(inputs) == 0 {
 		return fmt.Errorf("mux: no inputs")
@@ -82,8 +86,9 @@ func Mux(ffmpeg string, inputs []Input, outPath string) error {
 			args = append(args, "-map", fmt.Sprintf("%d:a", i))
 		case manifest.Video:
 			if haveAudioInput {
-				// separate audio chosen: drop any audio muxed into the
-				// video variant to avoid duplicate tracks
+				// A separate audio stream was chosen, so take only the video
+				// from this input. Any audio muxed into the video variant
+				// would otherwise show up as a duplicate track.
 				args = append(args, "-map", fmt.Sprintf("%d:v", i))
 			} else {
 				args = append(args, "-map", fmt.Sprint(i))
@@ -92,7 +97,8 @@ func Mux(ffmpeg string, inputs []Input, outPath string) error {
 			args = append(args, "-map", fmt.Sprint(i))
 		}
 	}
-	// -dn: drop metadata/emsg data tracks CMAF inits often carry
+	// -dn drops the data tracks (metadata, emsg) that CMAF init segments often
+	// carry.
 	args = append(args, "-dn", "-c:v", "copy", "-c:a", "copy")
 	if sc := subCodec(ext); sc != "" {
 		args = append(args, "-c:s", sc)
@@ -115,8 +121,8 @@ func Mux(ffmpeg string, inputs []Input, outPath string) error {
 			if in.Name != "" {
 				args = append(args, fmt.Sprintf("-metadata:s:s:%d", si), "title="+in.Name)
 			}
-			// Flag the first subtitle as default so a player turns it on without
-			// the viewer having to pick a track.
+			// Mark the first subtitle track as default, so a player turns it on
+			// without the viewer having to pick a track.
 			if si == 0 {
 				args = append(args, fmt.Sprintf("-disposition:s:%d", si), "default")
 			}
@@ -143,8 +149,10 @@ func Mux(ffmpeg string, inputs []Input, outPath string) error {
 	return nil
 }
 
-// ExtractSubtitle converts a raw subtitle stream file (fMP4 wvtt/stpp or
-// anything ffmpeg understands) into outPath (.srt/.vtt by extension).
+// ExtractSubtitle converts a raw subtitle stream file into outPath. The input
+// may be fragmented MP4 (fMP4) carrying wvtt or stpp subtitles, or anything
+// else ffmpeg understands. The output format (.srt or .vtt) follows the
+// extension of outPath.
 func ExtractSubtitle(ffmpeg, inPath, outPath string) error {
 	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", inPath, outPath)
 	var stderr strings.Builder

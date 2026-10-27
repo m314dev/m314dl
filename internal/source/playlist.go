@@ -9,17 +9,17 @@ import (
 	"github.com/m314dev/m314dl/internal/manifest"
 )
 
-// An IPTV-style M3U playlist (#EXTM3U + #EXTINF lines, each followed by the
-// URL of a whole movie, episode, or channel) is a list of downloads, not an
-// HLS playlist: its URLs are separate titles, not segments of one. It comes
-// back from LoadManifest as a master of kind PlaylistKind with one Stream per
-// entry: ID is the entry's 1-based position in the file, Name its title,
-// GroupID its group-title, PlaylistURL its URL.
+// An IPTV-style M3U playlist (#EXTM3U, then #EXTINF lines each followed by the
+// URL of a whole movie, episode, or channel) looks like HLS but is a list of
+// separate downloads: each URL is its own title rather than one segment of a
+// single stream. LoadManifest returns it as a master of kind PlaylistKind with
+// one Stream per entry: ID is the entry's position in the file counting from
+// 1, Name its title, GroupID its group-title, PlaylistURL its URL.
 const PlaylistKind = "playlist"
 
-// isPlaylist tells an IPTV list from HLS. Every HLS media playlist carries
-// #EXT-X-TARGETDURATION and every master #EXT-X-STREAM-INF (or #EXT-X-MEDIA);
-// a list of titles has none of them.
+// isPlaylist tells an IPTV list apart from HLS. Every HLS media playlist has
+// #EXT-X-TARGETDURATION and every HLS master has #EXT-X-STREAM-INF (or
+// #EXT-X-MEDIA); a list of titles has none of them.
 func isPlaylist(body []byte) bool {
 	s := string(body)
 	return !strings.Contains(s, "#EXT-X-TARGETDURATION") &&
@@ -28,8 +28,9 @@ func isPlaylist(body []byte) bool {
 }
 
 // parsePlaylist reads the entries. The title is the #EXTINF text after the
-// first comma outside quotes (falling back to tvg-name, then the URL's
-// basename); the group is group-title, or a preceding #EXTGRP line.
+// first comma outside quotes; when that is empty, tvg-name is used, then the
+// last part of the URL path. The group is group-title, or an #EXTGRP line that
+// comes before the URL.
 func parsePlaylist(body []byte, baseURL string) *manifest.Master {
 	m := &manifest.Master{URL: baseURL}
 	base, _ := url.Parse(baseURL)
@@ -71,8 +72,8 @@ func parsePlaylist(body []byte, baseURL string) *manifest.Master {
 	return m
 }
 
-// splitExtinf splits `-1 key="v,al" key2="…",Title` at the first comma
-// outside quotes.
+// splitExtinf splits `-1 key="v,al" key2="…",Title` at the first comma that
+// is outside quotes.
 func splitExtinf(s string) (attrs, title string) {
 	inQuote := false
 	for i, c := range s {
@@ -98,20 +99,21 @@ func attrValue(attrs, key string) string {
 	return strings.TrimSpace(v)
 }
 
-// vodExts are file containers an IPTV list uses for movies and episodes.
+// vodExts lists the file extensions an IPTV list uses for movies and episodes.
 var vodExts = map[string]bool{
 	".mp4": true, ".mkv": true, ".avi": true, ".mov": true, ".m4v": true, ".webm": true,
 	".wmv": true, ".flv": true, ".mpg": true, ".mpeg": true, ".3gp": true,
 }
 
-// LiveEntry guesses from the URL alone — no request, which matters on a panel
-// that bans an IP for opening thousands of channels — whether a playlist entry
-// is an endless live channel. Xtream Codes lists put movies and episodes under
-// /movie/ and /series/ with a file extension, and channels under /live/ or a
-// bare /user/pass/id (or id.ts). An .m3u8/.mpd entry is left to the manifest
-// (HLS without ENDLIST is live) and so reports false here.
-// ponytail: URL heuristic; a list serving VOD as bare or .ts URLs is skipped as
-// live — probe Content-Length per entry if such lists show up.
+// LiveEntry guesses from the URL alone whether a playlist entry is an endless
+// live channel. It makes no request, which matters on a panel that bans an IP
+// for opening thousands of channels. Xtream Codes lists put movies and
+// episodes under /movie/ and /series/ with a file extension, and channels
+// under /live/ or a bare /user/pass/id (or id.ts). An .m3u8 or .mpd entry is
+// left to the manifest (HLS without ENDLIST is live) and so reports false
+// here.
+// ponytail: URL heuristic; a list that serves VOD as bare or .ts URLs is
+// skipped as live. Probe Content-Length per entry if such lists show up.
 func LiveEntry(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil {

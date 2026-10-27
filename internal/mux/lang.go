@@ -2,8 +2,8 @@ package mux
 
 import "strings"
 
-// iso639_2 maps 2-letter codes to the 3-letter codes MP4 requires
-// (2-letter tags are silently dropped by ffmpeg's mp4 muxer).
+// iso639_2 maps 2-letter language codes to the 3-letter codes MP4 requires.
+// ffmpeg's mp4 muxer drops a 2-letter tag without any warning.
 var iso639_2 = map[string]string{
 	"aa": "aar", "ab": "abk", "af": "afr", "am": "amh", "ar": "ara",
 	"as": "asm", "az": "aze", "be": "bel", "bg": "bul", "bn": "ben",
@@ -24,8 +24,8 @@ var iso639_2 = map[string]string{
 	"vi": "vie", "zh": "zho", "zu": "zul",
 }
 
-// lang639 converts a BCP-47 tag ("en-US", "es") to ISO 639-2 ("eng", "spa").
-// Unknown values pass through unchanged.
+// lang639 converts a BCP-47 language tag ("en-US", "es") to its ISO 639-2
+// three-letter code ("eng", "spa"). A tag it does not know is returned as is.
 func lang639(tag string) string {
 	if tag == "" {
 		return ""

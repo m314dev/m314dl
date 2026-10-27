@@ -5,29 +5,31 @@ import (
 	"errors"
 )
 
-// SidxRef is one subsegment described by a SegmentIndexBox: its size in bytes
-// and its duration in the sidx timescale.
+// SidxRef is one subsegment listed in a SegmentIndexBox (sidx): its size in
+// bytes and its duration in sidx timescale units.
 type SidxRef struct {
 	Size     uint32
 	Duration uint32
 }
 
-// Sidx is a parsed SegmentIndexBox (ISO 14496-12 §8.16.3): the subsegments of
-// an on-demand-profile DASH representation whose media is one big file.
+// Sidx is a parsed SegmentIndexBox (ISO 14496-12 §8.16.3). It lists the
+// subsegments of a DASH on-demand representation, where the whole media is one
+// big file and the index says how large each piece is.
 type Sidx struct {
 	Timescale uint64
-	// FirstOffset is the byte distance from the end of the sidx box to the
-	// first subsegment.
+	// FirstOffset is the number of bytes between the end of the sidx box and
+	// the first subsegment.
 	FirstOffset uint64
-	// End is the offset just past the sidx box within the parsed buffer, so the
-	// first subsegment starts at (buffer start) + End + FirstOffset.
+	// End is the offset of the first byte after the sidx box, within the parsed
+	// buffer. The first subsegment starts at End + FirstOffset, counted from
+	// the start of that buffer.
 	End  int64
 	Refs []SidxRef
 }
 
-// ParseSidx parses the first sidx box in buf (the bytes of a SegmentBase
-// @indexRange). A hierarchical index (a sidx referencing further sidx boxes)
-// is rejected: every reference must be to media.
+// ParseSidx parses the first sidx box in buf, which holds the bytes of a
+// SegmentBase @indexRange. A hierarchical index (a sidx that points at further
+// sidx boxes) is rejected: every reference must point at media.
 func ParseSidx(buf []byte) (*Sidx, error) {
 	sb, ok := find(buf, "sidx")
 	if !ok {
@@ -37,7 +39,8 @@ func ParseSidx(buf []byte) (*Sidx, error) {
 	if err != nil {
 		return nil, err
 	}
-	// reference_ID(4) timescale(4) then EPT/first_offset: 4+4 (v0) or 8+8 (v1)
+	// Layout: reference_ID(4), timescale(4), then earliest_presentation_time
+	// (EPT) and first_offset: 4+4 bytes in version 0, 8+8 in version 1.
 	need := 8 + 8
 	if version != 0 {
 		need = 8 + 16

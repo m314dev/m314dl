@@ -100,7 +100,8 @@ func TestBadExpr(t *testing.T) {
 	}
 }
 
-// segList builds a stream with n segments of secs each (for segsMin/plistDur).
+// segList builds a stream with n segments of secs seconds each, for the
+// segsmin and plistdur tests.
 func segList(id string, n int, secs float64) *manifest.Stream {
 	st := &manifest.Stream{Type: manifest.Video, ID: id, Height: 720, Codecs: "avc1"}
 	for i := 0; i < n; i++ {
@@ -111,7 +112,7 @@ func segList(id string, n int, secs float64) *manifest.Stream {
 
 func TestSegsMinDropsBumper(t *testing.T) {
 	content := segList("content", 75, 4)                                      // 300s
-	bumper := segList("bumper", 1, 3)                                         // 3s ad/bumper
+	bumper := segList("bumper", 1, 3)                                         // a 3s ad or bumper
 	unknown := &manifest.Stream{Type: manifest.Video, ID: "hls", Height: 720} // 0 segs
 
 	e, err := ParseExpr("segsmin=2:for=all")

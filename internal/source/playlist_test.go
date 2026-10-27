@@ -47,7 +47,7 @@ func TestLiveEntry(t *testing.T) {
 		"http://h/vod/show.m3u8":    false, // the manifest decides
 		"http://h/live/u/p/3.m3u8":  true,
 		"http://h/live/u/p/3.ts":    true,
-		"http://h/u/p/3":            true, // Xtream short channel form
+		"http://h/u/p/3":            true, // the short Xtream channel form
 		"http://h/u/p/3.ts":         true,
 	} {
 		if got := LiveEntry(u); got != live {

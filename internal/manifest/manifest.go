@@ -1,6 +1,6 @@
-// Package manifest defines the protocol-agnostic streaming model.
-// HLS and DASH parsers both normalize into these types; the download
-// engine only ever sees this model.
+// Package manifest defines the streaming model shared by every protocol.
+// The HLS, DASH and Smooth Streaming parsers all turn their input into these
+// types, and the download engine only ever sees this model.
 package manifest
 
 import (
@@ -29,20 +29,20 @@ func (t MediaType) String() string {
 	return "unknown"
 }
 
-// EncMethod is the segment encryption method.
+// EncMethod says how a segment is encrypted.
 type EncMethod string
 
 const (
 	EncNone      EncMethod = ""
-	EncAES128    EncMethod = "AES-128"    // whole-segment AES-CBC, supported in-process
-	EncSampleAES EncMethod = "SAMPLE-AES" // unsupported: reported, not downloaded blindly
-	EncCENC      EncMethod = "CENC"       // DRM: detected and refused
+	EncAES128    EncMethod = "AES-128"    // whole segment AES-CBC; decrypted in-process
+	EncSampleAES EncMethod = "SAMPLE-AES" // unsupported: reported, never downloaded blindly
+	EncCENC      EncMethod = "CENC"       // DRM: decrypted in process with a -key, refused without one
 )
 
-// ByteRange is an inclusive HTTP byte range.
+// ByteRange is an HTTP byte range; both ends are inclusive.
 type ByteRange struct {
 	Start int64
-	End   int64 // -1 = open-ended
+	End   int64 // -1 means no end: the range runs to the end of the object
 }
 
 func (r *ByteRange) Header() string {
@@ -54,9 +54,9 @@ func (r *ByteRange) Header() string {
 
 type Key struct {
 	Method EncMethod
-	URI    string   // http(s), data:, or empty
-	IV     []byte   // nil = derive from segment media sequence (HLS rule)
-	KID    [16]byte // CENC: default key id (from manifest or init tenc); zero = unknown
+	URI    string   // http(s) URL, data: URL, or empty
+	IV     []byte   // nil: derive it from the segment's media sequence (HLS rule)
+	KID    [16]byte // CENC default key id (manifest or init tenc box); all zero = unknown
 }
 
 type InitMap struct {
@@ -68,21 +68,22 @@ type Segment struct {
 	URL           string
 	Duration      float64 // seconds
 	Range         *ByteRange
-	Key           *Key // nil = clear
+	Key           *Key // nil means the segment is not encrypted
 	Init          *InitMap
-	Seq           int64 // media sequence / $Number$; IV fallback + ordering
+	Seq           int64 // media sequence or $Number$; IV fallback and ordering
 	Discontinuity bool
 	// Index, when set, marks a placeholder: the segment is a whole on-demand
-	// media file whose SegmentIndexBox lives at this byte range. It is split
-	// into real subsegments (source.ExpandIndexed) before download.
+	// media file, and its SegmentIndexBox (sidx, the table of where each piece
+	// of the file starts) sits at this byte range. source.ExpandIndexed splits
+	// it into real subsegments before download.
 	Index *ByteRange
 }
 
 // Stream is one downloadable track (video variant, audio rendition, subtitle).
 type Stream struct {
 	Type         MediaType
-	ID           string // stable id for selection/display
-	PlaylistURL  string // media playlist / representation locator (for live refresh)
+	ID           string // stable id used for selection and display
+	PlaylistURL  string // media playlist or representation URL (for live refresh)
 	Bandwidth    int64
 	Width        int
 	Height       int
@@ -92,23 +93,23 @@ type Stream struct {
 	Name         string
 	Channels     string
 	Default      bool
-	AudioGroup   string // HLS: groups this video variant references
+	AudioGroup   string // HLS: the rendition groups this video variant references
 	SubsGroup    string
-	GroupID      string // HLS: group this rendition belongs to
-	MuxedAudio   bool   // HLS variant whose segments carry audio too
+	GroupID      string // HLS: the group this rendition belongs to
+	MuxedAudio   bool   // HLS variant whose video segments also carry the audio
 	Live         bool
-	MediaSeq     int64 // first segment's media sequence (live window tracking)
+	MediaSeq     int64 // first segment's media sequence (tracks the live window)
 	TargetDur    float64
-	Refresh      time.Duration // live playlist refresh interval
+	Refresh      time.Duration // how often to re-fetch a live playlist
 	Init         *InitMap
 	Segments     []Segment
-	SegmentsFull bool // segments already populated (bare media playlist)
+	SegmentsFull bool // segments already filled in (bare media playlist)
 
-	// DASH AudioChannelConfiguration scheme; Channels is its value.
+	// DASH: the AudioChannelConfiguration scheme; Channels holds its value.
 	ChannelScheme string
 }
 
-// Resolution returns "WxH" or "".
+// Resolution returns the picture size as "WxH", or "" when it is unknown.
 func (s *Stream) Resolution() string {
 	if s.Width == 0 && s.Height == 0 {
 		return ""
@@ -116,7 +117,7 @@ func (s *Stream) Resolution() string {
 	return fmt.Sprintf("%dx%d", s.Width, s.Height)
 }
 
-// Duration sums segment durations.
+// Duration returns the total length of all segments, in seconds.
 func (s *Stream) Duration() float64 {
 	var d float64
 	for i := range s.Segments {
@@ -150,7 +151,7 @@ func (s *Stream) String() string {
 
 // Master is the parsed top-level manifest.
 type Master struct {
-	URL     string // final (post-redirect) manifest URL, base for relatives
+	URL     string // manifest URL after redirects; relative URLs resolve against it
 	Live    bool
 	Streams []*Stream
 }

@@ -140,7 +140,7 @@ type initXML struct {
 
 // ---- parsing ----
 
-// Now is stubbed in tests; live edge computation needs wall clock.
+// Now is replaced in tests. Working out the live edge needs the wall clock.
 var Now = time.Now
 
 // Parse converts an MPD into the unified model. Segments are fully populated.
@@ -168,7 +168,7 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 			pDur = mpdDur
 		}
 		if live && pi > 0 {
-			break // live: record newest reachable period only; refresh keeps up
+			break // live: only the first period listed is parsed; each refresh parses the manifest again and follows whatever the source lists first
 		}
 		for ai, as := range p.AdaptationSets {
 			aBase := resolveChain(pBase, as.BaseURL)
@@ -197,13 +197,14 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 				}
 				key := st.ID
 				if prev, ok := byKey[key]; ok {
-					// Same track ID recurs across periods. Concatenate (with a
-					// discontinuity) ONLY when the encoding is truly continuous:
-					// same codecs, resolution, init segment and content key.
-					// Ad/bumper periods (SSAI) and per-period re-encodes differ
-					// on at least one of those, so keep them as separate tracks
-					// the caller can drop (e.g. -sv segsMin=2:plistDurMin=20m)
-					// rather than splicing ads in or dropping a period's init.
+					// The same track ID shows up again in a later period. Join
+					// the two (with a discontinuity) only when the encoding
+					// really continues: same codecs, resolution, init segment
+					// and content key. Ad or bumper periods (SSAI) and
+					// per-period re-encodes differ in at least one of those, so
+					// they stay separate tracks the caller can drop (for example
+					// -sv segsMin=2:plistDurMin=20m). Joining them would splice
+					// ads in or drop a period's init.
 					if len(segs) > 0 && mergeCompatible(prev, st, init, firstSegKey(segs)) {
 						segs[0].Discontinuity = true
 						base := int64(len(prev.Segments))
@@ -213,8 +214,8 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 						prev.Segments = append(prev.Segments, segs...)
 						continue
 					}
-					// incompatible: give it a period-unique ID so it is a
-					// distinct, filterable track instead of colliding.
+					// incompatible: give it an ID unique to this period so it is
+					// a separate, filterable track instead of colliding.
 					st.ID = fmt.Sprintf("%s.p%d", st.ID, pi)
 					key = st.ID
 				}
@@ -238,11 +239,11 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 }
 
 // trickModeScheme is the DASH-IF EssentialProperty that marks a trick-play
-// track (I-frame only, frameRate=1, maxPlayoutRate set). EssentialProperty
+// track (I-frames only, frameRate=1, maxPlayoutRate set). EssentialProperty
 // means a client that does not implement the scheme must ignore the element,
-// so such representations are dropped instead of offered as ordinary video —
-// they often tie with the real top rendition on height and bandwidth, and only
-// document order kept "best" from picking the 1 fps track.
+// so such representations are dropped instead of being offered as ordinary
+// video. They often tie with the real top rendition on height and bandwidth,
+// and only document order kept "best" from picking the 1 fps track.
 const trickModeScheme = "http://dashif.org/guidelines/trickmode"
 
 func isTrickMode(as *adaptXML, rep *repXML) bool {
@@ -258,9 +259,10 @@ func buildStream(as *adaptXML, rep *repXML, ai, ri int) *manifest.Stream {
 	st := &manifest.Stream{
 		ID:        fmt.Sprintf("%s.%d.%d", firstNonEmpty(rep.ID, "r"), ai, ri),
 		Bandwidth: rep.Bandwidth,
-		// width/height are per-Representation, but some packagers (shaka
-		// on-demand) put them only on the AdaptationSet; inherit as a fallback
-		// so the restream output and picker still know the resolution.
+		// width/height belong on the Representation, but some packagers (shaka
+		// on-demand) put them only on the AdaptationSet. Inherit them as a
+		// fallback so the restream output and the picker still know the
+		// resolution.
 		Width:    firstNonZero(rep.Width, as.Width, as.MaxWidth),
 		Height:   firstNonZero(rep.Height, as.Height, as.MaxHeight),
 		Codecs:   firstNonEmpty(rep.Codecs, as.Codecs),
@@ -313,7 +315,7 @@ type segCtx struct {
 }
 
 func buildSegments(c segCtx) ([]manifest.Segment, *manifest.InitMap, error) {
-	// representation-level wins, adaptation-level fills gaps
+	// the representation-level template wins; the adaptation-level one fills gaps
 	tmpl := mergeTemplates(c.rep.SegmentTemplate, c.as.SegmentTemplate)
 	list := c.rep.SegmentList
 	if list == nil {
@@ -326,13 +328,14 @@ func buildSegments(c segCtx) ([]manifest.Segment, *manifest.InitMap, error) {
 		return segmentsFromList(c, list)
 	case c.rep.SegmentBase != nil:
 		// One media file per representation. Split off the init header
-		// (<Initialization range="0-N">) as a separate init item so a CENC stream
-		// can read its tenc/KID — without it the decryptor never runs and every
-		// encrypted SegmentBase track dies with "stream is CENC-protected". The
-		// rest is a placeholder for the whole file, carrying the sidx location
-		// (@indexRange) so it can be split into real subsegments before download
-		// — as one blob a feature film is read into RAM whole and OOM-kills the
-		// process (the engine writes the init item, then the segments).
+		// (<Initialization range="0-N">) as a separate init item so a CENC
+		// stream can read its tenc/KID. Without it the decryptor never runs and
+		// every encrypted SegmentBase track dies with "stream is CENC-protected".
+		// The rest is a placeholder for the whole file. It carries the sidx
+		// location (@indexRange) so it can be split into real subsegments before
+		// download: as one blob, a feature film is read into RAM whole and the
+		// process is OOM-killed. (The engine writes the init item, then the
+		// segments.)
 		seg := manifest.Segment{URL: c.base, Duration: c.periodDur}
 		var init *manifest.InitMap
 		sb := c.rep.SegmentBase
@@ -401,7 +404,7 @@ func segmentsFromTemplate(c segCtx, t *tmplXML) ([]manifest.Segment, *manifest.I
 			}
 			repeat := s.R
 			if repeat < 0 {
-				// negative r: repeat until period end
+				// negative r: repeat until the period ends
 				if c.periodDur > 0 && s.D > 0 {
 					end := uint64(c.periodDur * float64(ts))
 					repeat = int64((end - cur) / s.D)
@@ -431,7 +434,7 @@ func segmentsFromTemplate(c segCtx, t *tmplXML) ([]manifest.Segment, *manifest.I
 	segDur := float64(t.Duration) / float64(ts)
 	var count uint64
 	if c.live {
-		// live edge from wall clock inside the DVR window
+		// work out the live edge from the wall clock, inside the DVR window
 		window := c.tsbd
 		if window <= 0 {
 			window = 60
@@ -557,7 +560,8 @@ func parseRange(s string) *manifest.ByteRange {
 
 var isoDurRe = regexp.MustCompile(`^-?P(?:(\d+(?:\.\d+)?)Y)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$`)
 
-// parseISODuration returns seconds; 0 on empty/invalid.
+// parseISODuration returns the duration in seconds, or 0 when s is empty or
+// invalid.
 func parseISODuration(s string) float64 {
 	if s == "" {
 		return 0
@@ -587,9 +591,9 @@ func parseFrameRate(s string) float64 {
 }
 
 // mergeCompatible reports whether cur (a later period with the same track ID)
-// is a true continuation of prev — same codecs, resolution, init segment and
-// content key — so their segments can be concatenated into one track. Anything
-// else (SSAI ad periods, per-period re-encodes, per-period KIDs) is not merged.
+// truly continues prev, meaning the same codecs, resolution, init segment and
+// content key, so their segments can be joined into one track. Anything else
+// (SSAI ad periods, per-period re-encodes, per-period KIDs) is not merged.
 func mergeCompatible(prev, cur *manifest.Stream, curInit *manifest.InitMap, curKey *manifest.Key) bool {
 	if prev.Codecs != cur.Codecs || prev.Width != cur.Width || prev.Height != cur.Height {
 		return false
@@ -625,8 +629,9 @@ func firstSegKey(segs []manifest.Segment) *manifest.Key {
 	return nil
 }
 
-// defaultKID extracts the cenc:default_KID from ContentProtection descriptors
-// (representation-level wins). Returns the zero KID when absent/malformed.
+// defaultKID extracts the cenc:default_KID from the ContentProtection
+// descriptors (the representation-level one wins). It returns the zero KID when
+// the value is absent or malformed.
 func defaultKID(lists ...[]cpXML) [16]byte {
 	var zero [16]byte
 	for _, list := range lists {

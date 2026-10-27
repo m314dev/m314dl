@@ -31,8 +31,8 @@ func rangedStream(u string, n, chunk int) *manifest.Stream {
 	return st
 }
 
-// fileBody opens with a PNG magic and has TS sync bytes 188 apart: the
-// fake-image-header strip would cut it if the file path weren't verbatim.
+// fileBody starts with the PNG magic bytes and has TS sync bytes 188 apart.
+// The fake-image-header strip would cut it if the file path were not verbatim.
 func fileBody(n int) []byte {
 	b := make([]byte, n)
 	for i := range b {
@@ -56,7 +56,8 @@ func assertFile(t *testing.T, out string, want []byte) {
 	}
 }
 
-// Slicing server: parallel ranged chunks assemble byte-exact, verbatim.
+// A server that honors ranges: parallel ranged chunks assemble to the exact
+// bytes, verbatim.
 func TestDownloadFileRanged(t *testing.T) {
 	body := fileBody(5000)
 	var ranges sync.Map
@@ -104,8 +105,8 @@ func TestDownloadFileRangeIgnoredFallsBack(t *testing.T) {
 	assertFile(t, out, body)
 }
 
-// Resume with ranged chunks: committed prefix + checkpoint + a partial part
-// file complete byte-exact, fetching only what is missing.
+// Resume with ranged chunks: a committed prefix, a checkpoint and a partial
+// part file complete to the exact bytes, fetching only what is missing.
 func TestDownloadFileRangedResume(t *testing.T) {
 	body := fileBody(5000)
 	var ranges sync.Map
@@ -158,9 +159,9 @@ func TestDownloadFileShortRange(t *testing.T) {
 	assertFile(t, out, body)
 }
 
-// An expiring redirect token (Xtream-style IPTV panels, signed-URL hosts): once
-// the token is refused its chunks get 406, and the download re-resolves the
-// origin for a fresh one — once, shared by every worker — instead of failing.
+// An expiring redirect token (Xtream-style IPTV panels, signed-URL hosts).
+// Once the token is refused its chunks get 406. The download then asks the
+// origin for a fresh one, once, shared by every worker, instead of failing.
 func TestDownloadFileReresolvesRefusedToken(t *testing.T) {
 	body := fileBody(5000)
 	var mu sync.Mutex

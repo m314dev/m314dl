@@ -1,17 +1,18 @@
-// Package bbts decrypts "BBTS" (Broadband Transport Stream) MPEG-TS payloads:
-// a whole-segment scheme where the video (PID 0x0100) and audio (PID 0x0101)
-// elementary streams are AES-128 encrypted, with the base IV carried inside the
-// stream's own SDT service name ("mdcm|provider|service|<IV_HEX>"). Only the key
-// is supplied from outside; everything else is read from the .ts itself, so this
-// stays a generic cipher — it knows about Transport Streams, not about any site.
+// Package bbts decrypts "BBTS" (Broadband Transport Stream) MPEG-TS payloads.
+// This is a whole-segment scheme: the video (PID 0x0100) and audio (PID 0x0101)
+// elementary streams are AES-128 encrypted, and the base IV travels inside the
+// stream's own SDT service name ("mdcm|provider|service|<IV_HEX>"). The caller
+// supplies only the key. Everything else is read from the .ts itself, so this
+// stays a generic cipher: it knows about transport streams and nothing about
+// any particular site.
 //
-// The block cadence is the format's own: only every 10th 16-byte block (and any
-// final short block) is truly AES-encrypted; the rest XOR against the raw
-// incremented counter. That is faithful to the source scheme — do not "fix" it.
+// The block pattern is the format's own. Only every 10th 16-byte block (and any
+// final short block) is truly AES-encrypted; the rest are XORed against the raw
+// incremented counter. That is how the source scheme works, so do not "fix" it.
 //
 // Ported from bbtsdecrypt (https://github.com/ReiDoBrega/bbtsdecrypt),
-// MIT-licensed, (c) 2025-2026 @duck @ReiDoBrega. Adapted to run in-memory
-// (buffer in, buffer out) instead of file-to-file.
+// MIT-licensed, (c) 2025-2026 @duck @ReiDoBrega. Adapted to run in memory
+// (buffer in, buffer out) instead of file to file.
 package bbts
 
 import (
@@ -34,8 +35,8 @@ const (
 )
 
 // Decrypt decrypts a BBTS-encrypted MPEG-TS buffer with the given 16-byte AES
-// key, returning a clean TS buffer. A stream carrying no SDT IV is passed
-// through unchanged (nothing to decrypt).
+// key and returns a clean TS buffer. A stream that carries no SDT IV is passed
+// through unchanged, since there is nothing to decrypt.
 func Decrypt(data, key []byte) ([]byte, error) {
 	if len(key) != 16 {
 		return nil, fmt.Errorf("bbts: key must be 16 bytes, got %d", len(key))
@@ -264,7 +265,8 @@ func tsPayloadOffset(pkt []byte) int {
 	}
 }
 
-// psiAssembler reassembles a PSI section that spans multiple TS packets.
+// psiAssembler reassembles a PSI section (a table such as the SDT or PMT) that
+// spans several TS packets.
 type psiAssembler struct {
 	buf           []byte
 	expectedTotal *int
@@ -314,7 +316,8 @@ func (pa *psiAssembler) push(pkt []byte) []byte {
 }
 
 // parseSDTAndSetIV pulls the base IV out of the SDT service name
-// ("mdcm|provider|service|<X+IV_HEX>"), copying the first ivCopyLen bytes.
+// ("mdcm|provider|service|<X+IV_HEX>") and copies its first ivCopyLen bytes
+// into ivec.
 func parseSDTAndSetIV(section, ivec []byte) bool {
 	if len(section) < 16 || section[0] != 0x42 {
 		return false
@@ -402,10 +405,11 @@ func findStreamType(streams []streamInfo, pid uint16) byte {
 	return 0
 }
 
-// decryptESSparse decrypts elementary-stream bytes in place. The counter copy is
-// local so the caller's base IV is never touched. Only every 10th block (and a
-// final short block) is AES-encrypted; the format XORs the rest against the raw
-// counter. Emulation-prevention bytes (00 00 03 -> 00 00) are stripped first.
+// decryptESSparse decrypts elementary-stream bytes in place. It works on a local
+// copy of the counter, so the caller's base IV is never touched. Only every 10th
+// block (and a final short block) is AES-encrypted; the format XORs the rest
+// against the raw counter. Emulation-prevention bytes (00 00 03 -> 00 00) are
+// stripped first.
 func decryptESSparse(es []byte, block cipher.Block, ivStart []byte) {
 	newES := make([]byte, 0, len(es))
 	for i := 0; i < len(es); {

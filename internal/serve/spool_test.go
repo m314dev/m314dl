@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-// -spool-dir is honoured (and created); a spool made under the base lands
-// inside it.
+// -spool-dir is honoured and created when missing; a spool made under the
+// base lands inside it.
 func TestSpoolBaseOverride(t *testing.T) {
 	want := filepath.Join(t.TempDir(), "deep", "spool")
 	base, err := SpoolBase(want)
@@ -29,8 +29,8 @@ func TestSpoolBaseOverride(t *testing.T) {
 	}
 }
 
-// With no override the spool base is the current directory, not the system
-// temp dir (tmpfs — RAM — on most Linux hosts).
+// With no override the spool base is the current directory. It must not be
+// the system temp dir, which is tmpfs (RAM) on most Linux hosts.
 func TestSpoolBaseDefaultsToCurrentDir(t *testing.T) {
 	cwd := t.TempDir()
 	t.Chdir(cwd)

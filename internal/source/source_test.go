@@ -12,11 +12,11 @@ func TestParseKeys(t *testing.T) {
 	if len(keys[kid]) != 16 {
 		t.Fatalf("key not stored under KID: %v", keys)
 	}
-	// dashes in KID tolerated
+	// dashes in the KID are allowed
 	if _, err := ParseKeys([]string{"00112233-4455-6677-8899-aabbccddeeff:0123456789abcdef0123456789abcdef"}); err != nil {
 		t.Fatalf("dashed KID should parse: %v", err)
 	}
-	// bare key → zero KID
+	// a bare key is stored under the all-zero KID
 	bare, err := ParseKeys([]string{"0123456789abcdef0123456789abcdef"})
 	if err != nil {
 		t.Fatal(err)
@@ -24,7 +24,7 @@ func TestParseKeys(t *testing.T) {
 	if len(bare[[16]byte{}]) != 16 {
 		t.Fatal("bare key should be stored under the zero KID")
 	}
-	// bad lengths rejected
+	// wrong lengths are rejected
 	if _, err := ParseKeys([]string{"tooshort:0123456789abcdef0123456789abcdef"}); err == nil {
 		t.Fatal("short KID should error")
 	}

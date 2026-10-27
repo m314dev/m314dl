@@ -1,10 +1,11 @@
-// m314dl — HLS/DASH/MSS media downloader.
+// m314dl is an HLS/DASH/MSS media downloader.
 //
 // Usage: m314dl [flags] <URL>
-// URL may be a master/media playlist (.m3u8), a DASH manifest (.mpd), a Smooth
-// Streaming manifest (.ism/Manifest), a web page (m314dl scrapes it for
-// stream URLs), or a plain file (mp4, mkv, zip, iso, …), which is fetched in
-// parallel byte ranges with resume and written as-is.
+// The URL may be a master or media playlist (.m3u8), a DASH manifest (.mpd), a
+// Smooth Streaming manifest (.ism/Manifest), a web page (m314dl reads the page
+// and finds the stream URLs in it), or a plain file (mp4, mkv, zip, iso and so
+// on). A plain file is fetched in parallel byte ranges, can resume, and is
+// written exactly as it came.
 package main
 
 import (
@@ -44,7 +45,7 @@ import (
 	"github.com/m314dev/m314dl/internal/worker"
 )
 
-var version = "0.3.6" // set by goreleaser via -ldflags "-X main.version=..."
+var version = "0.3.6" // goreleaser sets this with -ldflags "-X main.version=..."
 
 type multiFlag []string
 
@@ -109,9 +110,10 @@ func main() {
 	}
 }
 
-// printUsage keeps the command-line help short enough to scan. The standard
-// flag package prints one long alphabetical list, which hides the options most
-// people need for a normal download among the server-only settings.
+// printUsage prints command-line help that is short enough to scan. The
+// standard flag package prints one long alphabetical list, where the options
+// most people need for a normal download get lost among the server-only
+// settings.
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "m314dl %s — HLS/DASH/MSS media downloader\n\n", version)
 	fmt.Fprintln(w, "Usage:")
@@ -171,7 +173,7 @@ func printUsageSection(w io.Writer, title string, options []helpOption) {
 	fmt.Fprintf(w, "%s:\n", title)
 	for _, option := range options {
 		f := flag.Lookup(option.name)
-		if f == nil { // Keep help usable if a flag is removed later.
+		if f == nil { // The help still works if a flag is removed later.
 			continue
 		}
 		label := "-" + f.Name
@@ -184,8 +186,9 @@ func printUsageSection(w io.Writer, title string, options []helpOption) {
 }
 
 func usageDefault(f *flag.Flag) string {
-	// Empty values, false, and zero normally have special meanings described in
-	// the option text, so repeating them as a default would add noise.
+	// An empty value, false and zero usually have a special meaning that the
+	// option text already explains, so printing them as the default would only
+	// add noise.
 	if f.DefValue == "" || f.DefValue == "false" || f.DefValue == "0" || f.DefValue == "0s" {
 		return ""
 	}
@@ -241,10 +244,11 @@ func run() error {
 	flag.IntVar(&o.workerMaxChan, "worker-max-channels", 32, "-worker: max concurrent channels; further starts get 503 (0 = unlimited)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() { printUsage(flag.CommandLine.Output()) }
-	// Flags may appear in any order relative to the URL. Go's flag package stops
-	// at the first non-flag arg, so parse in a loop: keep the positional it stops
-	// on and resume parsing the rest. Flags before, after, or around the URL all
-	// work (m314dl -o out.mp4 URL -t 16 is the same as m314dl URL -o out.mp4 -t 16).
+	// Flags may come before or after the URL. Go's flag package stops parsing at
+	// the first argument that is not a flag, so parse in a loop: keep the
+	// positional argument it stopped on and parse the rest again. Flags before,
+	// after, or on both sides of the URL all work (m314dl -o out.mp4 URL -t 16 is
+	// the same as m314dl URL -o out.mp4 -t 16).
 	var positionals []string
 	rest := os.Args[1:]
 	for {
@@ -279,15 +283,16 @@ func run() error {
 		}
 		return worker.ServeWorker(o.worker, o.workerSecret, o.workerMaxChan, o.ffmpegPath, o.spoolDir, version, logv)
 	}
-	// Adaptive concurrency unless the user pinned -t.
+	// Concurrency adapts on its own unless the user set -t by hand.
 	tPinned := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "t" {
 			tPinned = true
 		}
 	})
-	// -curl: pull the URL and headers out of a pasted copy-as-curl command. An
-	// explicit positional URL still wins; -H below still overrides its headers.
+	// -curl: take the URL and headers from a pasted copy-as-curl command. A URL
+	// given on the command line still wins, and -H (handled below) still
+	// overrides the headers from the curl command.
 	var curlHeaders map[string]string
 	if o.curl != "" {
 		cmd, err := readCurlSource(o.curl)
@@ -309,8 +314,8 @@ func run() error {
 	}
 	inputURL := positionals[0]
 
-	// Nudge the user if a newer release exists. Runs in the background and its
-	// notice prints when run() returns, so it never delays the download.
+	// Tell the user when a newer release exists. The check runs in the background
+	// and its notice prints when run() returns, so it never delays the download.
 	defer printUpdateNotice(startUpdateCheck(&o))
 
 	logv := func(format string, args ...any) {
@@ -320,10 +325,10 @@ func run() error {
 	}
 
 	headers := map[string]string{}
-	for k, v := range curlHeaders { // from -curl, if any
+	for k, v := range curlHeaders { // headers from -curl, if any
 		headers[k] = v
 	}
-	for _, h := range o.headers { // explicit -H overrides a curl header
+	for _, h := range o.headers { // an explicit -H wins over a header from -curl
 		k, v, ok := strings.Cut(h, ":")
 		if !ok {
 			return fmt.Errorf("bad header %q (want 'Key: Value')", h)
@@ -363,12 +368,13 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// fetch + detect manifest (scraping web pages transparently)
+	// Fetch the manifest and work out its kind. A web page is searched for the
+	// stream URL on the way, with no extra step for the user.
 	master, kind, err := source.LoadManifest(ctx, client, inputURL, logv)
 	if err != nil {
 		return err
 	}
-	threadCeiling := 0 // 0 = auto-tune (no -t given)
+	threadCeiling := 0 // 0 means auto-tune (no -t given)
 	if tPinned {
 		threadCeiling = o.threads
 	}
@@ -379,21 +385,22 @@ func run() error {
 	return j.download(ctx, cancel, inputURL, master, kind)
 }
 
-// job is what a download needs besides its URL: settled once per run and
-// shared by every entry of an M3U playlist.
+// job holds what a download needs besides its URL. It is set up once per run
+// and shared by every entry of an M3U playlist.
 type job struct {
 	o         *options
 	client    *httpx.Client
-	threads   int // -t ceiling; 0 = auto-tune
+	threads   int // upper limit from -t; 0 means auto-tune
 	adFilters []*regexp.Regexp
 	keys      map[[16]byte][]byte
 	bbtsKey   []byte
 	logv      func(string, ...any)
-	skipLive  bool             // playlist entry: a live stream is skipped (errLiveEntry), not recorded
-	prog      *engine.Progress // playlist -titles >1: one status line shared by the titles in flight
+	skipLive  bool             // playlist entry: a live stream is skipped (errLiveEntry) instead of recorded
+	prog      *engine.Progress // playlist -titles above 1: one status line shared by the running titles
 }
 
-// say prints a status message, through the shared status line when there is one.
+// say prints a status message. It goes through the shared status line when
+// there is one.
 func (j job) say(format string, args ...any) {
 	if j.prog != nil {
 		j.prog.Log(fmt.Sprintf(format, args...))
@@ -402,13 +409,14 @@ func (j job) say(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
-// warn prints a message under a yellow "warning:" tag.
+// warn prints a message after a yellow "warning:" tag.
 func (j job) warn(format string, args ...any) {
 	j.say("%s %s", ui.Paint(ui.Yellow, "warning:"), fmt.Sprintf(format, args...))
 }
 
-// progress is the status line for one download: its own, drawn until stop is
-// called, or the playlist's shared one, which the playlist stops.
+// progress returns the status line for one download. A single download gets
+// its own line, drawn until stop is called. A playlist entry gets the
+// playlist's shared line, which the playlist itself stops.
 func (j job) progress(live bool) (prog *engine.Progress, stop func()) {
 	if j.prog != nil {
 		return j.prog, func() {}
@@ -418,12 +426,12 @@ func (j job) progress(live bool) (prog *engine.Progress, stop func()) {
 	go prog.Render(done)
 	return prog, func() {
 		close(done)
-		time.Sleep(50 * time.Millisecond) // let renderer print the final line
+		time.Sleep(50 * time.Millisecond) // give the renderer time to print the final line
 	}
 }
 
-// download runs one loaded input to its output: a direct file as-is, a
-// manifest through selection, download, and mux.
+// download turns one loaded input into its output. A direct file is written
+// as it is. A manifest goes through track selection, download and mux.
 func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL string, master *manifest.Master, kind string) error {
 	o, client, threadCeiling, logv := j.o, j.client, j.threads, j.logv
 	keys, bbtsKey, adFilters := j.keys, j.bbtsKey, j.adFilters
@@ -464,7 +472,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		j.say("selected: %-4s %s", st.ID, st)
 	}
 
-	// expand HLS media playlists for selected streams only
+	// Expand the HLS media playlists, for the selected streams only.
 	live := master.Live
 	for _, st := range selected {
 		if kind == "hls" && !st.SegmentsFull {
@@ -496,7 +504,8 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		return errLiveEntry
 	}
 
-	// Restream mode: republish live HLS over HTTP instead of downloading a file.
+	// Restream mode: republish the stream over HTTP as live HLS instead of
+	// downloading it to a file.
 	if o.serve != "" {
 		return serve.Run(ctx, serve.Options{Addr: o.serve, Format: o.serveFormat, Transcode: o.serveTranscode, FFmpegPath: o.ffmpegPath, SpoolDir: o.spoolDir},
 			client, kind, selected, keys, bbtsKey, threadCeiling, logv)
@@ -507,10 +516,11 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	if !o.noMux && ffErr != nil {
 		return fmt.Errorf("ffmpeg not found (needed for muxing; pass -ffmpeg <path>, or -no-mux to skip): %w", ffErr)
 	}
-	// Everything this download writes before the mux goes in one folder, so a
-	// 2000-segment download leaves one entry in the output directory instead of
-	// a part file per in-flight segment, and a Ctrl-C leaves one folder to resume
-	// from. The folder is deleted once the mux succeeds.
+	// Everything this download writes before the mux goes into one folder. A
+	// download with 2000 segments then leaves one entry in the output directory
+	// instead of a part file for every segment in flight, and after a Ctrl-C
+	// there is one folder to resume from. The folder is deleted once the mux
+	// succeeds.
 	tempDir := engine.TempDir(outPath, o.tempDir)
 	adoptOldTempFiles(outPath, tempDir)
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
@@ -533,20 +543,22 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	type done struct {
 		st     *manifest.Stream
 		path   string
-		failed bool // a subtitle whose download failed — skipped, not fatal
+		failed bool // a subtitle whose download failed; skipped, and the run goes on
 	}
 	var results []done
 	for _, st := range selected {
 		results = append(results, done{st: st, path: engine.TempStreamPath(tempDir, st, source.RawExt(st))})
 	}
-	// Stream scheduling. A stream's segments are latency-bound when small
-	// (subtitles: thousands of ~byte-sized segments) and bandwidth-bound when
-	// large (video). With only a few streams running at once, the many tiny
-	// subtitle streams serialize into batches and their round-trip latency piles
-	// up *after* the video finishes — a 5–6s tail on a 41-min asset. So run many
-	// streams concurrently, but cap each subtitle stream to a few workers: a
-	// handful hides its latency, and the cap keeps total in-flight requests
-	// bounded (streamPar × workers) even with 25 subtitle tracks and a big -t.
+	// How the streams are scheduled. Small segments (subtitles: thousands of tiny
+	// segments, a few bytes each) are bound by latency, the time one request
+	// takes to come back. Large segments (video) are bound by bandwidth. With
+	// only a few streams running at once, the many tiny subtitle streams run in
+	// batches, one after another, and their round trips add up after the video
+	// is done: a 5 to 6 second tail on a 41 minute asset. So run many streams at
+	// the same time, but cap each subtitle stream at a few workers. A handful of
+	// workers hides the latency, and the cap keeps the total number of requests
+	// in flight bounded (streamPar times the workers per stream) even with 25
+	// subtitle tracks and a big -t.
 	const subWorkerCap = 16
 	streamPar := 1
 	if o.multiTracks {
@@ -563,7 +575,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	tDownload := time.Now()
 	for i := range results {
 		r := &results[i]
-		stCfg := cfg // per-stream copy (shares Client/Progress pointers)
+		stCfg := cfg // a copy per stream (Client and Progress pointers are shared)
 		if r.st.Type == manifest.Subtitles && (stCfg.Threads == 0 || stCfg.Threads > subWorkerCap) {
 			stCfg.Threads = subWorkerCap
 		}
@@ -573,10 +585,11 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 				refresh = nil
 			}
 			if err := engine.DownloadStream(gctx, stCfg, r.st, r.path, refresh); err != nil {
-				// Subtitles are optional: a broken track (Disney+ ships dummy
-				// placeholder subtitle tracks, some CDNs 404 a language) must not
-				// sink a finished video+audio download. Skip it with a warning.
-				// Video/audio failures stay fatal — there's no output without them.
+				// Subtitles are optional. A broken track (Disney+ ships dummy
+				// placeholder subtitle tracks, and some CDNs answer 404 for a
+				// language) must not ruin a finished video and audio download, so
+				// skip it with a warning. A video or audio failure is still fatal,
+				// because there is no output without them.
 				if r.st.Type == manifest.Subtitles {
 					r.failed = true
 					j.warn("subtitle %s failed to download (%v); skipping it", r.st.ID, err)
@@ -595,15 +608,15 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		return err
 	}
 
-	// subtitles: normalize raw payloads into srt/vtt
+	// Subtitles: convert the raw payloads into srt or vtt files.
 	var muxInputs []mux.Input
-	var sidecars []string             // -sub-external: files written beside output
-	wentExternal := map[string]bool{} // raw paths whose subtitle became a sidecar
-	subSidecars := map[string]bool{}  // sidecar paths already used (collision guard)
-	keepRaw := map[string]bool{}      // conversion/placement failures must remain recoverable
+	var sidecars []string             // -sub-external: files written next to the output
+	wentExternal := map[string]bool{} // raw paths whose subtitle became a sidecar file
+	subSidecars := map[string]bool{}  // sidecar paths already taken (no two tracks share a name)
+	keepRaw := map[string]bool{}      // a failed conversion or move keeps its raw file for recovery
 	for _, r := range results {
 		if r.failed {
-			continue // subtitle that failed to download — already warned
+			continue // a subtitle that failed to download; already warned about
 		}
 		if r.st.Type != manifest.Subtitles {
 			muxInputs = append(muxInputs, mux.Input{
@@ -629,7 +642,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 			sidecars = append(sidecars, sidecar)
 			wentExternal[r.path] = true
 			if !o.keepTemp {
-				os.Remove(r.path) // raw payload superseded by the sidecar
+				os.Remove(r.path) // the sidecar replaces the raw payload
 			}
 			j.say("subtitle: %s", sidecar)
 			continue
@@ -654,8 +667,8 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		return nil
 	}
 
-	// Nothing to mux (e.g. subtitles-only with -sub-external): the sidecars are
-	// already written, so finish without invoking ffmpeg.
+	// Nothing to mux (for example subtitles only with -sub-external). The
+	// sidecar files are already written, so finish without running ffmpeg.
 	if len(muxInputs) == 0 {
 		if len(sidecars) == 0 {
 			return fmt.Errorf("no streams selected to write")
@@ -676,18 +689,19 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		for _, in := range muxInputs {
 			temporary = append(temporary, in.Path)
 		}
-		for _, r := range results { // raw subtitle payloads too
+		for _, r := range results { // the raw subtitle payloads too
 			temporary = append(temporary, r.path)
 		}
 		cleanupTempFiles(temporary, keepRaw)
-		os.Remove(tempDir) // stays if a raw subtitle was kept for recovery
+		os.Remove(tempDir) // the folder stays if a raw subtitle was kept for recovery
 	}
 	j.say("%s %s%s", ui.Paint(ui.Green, "done:"), outPath, j.summary(prog, outPath))
 	return nil
 }
 
-// summary is the " (size, elapsed at speed)" suffix of a "done" line. A
-// playlist's shared Progress mixes several titles, so there is none for those.
+// summary returns the " (size, elapsed at speed)" suffix of a "done" line. A
+// playlist's shared Progress mixes several titles, so playlist entries get no
+// suffix.
 func (j job) summary(prog *engine.Progress, outPath string) string {
 	if j.prog != nil {
 		return ""
@@ -699,11 +713,11 @@ func (j job) summary(prog *engine.Progress, outPath string) string {
 	return " (" + prog.Summary(size) + ")"
 }
 
-// adoptOldTempFiles moves the temp files an older m314dl left beside the output
-// (movie.m314dl-video-1.mp4, its .part files and its checkpoint) into the
-// download's folder, so a download started before the folder existed still
-// resumes after an upgrade. The old names were the folder's name plus a dash
-// plus today's file name, so stripping that prefix is the whole rename.
+// adoptOldTempFiles moves the temp files an older m314dl left next to the
+// output (movie.m314dl-video-1.mp4, its .part files and its checkpoint) into
+// the download's folder, so a download started before the folder existed
+// still resumes after an upgrade. An old name was the folder's name, a dash
+// and today's file name, so cutting that prefix off is the whole rename.
 func adoptOldTempFiles(outPath, tempDir string) {
 	dir := filepath.Dir(outPath)
 	prefix := strings.TrimSuffix(filepath.Base(outPath), filepath.Ext(outPath)) + ".m314dl-"
@@ -723,8 +737,9 @@ func adoptOldTempFiles(outPath, tempDir string) {
 	}
 }
 
-// cleanupTempFiles removes only superseded downloads, never raw subtitles
-// whose conversion failed (the warning promises those files are recoverable).
+// cleanupTempFiles removes the temp files that are no longer needed. It keeps
+// a raw subtitle whose conversion failed, because the warning promised that
+// file can be recovered.
 func cleanupTempFiles(paths []string, preserve map[string]bool) {
 	for _, path := range paths {
 		if !preserve[path] {
@@ -733,10 +748,11 @@ func cleanupTempFiles(paths []string, preserve map[string]bool) {
 	}
 }
 
-// interruptHandler makes the first Ctrl-C/SIGTERM stop the download cleanly — a
-// live recording finishes up (stopLive closed), a VOD cancels so the next run
-// resumes — and a second one abort outright. Installed once per process: a
-// playlist installs it for the whole batch, and its entries' calls are no-ops.
+// interruptHandler makes the first Ctrl-C or SIGTERM stop the download
+// cleanly: a live recording finishes up (stopLive is closed), and a VOD
+// download cancels so the next run can resume. A second signal aborts at
+// once. The handler is installed once per process: a playlist installs it for
+// the whole batch, and the calls from its entries do nothing.
 func interruptHandler(live bool, stopLive chan struct{}, cancel context.CancelFunc) {
 	interruptOnce.Do(func() { installInterruptHandler(live, stopLive, cancel) })
 }
@@ -749,11 +765,12 @@ func installInterruptHandler(live bool, stopLive chan struct{}, cancel context.C
 	go func() {
 		<-sigCh
 		if live {
-			// live: stop discovering, drain pipeline, mux what we have
+			// live: stop looking for new segments, finish the ones in flight, and
+			// mux what we have
 			fmt.Fprintln(os.Stderr, "\n"+ui.Paint(ui.Yellow, "interrupt: finishing recording (press again to abort)"))
 			close(stopLive)
 		} else {
-			// VOD: cancel now; resume state lets the next run continue
+			// VOD: cancel now; the saved resume state lets the next run carry on
 			fmt.Fprintln(os.Stderr, "\n"+ui.Paint(ui.Yellow, "interrupt: stopping (rerun the same command to resume)"))
 			cancel()
 		}
@@ -764,10 +781,10 @@ func installInterruptHandler(live bool, stopLive chan struct{}, cancel context.C
 	}()
 }
 
-// downloadFile writes a direct file straight to its output path: no stream
-// selection, no temp file, no mux — the bytes are the deliverable. -o is used
-// as given (no container extension is forced); otherwise the server's or the
-// URL's filename, extension and all.
+// downloadFile writes a direct file straight to its output path. There is no
+// stream selection, no temp file and no mux, because the bytes themselves are
+// the result. -o is used as given (no container extension is forced). Without
+// -o the name comes from the server or the URL, extension included.
 func (j job) downloadFile(ctx context.Context, cancel context.CancelFunc, st *manifest.Stream) error {
 	o := j.o
 	outPath := o.output
@@ -784,9 +801,9 @@ func (j job) downloadFile(ctx context.Context, cancel context.CancelFunc, st *ma
 	}
 	j.say("file: %s (%s)", outPath, size)
 	interruptHandler(false, nil, cancel)
-	// The output file is written in place, so only its in-flight chunks need a
-	// home. They go in the same kind of folder a stream download uses, gone
-	// once the file is complete.
+	// The output file is written in place, so only the chunks still in flight
+	// need somewhere to live. They go in the same kind of folder a stream
+	// download uses, and the folder is removed once the file is complete.
 	tempDir := engine.TempDir(outPath, o.tempDir)
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		return err
@@ -805,8 +822,9 @@ func (j job) downloadFile(ctx context.Context, cancel context.CancelFunc, st *ma
 	return nil
 }
 
-// sidecarSubPath builds "<output-basename>.<lang>.<fmt>" next to the output,
-// disambiguating with the stream name/ID when a language repeats.
+// sidecarSubPath builds "<output-basename>.<lang>.<fmt>" next to the output.
+// When a language appears twice, the stream name or ID is added to tell the
+// files apart.
 func sidecarSubPath(outPath string, st *manifest.Stream, format string, used map[string]bool) string {
 	base := strings.TrimSuffix(outPath, filepath.Ext(outPath))
 	tag := st.Language
@@ -824,8 +842,9 @@ func sidecarSubPath(outPath string, st *manifest.Stream, format string, used map
 	return cand
 }
 
-// startUpdateCheck kicks off a background GitHub version check unless disabled,
-// returning a channel that yields a newer tag (or "" / nil when off).
+// startUpdateCheck starts a GitHub version check in the background, unless the
+// check is disabled. It returns a channel that delivers the newer tag, or ""
+// when there is none. When the check is off it returns nil.
 func startUpdateCheck(o *options) <-chan string {
 	if o.noUpdateCheck || os.Getenv("M314DL_NO_UPDATE_CHECK") != "" {
 		return nil
@@ -843,9 +862,9 @@ func startUpdateCheck(o *options) <-chan string {
 	return ch
 }
 
-// printUpdateNotice prints the "new version" line if the check found one, but
-// waits only briefly so a slow network never holds up exit — a check that
-// hasn't finished simply reports next run.
+// printUpdateNotice prints the "new version" line if the check found one. It
+// waits only briefly, so a slow network never holds up the exit. A check that
+// has not finished in time reports on the next run instead.
 func printUpdateNotice(ch <-chan string) {
 	if ch == nil {
 		return
@@ -859,9 +878,9 @@ func printUpdateNotice(ch <-chan string) {
 	}
 }
 
-// readCurlSource resolves the -curl value: "-" reads stdin, an existing file is
-// read, and anything else is treated as the curl command itself (so a shell
-// heredoc, a saved file, or an inline string all work).
+// readCurlSource reads the -curl value. "-" reads stdin, a path to an existing
+// file reads that file, and anything else is taken as the curl command itself.
+// So a shell heredoc, a saved file, or a string on the command line all work.
 func readCurlSource(v string) (string, error) {
 	if v == "-" {
 		b, err := io.ReadAll(os.Stdin)
@@ -897,7 +916,7 @@ func outputPath(out, inputURL string, live bool) string {
 	return name + ".mp4"
 }
 
-// convertSubtitle normalizes a raw subtitle stream file to srt/vtt.
+// convertSubtitle converts a raw subtitle stream file to srt or vtt.
 func convertSubtitle(rawPath, format, ffmpeg string) (string, error) {
 	b, err := os.ReadFile(rawPath)
 	if err != nil {
@@ -914,8 +933,9 @@ func convertSubtitle(rawPath, format, ffmpeg string) (string, error) {
 		if !errors.Is(err, mp4.ErrTrackNotFound) {
 			return "", fmt.Errorf("wvtt extraction: %w", err)
 		}
-		// stpp: TTML documents live in mdat — extract natively (ffmpeg has
-		// no TTML decoder)
+		// stpp: the TTML documents sit inside the mdat box (the part of the
+		// MP4 that holds the media data). Extract them here, because ffmpeg
+		// has no TTML decoder.
 		if mdat := subs.ExtractMdat(b); subs.IsTTMLPayload(mdat) {
 			b = mdat
 			kind = subs.KindTTML
@@ -925,8 +945,9 @@ func convertSubtitle(rawPath, format, ffmpeg string) (string, error) {
 		if ffmpeg == "" {
 			return "", errors.New("fMP4 subtitles need ffmpeg")
 		}
-		// Native paths above handle wvtt and TTML. Leave other subtitle codecs
-		// to ffmpeg's content probe; never rename away the recoverable raw file.
+		// The code above handles wvtt and TTML itself. Other subtitle codecs are
+		// left to ffmpeg, which probes the content. Never rename the raw file
+		// away, so it stays recoverable.
 		if err := mux.ExtractSubtitle(ffmpeg, rawPath, outPath); err != nil {
 			return "", err
 		}

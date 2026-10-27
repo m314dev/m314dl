@@ -15,9 +15,10 @@ import (
 	"github.com/m314dev/m314dl/internal/manifest"
 )
 
-// onDemandFile is a fake SegmentBase media file: 100 bytes of "init", a sidx
-// describing three subsegments (sizes 300/200/100, durations 6/6/3 s at 1000),
-// then the subsegment bytes. Returns the file and the sidx byte range.
+// onDemandFile builds a fake SegmentBase media file: 100 bytes of "init", a
+// sidx describing three subsegments (sizes 300/200/100 bytes, durations 6/6/3
+// seconds at timescale 1000), then the subsegment bytes. It returns the file
+// and the sidx byte range.
 func onDemandFile() ([]byte, string) {
 	be32 := func(v uint32) []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, v); return b }
 	refs := [][2]uint32{{300, 6000}, {200, 6000}, {100, 3000}}
@@ -54,8 +55,8 @@ func TestExpandIndexedSplitsSegmentBaseBySidx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Two periods slicing the same file (MAX-style) merge into one track with
-	// two whole-file placeholders; expansion must index the file once.
+	// Two periods slicing the same file (as MAX does) merge into one track with
+	// two whole-file placeholders. Expansion must index the file only once.
 	mpd := `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT30S">
 	<Period id="0" duration="PT15S"><AdaptationSet mimeType="video/mp4">
 	 <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc" cenc:default_KID="00112233-4455-6677-8899-aabbccddeeff" xmlns:cenc="urn:mpeg:cenc:2013"/>
@@ -105,8 +106,8 @@ func TestExpandIndexedSplitsSegmentBaseBySidx(t *testing.T) {
 	if st.Init == nil || st.Init.Range == nil || st.Init.Range.End != 99 {
 		t.Fatalf("init = %+v", st.Init)
 	}
-	// The byte ranges tile the media exactly: fetching them back yields the
-	// three marker runs.
+	// The byte ranges cover the media exactly, with no gaps or overlaps: reading
+	// them back yields the three marker runs.
 	for i, s := range st.Segments {
 		got := file[s.Range.Start : s.Range.End+1]
 		if got[0] != byte('a'+i) || got[len(got)-1] != byte('a'+i) {
@@ -116,13 +117,13 @@ func TestExpandIndexedSplitsSegmentBaseBySidx(t *testing.T) {
 }
 
 func TestExpandIndexedLeavesTemplateStreamsUntouched(t *testing.T) {
-	// A template/timeline stream (no SegmentBase placeholder) must pass through
-	// unchanged — same segments, same Seq, and no network fetch.
+	// A template or timeline stream (no SegmentBase placeholder) must pass through
+	// unchanged: same segments, same Seq, and no network fetch.
 	st := &manifest.Stream{Segments: []manifest.Segment{
 		{URL: "a.m4s", Seq: 7, Duration: 6},
 		{URL: "b.m4s", Seq: 8, Duration: 6},
 	}}
-	client, _ := httpx.New(httpx.Options{}) // never used: no Index → no fetch
+	client, _ := httpx.New(httpx.Options{}) // never used: no Index means no fetch
 	if err := ExpandIndexed(context.Background(), client, st, func(string, ...any) {}); err != nil {
 		t.Fatal(err)
 	}

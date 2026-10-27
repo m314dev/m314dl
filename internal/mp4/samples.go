@@ -11,8 +11,9 @@ import (
 // ErrTrackNotFound means the init has no sample entry for the requested codec.
 var ErrTrackNotFound = errors.New("mp4: requested sample entry not found")
 
-// TimedSample references one clear sample in the input buffer. Times are in
-// seconds on the media timeline (including any trun composition offset).
+// TimedSample points at one unencrypted sample in the input buffer. Start and
+// End are seconds on the media timeline, with any trun composition offset
+// already applied.
 type TimedSample struct {
 	Start, End float64
 	Data       []byte
@@ -31,10 +32,12 @@ func boxes(buf []byte) ([]box, error) {
 	return result, err
 }
 
-// WalkSamples walks a single codec track in a concatenated init + fragments.
-// It honors tfhd/trex defaults, multiple truns, signed data offsets and tfdt
-// v0/v1. Samples must fall inside an mdat, never inside neighboring headers.
-// No media bytes are copied. This intentionally does not demux flat MP4/stbl.
+// WalkSamples visits every sample of one codec's track in a buffer that holds
+// an init segment followed by its fragments. It handles default values from
+// tfhd and trex, several truns per traf, signed data offsets, and both tfdt
+// versions (v0 and v1). A sample must lie inside an mdat box; one that would
+// land in a neighbouring header is an error. No media bytes are copied. Flat
+// (non-fragmented) MP4 with an stbl sample table is not supported, on purpose.
 func WalkSamples(data []byte, codec string, yield func(TimedSample) error) error {
 	top, err := boxes(data)
 	if err != nil {
@@ -233,7 +236,9 @@ func findSampleTrack(moov []byte, codec string) (*sampleTrack, error) {
 	return result, nil
 }
 
-// Both tkhd's track_ID and mdhd's timescale follow creation/modification time.
+// timeHeaderField reads the 32-bit field that comes right after the creation
+// and modification times. In a tkhd that field is track_ID; in an mdhd it is
+// timescale.
 func timeHeaderField(payload []byte) (uint32, error) {
 	v, _, rest, err := fullBox(payload)
 	if err != nil {
@@ -275,8 +280,9 @@ func walkSampleRun(data []byte, mdats []box, trun box, base int64, pos *int64, d
 	if r.err != nil {
 		return r.err
 	}
-	// Every supported sample occupies at least one byte; this also bounds work
-	// for a corrupt count with default sample sizes and no per-sample fields.
+	// Every sample we accept takes at least one byte, so the count can never be
+	// larger than the input. This also caps the work done for a corrupt count
+	// when sizes come from defaults and the trun has no per-sample fields.
 	if uint64(count) > uint64(len(data)) {
 		return fmt.Errorf("mp4: unreasonable sample count")
 	}
@@ -309,8 +315,9 @@ func walkSampleRun(data []byte, mdats []box, trun box, base int64, pos *int64, d
 			return fmt.Errorf("mp4: sample outside input")
 		}
 		end := *pos + int64(size)
-		// mdat boxes are ordered by file offset. Avoid scanning every earlier
-		// fragment for every sample on subtitle tracks with thousands of parts.
+		// mdat boxes are sorted by file offset, so a binary search finds the one
+		// that may hold this sample. Scanning every earlier fragment for every
+		// sample would be slow on subtitle tracks with thousands of parts.
 		idx := sort.Search(len(mdats), func(i int) bool { return mdats[i].off > *pos }) - 1
 		inside := idx >= 0 && *pos >= mdats[idx].off+mdats[idx].hdrLen && end <= mdats[idx].off+mdats[idx].hdrLen+int64(len(mdats[idx].payload))
 		if !inside {
@@ -345,7 +352,8 @@ func (r *sampleReader) u32() uint32 {
 }
 func (r *sampleReader) u64() uint64 { hi, lo := r.u32(), r.u32(); return uint64(hi)<<32 | uint64(lo) }
 
-// WalkBoxes exposes payloads without copying, for codec-specific sample boxes.
+// WalkBoxes calls yield with the type and payload of each top-level box in
+// data, without copying. Codec-specific code uses it to read sample boxes.
 func WalkBoxes(data []byte, yield func(typ string, payload []byte) error) error {
 	var visitErr error
 	err := walk(data, func(b box) bool { visitErr = yield(b.typ, b.payload); return visitErr == nil })

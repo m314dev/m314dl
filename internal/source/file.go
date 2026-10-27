@@ -17,29 +17,30 @@ import (
 	"github.com/m314dev/m314dl/internal/mss"
 )
 
-// A plain file (mp4, mkv, zip, iso, …) is downloaded by the same pipeline as a
-// stream: one "stream" whose segments are consecutive byte ranges of the
-// object, fetched in parallel and concatenated in order.
+// A plain file (mp4, mkv, zip, iso, and so on) goes through the same pipeline
+// as a stream: one "stream" whose segments are consecutive byte ranges of the
+// file, fetched in parallel and joined back together in order.
 
 const (
-	// fileChunk is the byte-range slice size. 4 MiB amortizes the per-request
-	// cost (TCP ramp-up, headers, a part file, a checkpoint write) to well under
-	// 1% at CDN speeds, keeps the ordered writer's peak memory at one slice, and
-	// lets a 256 MiB file already occupy all 64 adaptive workers. Files that
-	// would need more than fileMaxChunks slices get proportionally bigger ones
-	// so the slice count — and the progress "segs" figure — stays readable.
+	// fileChunk is the size of one byte-range slice. At 4 MiB the per-request
+	// cost (TCP ramp-up, headers, a part file, a checkpoint write) stays well
+	// under 1% at CDN speeds, the ordered writer holds at most one slice in
+	// memory, and a 256 MiB file already keeps all 64 adaptive workers busy.
+	// A file that would need more than fileMaxChunks slices gets bigger ones
+	// instead, so the slice count (and the "segs" figure in the progress line)
+	// stays readable.
 	fileChunk     = 4 << 20
 	fileMaxChunks = 4096
-	// fileMaxSniff is how much textual body LoadManifest is willing to read to
-	// look for a manifest or scrape a page; a text body bigger than any
-	// playlist or web page is a file.
+	// fileMaxSniff is the most text LoadManifest will read while looking for a
+	// manifest or scraping a page. A text body bigger than any playlist or web
+	// page is treated as a file.
 	fileMaxSniff = 32 << 20
 	// FileKind is the kind LoadManifest returns for a direct file.
 	FileKind = "file"
 )
 
-// planChunks splits size bytes into consecutive inclusive ranges covering
-// [0, size).
+// planChunks splits size bytes into consecutive byte ranges (both ends
+// inclusive) that together cover [0, size).
 func planChunks(size int64) []manifest.ByteRange {
 	c := int64(fileChunk)
 	if n := (size + c - 1) / c; n > fileMaxChunks {
@@ -56,18 +57,18 @@ func planChunks(size int64) []manifest.ByteRange {
 	return out
 }
 
-// isDirectFile decides from the response headers and the first bytes of the
-// body whether the input is a file to download as-is, rather than a manifest
-// or a web page to scrape. A manifest is always text, so a binary body can't
-// be one; a text body stays on the manifest/scrape path (a JSON or plain
-// endpoint may well carry stream URLs) unless it's served as an attachment or
-// is far too big to be a playlist or page.
+// isDirectFile looks at the response headers and the first bytes of the body
+// and decides whether the input is a file to download as is, or a manifest or
+// web page to scrape. A manifest is always text, so a binary body cannot be
+// one. A text body stays on the manifest/scrape path (a JSON or plain text
+// endpoint may well carry stream URLs) unless it is served as an attachment or
+// is far too big to be a playlist or a page.
 func isDirectFile(resp *http.Response, head []byte) bool {
 	// A body that is itself a manifest is never a direct file, whatever the
-	// headers claim. Some CDNs force-download playlists with
+	// headers claim. Some CDNs force a download of playlists with
 	// Content-Disposition: attachment (Tencent COS sets it on every object),
-	// which would otherwise save the raw .m3u8/.mpd as the "download". Sniff
-	// the bytes, which are decisive, before trusting the header.
+	// which would otherwise save the raw .m3u8 or .mpd as the "download". The
+	// bytes settle the question, so check them before trusting the header.
 	if hls.IsHLS(head) || dash.IsDASH(head) || mss.IsMSS(head) {
 		return false
 	}
@@ -88,12 +89,13 @@ func isHTML(contentType string) bool {
 	return mt == "text/html" || mt == "application/xhtml+xml"
 }
 
-// fileName picks the output filename: the Content-Disposition filename, else
-// the final URL's basename — or the given URL's, when a redirect landed on an
-// opaque token path with no extension (IPTV panels, signed CDNs) and the given
-// URL names the file. That name is also stable across runs, which resume needs:
-// the token changes every time. Reduced to a bare basename so a hostile header
-// can't point outside the output directory.
+// fileName picks the output filename. It uses the Content-Disposition filename
+// when there is one, else the last path element of the final URL. When a
+// redirect landed on an opaque token path with no extension (IPTV panels,
+// signed CDNs) and the given URL names the file, the given URL's name wins.
+// That name is also the same on every run, which resume needs, since the token
+// changes every time. The result is cut down to a bare basename so a hostile
+// header cannot point outside the output directory.
 func fileName(resp *http.Response, inputURL, finalURL string) string {
 	name := ""
 	if _, params, err := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); err == nil {
@@ -124,14 +126,15 @@ func urlBase(s string) string {
 	return path.Base(u.Path)
 }
 
-// fileMaster builds the single-stream master for a direct file. When the
-// length is known and a byte-range probe is honored, the stream is the object
-// sliced into ranges; otherwise (unknown/chunked length, ranges ignored, or a
-// file no bigger than one slice) it is one whole-object segment, which the
-// engine streams on a single connection with byte-offset resume.
+// fileMaster builds the one-stream master for a direct file. When the length
+// is known and the server honors a byte-range probe, the stream is the file
+// sliced into ranges. Otherwise (unknown or chunked length, ranges ignored, or
+// a file no bigger than one slice) it is a single whole-file segment, which
+// the engine streams on one connection and resumes by byte offset.
 //
-// PlaylistURL is the URL as given, before redirects: re-requesting it mints a
-// fresh redirect token when the one in finalURL expires mid-download.
+// PlaylistURL is the URL as given, before redirects: requesting it again
+// yields a fresh redirect token when the one in finalURL expires during the
+// download.
 func fileMaster(ctx context.Context, client *httpx.Client, resp *http.Response, inputURL, finalURL string, logv func(string, ...any)) *manifest.Master {
 	st := &manifest.Stream{Type: manifest.Unknown, ID: "file", Name: fileName(resp, inputURL, finalURL), PlaylistURL: inputURL}
 	size := resp.ContentLength
@@ -151,10 +154,11 @@ func fileMaster(ctx context.Context, client *httpx.Client, resp *http.Response, 
 	return &manifest.Master{URL: finalURL, Streams: []*manifest.Stream{st}}
 }
 
-// rangesHonored asks for the object's first byte and checks the server slices:
-// a 206 whose Content-Range total matches the length. Trusting Accept-Ranges
-// alone is not enough — servers advertise it and then answer a ranged request
-// with the whole object, and others honor ranges without advertising.
+// rangesHonored asks for the file's first byte and checks that the server
+// really slices: a 206 status whose Content-Range total matches the length.
+// Trusting the Accept-Ranges header alone is not enough. Some servers
+// advertise it and then answer a ranged request with the whole file, and
+// others honor ranges without advertising them.
 func rangesHonored(ctx context.Context, client *httpx.Client, u string, size int64) bool {
 	resp, err := client.Open(ctx, u, "bytes=0-0")
 	if err != nil {
@@ -166,8 +170,8 @@ func rangesHonored(ctx context.Context, client *httpx.Client, u string, size int
 	return resp.StatusCode == http.StatusPartialContent && err == nil && start == 0 && end == 0 && total == size
 }
 
-// FileSize is a direct-file stream's length when its ranges make it known, -1
-// otherwise (single-connection stream).
+// FileSize returns a direct-file stream's length when its ranges make it
+// known, and -1 otherwise (a single-connection stream).
 func FileSize(st *manifest.Stream) int64 {
 	if n := len(st.Segments); n > 0 && st.Segments[n-1].Range != nil {
 		return st.Segments[n-1].Range.End + 1

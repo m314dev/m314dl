@@ -82,8 +82,8 @@ func TestProgressLogClearsStatusLine(t *testing.T) {
 	}
 }
 
-// On a terminal the line carries a bar, the projected size, the connection
-// count and the file name; piped, it keeps the parseable shape unchanged.
+// On a terminal the line has a bar, the projected size, the connection count
+// and the file name. Piped, it keeps the parseable shape unchanged.
 func TestProgressTerminalLine(t *testing.T) {
 	p := NewProgress(false, 0)
 	p.AddTotal(20)

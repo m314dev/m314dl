@@ -8,46 +8,47 @@ import (
 	"github.com/m314dev/m314dl/internal/engine"
 )
 
-// Continuous MPEG-TS output.
+// Continuous MPEG-TS (transport stream) output.
 //
-// A TS-input stream's segments are already MPEG-TS; concatenated in order they
-// ARE a valid continuous transport stream — no re-mux, no FFmpeg. The sink
+// A TS-input stream's segments are already MPEG-TS; joined in order they ARE a
+// valid continuous transport stream, with no re-mux and no FFmpeg. The sink
 // renumbers continuity counters across segment boundaries (the one genuinely
 // good idea in the drm worker's tscontinuity.go, applied where it belongs:
 // once, in-process, with no reconnect seam to bridge) and hands each whole
 // segment to a broadcaster that fans it out to every connected HTTP client.
 //
 // The broadcaster fixes the worker's worst flaw. There, a slow subscriber
-// stalled the producer — and therefore every other viewer — for up to two
-// seconds each, serially (audit #20). Here every send is non-blocking: a client
-// that falls a byte budget behind is dropped, and no one else ever waits on it.
+// stalled the producer, and so every other viewer, for up to two seconds
+// each, one after another (audit #20). Here every send is non-blocking: a
+// client that falls a byte budget behind is dropped, and no one else ever
+// waits on it.
 //
-// Publishing whole segments (not arbitrary byte chunks) is deliberate: each HLS
-// TS segment begins with PAT/PMT and is independently decodable, so a client
-// that joins mid-stream always starts on a clean, playable boundary.
+// Publishing whole segments instead of arbitrary byte chunks is deliberate:
+// each HLS TS segment begins with PAT/PMT and can be decoded on its own, so a
+// client that joins mid-stream always starts on a clean, playable boundary.
 
 // maxSubQueuedBytes is how many bytes a subscriber may have queued (published
 // but not yet written to its socket) before it is dropped. Slack must be
 // measured in bytes, not publish units: the remux pump publishes whatever each
-// pipe read returned (often a few KB), so a unit-counted buffer collapsed to a
-// fraction of a second of slack and kicked every viewer within seconds. 32 MiB
-// is ~30-60s at typical bitrates — generous for a network hiccup, bounded so
-// one stuck client can't grow memory without limit. A var so tests can shrink
-// it.
+// pipe read returned (often a few KB), so a buffer counted in units collapsed
+// to a fraction of a second of slack and kicked every viewer within seconds.
+// 32 MiB is about 30-60s at typical bitrates: generous for a network hiccup,
+// bounded so one stuck client cannot grow memory without limit. A var so tests
+// can shrink it.
 var maxSubQueuedBytes = int64(32 << 20)
 
-// tsSubChanCap sizes each subscriber's channel. Large enough that the byte
-// budget, not the slot count, is what triggers a kick even for small chunks;
-// it only bounds slice headers (~24B each), not payload.
+// tsSubChanCap sizes each subscriber's channel. It is large enough that the
+// byte budget, and not the slot count, is what triggers a kick even for small
+// chunks. It only bounds the slice headers (~24B each), not the payload bytes.
 const tsSubChanCap = 4096
 
 // TSBroadcaster fans one ordered segment stream out to many HTTP subscribers.
-// publish is called by exactly one producer goroutine (the TSSink writer or
-// the remux pump).
+// Exactly one producer goroutine (the TSSink writer or the remux pump) calls
+// publish.
 type TSBroadcaster struct {
 	mu   sync.RWMutex
 	subs map[*tsSub]struct{}
-	last []byte // most recent published unit, primed into new subscribers
+	last []byte // most recent published unit, handed to new subscribers first
 	done chan struct{}
 
 	segments atomic.Int64
@@ -55,7 +56,7 @@ type TSBroadcaster struct {
 }
 
 // tsSub is one connected client. data carries whole publish units (shared,
-// never mutated after publish); queued tracks the bytes in data not yet taken
+// never changed after publish); queued tracks the bytes in data not yet taken
 // by the handler; kicked closes when the client falls too far behind.
 type tsSub struct {
 	data   chan []byte
@@ -69,9 +70,9 @@ func NewTSBroadcaster() *TSBroadcaster {
 
 // Subscribe registers a client. The caller must Unsubscribe when it
 // disconnects. The new subscriber is primed with the most recent published
-// unit so a joiner has something to decode immediately instead of waiting up
-// to a whole segment interval for the first byte; holding b.mu across prime
-// and registration keeps the sequence gapless against a concurrent publish.
+// unit, so a joiner has something to decode at once instead of waiting up to a
+// whole segment interval for the first byte. Holding b.mu across the prime and
+// the registration keeps the sequence gapless against a concurrent publish.
 func (b *TSBroadcaster) Subscribe() *tsSub {
 	s := &tsSub{data: make(chan []byte, tsSubChanCap), kicked: make(chan struct{})}
 	b.mu.Lock()
@@ -91,9 +92,9 @@ func (b *TSBroadcaster) Unsubscribe(s *tsSub) {
 }
 
 // publish hands one segment to every subscriber without ever blocking. A
-// subscriber over its byte budget has fallen too far behind: it is kicked (a
-// clean disconnect) rather than dropped-from, because losing bytes mid-TS
-// corrupts the stream for that viewer. The producer never waits.
+// subscriber over its byte budget has fallen too far behind. It is kicked (a
+// clean disconnect) rather than having units dropped, because losing bytes
+// mid-TS corrupts the stream for that viewer. The producer never waits.
 func (b *TSBroadcaster) publish(seg []byte) {
 	b.segments.Add(1)
 	b.bytes.Add(int64(len(seg)))
@@ -109,14 +110,14 @@ func (b *TSBroadcaster) publish(seg []byte) {
 		case s.data <- seg:
 			s.queued.Add(int64(len(seg)))
 		default:
-			b.kickLocked(s) // slot count exhausted (pathologically small chunks)
+			b.kickLocked(s) // slot count used up (extremely small chunks)
 		}
 	}
 }
 
 // kickLocked disconnects a lagging subscriber and removes it from the fan-out,
-// so no further (now gapped, hence corrupt) units are queued to it. Caller
-// holds b.mu.
+// so no further units are queued to it (they would now follow a gap, so they
+// would be corrupt). Caller holds b.mu.
 func (b *TSBroadcaster) kickLocked(s *tsSub) {
 	select {
 	case <-s.kicked:
@@ -175,7 +176,7 @@ func fmtBytes(n int64) string {
 // ─── sink ────────────────────────────────────────────────────────────────────
 
 // TSSink implements engine.Sink for continuous MPEG-TS output: it renumbers
-// each segment's continuity counters into one seamless sequence, then publishes
+// each segment's continuity counters into one unbroken sequence, then publishes
 // the whole segment to the broadcaster.
 type TSSink struct {
 	b  *TSBroadcaster
@@ -186,7 +187,8 @@ func NewTSSink(b *TSBroadcaster) *TSSink {
 	return &TSSink{b: b, cc: ccRewriter{next: map[uint16]byte{}}}
 }
 
-// Init is never called for a TS stream (no init segment); satisfy the interface.
+// Init is never called for a TS stream (there is no init segment). It exists
+// only to satisfy the interface.
 func (s *TSSink) Init(_ []byte) error { return nil }
 
 func (s *TSSink) Segment(_ engine.SegmentInfo, data []byte) error {
@@ -201,18 +203,18 @@ func (s *TSSink) Segment(_ engine.SegmentInfo, data []byte) error {
 const tsPacketSize = 188
 
 // ccRewriter renumbers the 4-bit continuity counter of every payload-bearing TS
-// packet into one continuous per-PID sequence across all segments. A player
-// treats a CC jump as lost media and stalls to resync; independently-muxed
-// source segments often restart their counters, so renumbering across the
-// boundary is what makes concatenation seamless. State persists for the life of
-// the stream — that is the whole point.
+// packet into one continuous sequence per PID (packet id) across all segments.
+// A player treats a jump in the counter as lost media and stalls to resync.
+// Source segments that were muxed on their own often restart their counters,
+// so renumbering across the boundary is what lets the joined stream play
+// without a break. State persists for the life of the stream on purpose.
 type ccRewriter struct {
 	next map[uint16]byte
 }
 
 // rewrite patches seg in place. It processes whole 188-byte packets from the
 // first sync byte; a segment that is not 188-aligned has its trailing bytes
-// left untouched rather than corrupted.
+// left alone rather than corrupted.
 func (c *ccRewriter) rewrite(seg []byte) {
 	for off := 0; off+tsPacketSize <= len(seg); off += tsPacketSize {
 		if seg[off] != 0x47 {

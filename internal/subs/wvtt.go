@@ -11,9 +11,10 @@ import (
 	"github.com/m314dev/m314dl/internal/mp4"
 )
 
-// ParseWVTT reads MP4 WebVTT samples natively. Timing belongs to the MP4
-// sample table, not to the payl text; vtte gaps still advance that timeline.
-// Like plain VTT conversion, layout/styling is normalized to plain cue text.
+// ParseWVTT reads WebVTT cues stored as MP4 samples (the wvtt format). Cue
+// timing comes from the MP4 sample table; the payl text carries none of it.
+// Empty vtte samples mark gaps and still move that timeline forward. As with
+// plain VTT conversion, layout and styling are reduced to plain cue text.
 func ParseWVTT(data []byte) ([]Cue, error) {
 	var cues []Cue
 	type cueKey struct{ text, id, settings string }
@@ -40,7 +41,8 @@ func ParseWVTT(data []byte) ([]Cue, error) {
 					key.id = string(b)
 				case "sttg":
 					key.settings = string(b)
-					// ctim is the original cue time, not this sample's playback time.
+					// ctim is skipped: it holds the cue's original time, which is
+					// different from this sample's playback time.
 				}
 				return nil
 			}); err != nil {
@@ -53,7 +55,7 @@ func ParseWVTT(data []byte) ([]Cue, error) {
 				return nil
 			}
 			if i, ok := last[key]; ok && math.Abs(cues[i].End-sample.Start) < 1e-9 {
-				cues[i].End = sample.End // cue split over consecutive samples
+				cues[i].End = sample.End // the cue continues in the next sample; extend it
 			} else {
 				last[key] = len(cues)
 				cues = append(cues, Cue{Start: sample.Start, End: sample.End, Text: key.text})

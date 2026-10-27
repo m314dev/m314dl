@@ -53,7 +53,7 @@ func TestRPCAuthAndValidation(t *testing.T) {
 		t.Fatalf("id = %d, want 1", added["id"])
 	}
 
-	// /bin/echo exits immediately; wait for the reaper goroutine to mark it done.
+	// /bin/echo exits at once; wait for the reaper goroutine to mark the job done.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var v jobView
@@ -84,8 +84,9 @@ func TestRPCAdmissionCap(t *testing.T) {
 	}
 }
 
-// Finished jobs are reaped after the retention window, and IDs never reuse a
-// reaped id (monotonic), so a caller can't accidentally address a recycled job.
+// Finished jobs are reaped after the retention window, and a reaped id is never
+// handed out again (ids only go up), so a caller can never address a recycled
+// job by mistake.
 func TestRPCReapAndMonotonicIDs(t *testing.T) {
 	s := newRPCServer("/bin/echo", "", 64, time.Hour)
 
@@ -115,7 +116,7 @@ func TestRPCReapAndMonotonicIDs(t *testing.T) {
 		t.Fatalf("reaped job should 404, got %d", rec.Code)
 	}
 
-	// A new job gets id 2 — the reaped id 1 is never reused.
+	// A new job gets id 2; the reaped id 1 is never reused.
 	var second map[string]int64
 	json.Unmarshal(rpcPost(t, s, "/add", `{"url":"http://x/2"}`, "").Body.Bytes(), &second)
 	if second["id"] != 2 {
@@ -123,11 +124,11 @@ func TestRPCReapAndMonotonicIDs(t *testing.T) {
 	}
 }
 
-// stopAll signals every running child, so graceful shutdown actually stops
-// in-flight jobs instead of orphaning them.
+// stopAll signals every running child, so a graceful shutdown really stops the
+// jobs in flight and does not leave them as orphans.
 func TestRPCStopAll(t *testing.T) {
 	s := newRPCServer("/bin/sh", "", 4, time.Hour)
-	// A job that becomes `sleep 30`; a signal terminates it (no orphan).
+	// A job that becomes `sleep 30`; a signal ends it, so no orphan is left.
 	if rec := rpcPost(t, s, "/add", `{"url":"x","args":["-c","exec sleep 30"]}`, ""); rec.Code != 200 {
 		t.Fatalf("add: %d %s", rec.Code, rec.Body)
 	}

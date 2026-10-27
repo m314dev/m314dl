@@ -11,25 +11,26 @@ import (
 	"github.com/m314dev/m314dl/internal/engine"
 )
 
-// Cross-container remux to MPEG-TS via one long-lived FFmpeg.
+// Cross-container remux to MPEG-TS through one long-lived FFmpeg process.
 //
 // The pure-Go TS path (mpegts.go) only works when the source is already a muxed
-// transport stream. When it isn't — an fMP4/CMAF source, or separate video and
-// audio that must be muxed together — RemuxTS bridges the gap: it feeds each
+// transport stream. When it is not (an fMP4/CMAF source, or separate video and
+// audio that must be muxed together), RemuxTS fills the gap. It feeds each
 // ordered, decrypted input track into FFmpeg over its own pipe and reads one
-// continuous MPEG-TS off FFmpeg's stdout into the broadcaster.
+// continuous MPEG-TS from FFmpeg's stdout into the broadcaster.
 //
-// This is the deliberate, bounded use of FFmpeg the rest of the engine avoids,
-// and it keeps the properties that made the pure path good:
-//   - ONE process for the whole stream, not one per segment (the drm worker's
-//     per-segment spawn anti-pattern);
-//   - NO -re pacing — input arrives at the source's own segment cadence, so the
+// This is the one deliberate, bounded use of FFmpeg that the rest of the engine
+// avoids, and it keeps the properties that made the pure path good:
+//   - ONE process for the whole stream, instead of one per segment (the drm
+//     worker spawned one per segment, an anti-pattern);
+//   - NO -re pacing. Input arrives at the source's own segment cadence, so the
 //     output is paced without a wall-clock throttle;
-//   - FFmpeg only ever sees an already-decrypted, clear copy, so the mov-demuxer
-//     CENC leak that forced the worker to decrypt upstream never applies here.
+//   - FFmpeg only ever sees an already-decrypted, clear copy, so the
+//     mov-demuxer CENC (common encryption) leak that forced the worker to
+//     decrypt upstream never applies here.
 //
-// Default is stream copy (remux only). An explicit transcode arg list replaces
-// the copy codecs when a real re-encode is asked for.
+// The default is stream copy (remux only). An explicit transcode arg list
+// replaces the copy codecs when a real re-encode is asked for.
 
 const remuxReadChunk = 256 << 10 // read FFmpeg stdout in ~256KB chunks
 
@@ -43,9 +44,9 @@ type RemuxTS struct {
 	closed sync.Once
 }
 
-// NewRemuxTS starts the FFmpeg remuxer. ntracks input pipes are created and
-// exposed as pipe:3, pipe:4, … to the child; transcodeArgs (nil = stream copy)
-// replaces the output codec args.
+// NewRemuxTS starts the FFmpeg remuxer. It creates ntracks input pipes and
+// exposes them to the child as pipe:3, pipe:4, and so on. transcodeArgs
+// replaces the output codec args; nil means stream copy.
 func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadcaster, logv func(string, ...any)) (*RemuxTS, error) {
 	if ntracks < 1 {
 		return nil, fmt.Errorf("remux: no input tracks")
@@ -64,10 +65,11 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 		}
 		extra = append(extra, r)
 		inputs = append(inputs, w)
-		// -thread_queue_size well above FFmpeg's default of 8: with several input
-		// demuxers reading concurrently the default queue fills, FFmpeg logs
-		// "Thread message queue blocking", and can stall — the pipe writers then
-		// block with it. A deeper queue absorbs bursty per-input arrival.
+		// -thread_queue_size well above FFmpeg's default of 8. With several
+		// input demuxers reading at once the default queue fills up, FFmpeg
+		// logs "Thread message queue blocking" and can stall, and the pipe
+		// writers then block with it. A deeper queue absorbs bursty per-input
+		// arrival.
 		args = append(args, "-thread_queue_size", "512", "-i", fmt.Sprintf("pipe:%d", 3+i))
 	}
 	for i := 0; i < ntracks; i++ {
@@ -78,12 +80,13 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 	} else {
 		args = append(args, "-c", "copy")
 	}
-	// Bound the muxer backlog so a lagging input can't grow memory without limit
-	// on endless live input (the worker's -shortest never fires there either).
+	// Bound the muxer backlog so a lagging input cannot grow memory without
+	// limit on endless live input (the worker's -shortest never fires there
+	// either).
 	args = append(args, "-max_muxing_queue_size", "1024", "-f", "mpegts", "pipe:1")
 
 	cmd := exec.Command(ffmpeg, args...)
-	cmd.ExtraFiles = extra // r[0]→fd3, r[1]→fd4, …
+	cmd.ExtraFiles = extra // r[0] becomes fd 3, r[1] fd 4, …
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -94,8 +97,9 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start ffmpeg remux: %w", err)
 	}
-	// The child holds its own dups of the read ends; the parent must close them
-	// so an input pipe reaches EOF once we close its write end.
+	// The child holds its own copies (dups) of the read ends. The parent must
+	// close its copies so an input pipe reaches EOF once we close its write
+	// end.
 	for _, r := range extra {
 		r.Close()
 	}
@@ -105,9 +109,9 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 	return rm, nil
 }
 
-// pump reads the remuxed TS off FFmpeg and fans it out until FFmpeg exits.
-// Only whole 188-byte packets are published (the unaligned tail of a read is
-// carried into the next one): a subscriber joins the broadcast at a publish
+// pump reads the remuxed TS from FFmpeg and fans it out until FFmpeg exits.
+// Only whole 188-byte packets are published; the unaligned tail of a read is
+// carried into the next one. A subscriber joins the broadcast at a publish
 // boundary, and starting it mid-packet would feed the player torn TS.
 func (rm *RemuxTS) pump(stdout io.ReadCloser) {
 	buf := make([]byte, remuxReadChunk)
@@ -154,9 +158,10 @@ func (rm *RemuxTS) End() {
 
 func (rm *RemuxTS) StatusLine() string { return rm.b.StatusLine() }
 
-// remuxTrackSink writes one track's init + segments into its FFmpeg input pipe.
-// For fMP4 the init (ftyp+moov) is written first, then fragments — exactly a
-// fragmented-MP4 byte stream, which FFmpeg demuxes from the pipe.
+// remuxTrackSink writes one track's init and segments into its FFmpeg input
+// pipe. For fMP4 the init (ftyp+moov) is written first, then the fragments.
+// That is exactly a fragmented-MP4 byte stream, which FFmpeg demuxes from the
+// pipe.
 type remuxTrackSink struct{ w io.Writer }
 
 func (s remuxTrackSink) Init(data []byte) error {

@@ -8,17 +8,17 @@ import (
 	"testing"
 )
 
-// TestRedirectSendsNoReferer is a regression test for a live failure against a
-// real CDN, not a style preference.
+// TestRedirectSendsNoReferer is a regression test for a real failure seen
+// against a live CDN.
 //
 // Go's http.Client adds `Referer: <previous url>` to every request it makes
-// while following a redirect. Akamai's tokenized edge URLs reject a request
-// carrying one: the same live DASH manifest answered 200 fetched directly and
-// 403 fetched through Go's redirect, from the same address, the same second,
-// with otherwise identical headers.
+// while following a redirect. Akamai's edge URLs, which carry an access token,
+// reject a request with one: the same live DASH manifest answered 200 when
+// fetched directly and 403 when fetched through Go's redirect, from the same
+// address, in the same second, with otherwise identical headers.
 //
 // The symptom looked nothing like the cause. The 403 body parsed as a manifest
-// containing no PSSH, so a DRM channel silently never found a key.
+// with no PSSH, so a DRM channel silently never found a key.
 func TestRedirectSendsNoReferer(t *testing.T) {
 	var sawReferer string
 
@@ -58,8 +58,9 @@ func TestRedirectSendsNoReferer(t *testing.T) {
 	}
 }
 
-// TestRedirectLoopStops keeps the bound net/http applies by default, which
-// replacing CheckRedirect would otherwise silently remove.
+// TestRedirectLoopStops checks that the redirect limit net/http applies by
+// default is still in place. Replacing CheckRedirect would otherwise silently
+// remove it.
 func TestRedirectLoopStops(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/again", http.StatusFound)

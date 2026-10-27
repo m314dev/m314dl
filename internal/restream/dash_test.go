@@ -87,8 +87,8 @@ func TestDASHManifestVODCompletionPhases(t *testing.T) {
 	pub.End()
 
 	// 30s after start, 60s of media: the broadcast is still running. Served
-	// exactly like the growing phase — dynamic, minimumUpdatePeriod kept, and
-	// crucially NO mediaPresentationDuration (a static flip freezes mid-session
+	// exactly like the growing phase: dynamic, minimumUpdatePeriod kept, and
+	// above all NO mediaPresentationDuration (a static flip freezes mid-session
 	// dash.js; ffmpeg refuses a dynamic MPD carrying a duration).
 	clock = pub.start.Add(30 * time.Second)
 	m := string(pub.DASHManifest())
@@ -214,7 +214,7 @@ func TestDASHTimelineRunLengthSplits(t *testing.T) {
 	vs.Init([]byte("i"))
 	vs.Segment(engine.SegmentInfo{Duration: 4}, []byte("a"))
 	vs.Segment(engine.SegmentInfo{Duration: 4}, []byte("b"))
-	vs.Segment(engine.SegmentInfo{Duration: 2}, []byte("c")) // shorter → new run
+	vs.Segment(engine.SegmentInfo{Duration: 2}, []byte("c")) // shorter: starts a new run
 	pub.End()
 	pub.now = func() time.Time { return pub.start.Add(time.Hour) }
 

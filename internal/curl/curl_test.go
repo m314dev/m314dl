@@ -16,8 +16,8 @@ func TestParseCopyAsCurlHLS(t *testing.T) {
 	if u != "https://host.example/master.m3u8" {
 		t.Fatalf("url = %q", u)
 	}
-	// header key is canonicalized; the value (with its inner double quotes from
-	// the single-quoted arg) is preserved verbatim.
+	// The header key is put in canonical form. The value keeps its inner double
+	// quotes exactly as they were inside the single-quoted argument.
 	if got := h["Sec-Ch-Ua"]; got != `"Not=A?Brand";v="99", "Brave";v="151", "Chromium";v="151"` {
 		t.Fatalf("sec-ch-ua = %q", got)
 	}
@@ -33,8 +33,8 @@ func TestParseCopyAsCurlHLS(t *testing.T) {
 }
 
 func TestParseBareURLAndFolding(t *testing.T) {
-	// URL as a bare positional (not --url), plus -A/-e/-b and an ignored flag
-	// whose value must not be read as the URL.
+	// The URL is a bare argument with no --url. The command also has -A/-e/-b
+	// and ignored flags (-o, -X) whose values must not be taken for the URL.
 	cmd := `curl 'https://host.example/155.mp4?token=abc' --compressed -o out.mp4 ` +
 		`-A 'Mozilla/5.0' -e 'https://ref.example/;auto' -b 'sid=xyz; k=v' -X GET`
 	u, h, err := Parse(cmd)
@@ -47,7 +47,7 @@ func TestParseBareURLAndFolding(t *testing.T) {
 	if h["User-Agent"] != "Mozilla/5.0" {
 		t.Fatalf("ua = %q", h["User-Agent"])
 	}
-	if h["Referer"] != "https://ref.example/" { // ";auto" stripped
+	if h["Referer"] != "https://ref.example/" { // the ";auto" suffix is removed
 		t.Fatalf("referer = %q", h["Referer"])
 	}
 	if h["Cookie"] != "sid=xyz; k=v" {

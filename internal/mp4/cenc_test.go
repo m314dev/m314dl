@@ -8,10 +8,11 @@ import (
 	"testing"
 )
 
-// Hermetic round-trip tests: build a real fragmented-MP4 fragment (moof/traf/
-// tfhd/trun/senc + mdat), encrypt sample data with an independent oracle, then
-// assert DecryptFragment recovers the plaintext. These run without fixtures or
-// mp4decrypt, so CI proves the crypto + box parsing on their own.
+// Self-contained round-trip tests. Each one builds a real fragmented MP4
+// fragment (moof/traf/tfhd/trun/senc plus an mdat), encrypts the sample data
+// with a separate reference encryptor written here, and then checks that
+// DecryptFragment gets the plaintext back. They need no fixtures and no
+// mp4decrypt, so CI proves the crypto and the box parsing on their own.
 
 func mkBox(typ string, payload []byte) []byte {
 	b := make([]byte, 8+len(payload))
@@ -31,12 +32,13 @@ func u32(v uint32) []byte { b := make([]byte, 4); binary.BigEndian.PutUint32(b, 
 
 type testSample struct {
 	plain []byte
-	subs  []subsample // clear/encrypted split; nil => whole sample encrypted
+	subs  []subsample // clear/encrypted ranges; nil = whole sample encrypted
 	iv    []byte      // per-sample IV (nil for constant-IV schemes)
 }
 
-// buildFragment assembles a valid fragment whose mdat holds cipher (already
-// encrypted), described by trun sizes and senc IV/subsample data.
+// buildFragment assembles a valid fragment. Its mdat holds cipherData, which
+// is already encrypted; the trun gives the sample sizes and the senc gives the
+// IV and subsample data for each sample.
 func buildFragment(samples []testSample, cipherData []byte, ivLen int, useSub bool) []byte {
 	// trun: data-offset(0x1) + sample-size(0x200) present
 	trunPayload := append(u32(uint32(len(samples))), u32(0)...) // count, data_offset placeholder
@@ -69,10 +71,11 @@ func buildFragment(samples []testSample, cipherData []byte, ivLen int, useSub bo
 	traf := mkBox("traf", concat(tfhd, trun, senc))
 	moof := mkBox("moof", traf)
 
-	// patch trun data_offset = len(moof) + mdat header(8)
+	// Set the trun's data_offset to len(moof) + the 8-byte mdat header, so it
+	// points at the start of the mdat payload.
 	dataOff := uint32(len(moof) + 8)
 	ti := bytes.Index(moof, []byte("trun"))
-	binary.BigEndian.PutUint32(moof[ti+4+4+4:], dataOff) // +type +ver/flags +count → data_offset
+	binary.BigEndian.PutUint32(moof[ti+4+4+4:], dataOff) // past type, version/flags, count: data_offset
 
 	return concat(moof, mkBox("mdat", cipherData))
 }
@@ -85,8 +88,9 @@ func concat(parts ...[]byte) []byte {
 	return out
 }
 
-// encryptCTR is the independent oracle: encrypt each sample's protected bytes
-// under one CTR stream per sample, skipping clear bytes.
+// encryptCTR is the reference encryptor for CTR mode. It encrypts each
+// sample's protected bytes with one CTR stream per sample and skips the clear
+// bytes.
 func encryptCTR(key []byte, samples []testSample) []byte {
 	block, _ := aes.NewCipher(key)
 	var out []byte
@@ -131,9 +135,10 @@ func TestDecryptCTRHermetic(t *testing.T) {
 	}
 }
 
-// encryptCBCSPattern is the independent oracle for cbcs: constant IV per
-// subsample, CBC chaining across encrypted blocks, skip the rest, trailing
-// partial block left clear.
+// encryptCBCSPattern is the reference encryptor for cbcs. Each subsample
+// restarts the CBC chain from the constant IV, the chain runs across the
+// encrypted blocks only, the skipped blocks are left alone, and a partial
+// block at the end stays clear.
 func encryptCBCSPattern(key, constIV []byte, samples []testSample, cryptBlk, skipBlk int) []byte {
 	block, _ := aes.NewCipher(key)
 	var out []byte
@@ -194,9 +199,10 @@ func TestDecryptCBCSHermetic(t *testing.T) {
 	}
 }
 
-// A trun may omit per-sample sizes when tfhd supplies default_sample_size.
-// OSN uses that compact form for its one-sample fragments; treating the absent
-// trun field as zero makes the valid CENC subsample range look out of bounds.
+// A trun may leave out the per-sample sizes when the tfhd supplies a
+// default_sample_size. OSN uses that compact form for its one-sample
+// fragments. If the missing trun field were read as zero, the valid CENC
+// subsample range would look like it runs past the end of the sample.
 func TestDecryptCTRUsesTFHDDefaultSampleSize(t *testing.T) {
 	key := []byte("0123456789abcdef")
 	sample := testSample{
@@ -206,8 +212,8 @@ func TestDecryptCTRUsesTFHDDefaultSampleSize(t *testing.T) {
 	}
 	cipherData := encryptCTR(key, []testSample{sample})
 
-	// tfhd.default_sample_size is present; trun has data_offset but deliberately
-	// no sample-size-present flag.
+	// The tfhd carries default_sample_size. The trun has a data_offset but, on
+	// purpose, no sample-size-present flag.
 	tfhd := mkFullBox("tfhd", 0, 0x020000|0x000010, concat(u32(1), u32(uint32(len(sample.plain)))))
 	trun := mkFullBox("trun", 0, 0x000001, concat(u32(1), u32(0)))
 	senc := mkFullBox("senc", 0, 0x000002, concat(
@@ -236,11 +242,11 @@ func seqIV(seq uint64) []byte {
 
 // ---- multi-trun ----
 
-// buildMultiTrunFragment assembles one traf holding one trun per run, each with
-// its own data_offset, and a single global senc over every sample in trun
-// order. Each run's cipher data is separated from the next by `gap` junk bytes
-// in the mdat, so the runs occupy non-adjacent regions: a decryptor that walked
-// samples contiguously from the first trun would decrypt the junk as data.
+// buildMultiTrunFragment assembles one traf with one trun per run, each with
+// its own data_offset, and a single senc that covers every sample in trun
+// order. In the mdat, `gap` junk bytes separate each run's cipher data from
+// the next, so the runs are not adjacent. A decryptor that walked the samples
+// back to back from the first trun would decrypt the junk as if it were data.
 func buildMultiTrunFragment(runs [][]testSample, cipherRuns [][]byte, gap, ivLen int, useSub bool) []byte {
 	var truns [][]byte
 	for _, run := range runs {
@@ -278,7 +284,8 @@ func buildMultiTrunFragment(runs [][]testSample, cipherRuns [][]byte, gap, ivLen
 	traf := mkBox("traf", concat(append([][]byte{tfhd}, append(truns, senc)...)...))
 	moof := mkBox("moof", traf)
 
-	// mdat: run0 | gap | run1 | gap | ...  and patch each trun's data_offset.
+	// Lay out the mdat as run0 | gap | run1 | gap | ... and point each trun's
+	// data_offset at its own run.
 	var mdat []byte
 	junk := bytes.Repeat([]byte{0xEE}, gap)
 	search := 0
@@ -295,8 +302,8 @@ func buildMultiTrunFragment(runs [][]testSample, cipherRuns [][]byte, gap, ivLen
 	return concat(moof, mkBox("mdat", mdat))
 }
 
-// expectedMultiTrunMdat is the plaintext mdat: each run's plaintext with the
-// untouched junk gap between runs.
+// expectedMultiTrunMdat is the mdat we expect after decryption: each run's
+// plaintext, with the junk gaps between runs untouched.
 func expectedMultiTrunMdat(runs [][]testSample, gap int) []byte {
 	var out []byte
 	for k, run := range runs {
@@ -318,8 +325,9 @@ func firstDiff(a, b []byte) int {
 	return n
 }
 
-// A traf with two truns: senc IVs/subsamples must be applied by global sample
-// index, and each trun's samples addressed from its own data_offset.
+// A traf with two truns. The senc IVs and subsamples must be matched to
+// samples by their position across the whole traf, and each trun's samples
+// must be read from that trun's own data_offset.
 func TestDecryptMultiTrunCTR(t *testing.T) {
 	key := []byte("0123456789abcdef")
 	runs := [][]testSample{
@@ -373,11 +381,11 @@ func TestDecryptMultiTrunCBCS(t *testing.T) {
 	}
 }
 
-// TestApplyPatternCBC_SkipZero pins the cbcs (1,0) pattern: skip=0 means every
-// block is encrypted (a pure CBC run over the whole range). Regression for a bug
-// where only the first crypt run was decrypted and the rest of each sample was
-// left encrypted, so a (1,0)-pattern track came out as noise while a (1,9) one
-// played.
+// TestApplyPatternCBC_SkipZero pins down the cbcs (1,0) pattern. skip=0 means
+// every block is encrypted, so the range is plain CBC from start to end. This
+// guards against a bug where only the first crypt run was decrypted and the
+// rest of each sample stayed encrypted. A (1,0)-pattern track came out as
+// noise while a (1,9) track played fine.
 func TestApplyPatternCBC_SkipZero(t *testing.T) {
 	key := []byte("0123456789abcdef")
 	iv := []byte("ABCDEFGHIJKLMNOP")
@@ -397,8 +405,9 @@ func TestApplyPatternCBC_SkipZero(t *testing.T) {
 	}
 }
 
-// TestApplyPatternCBC_Pattern19 checks a real (1,9) pattern still round-trips:
-// one encrypted block per 10-block unit, CBC-chained across encrypted blocks.
+// TestApplyPatternCBC_Pattern19 checks that a real (1,9) pattern still round
+// trips: one encrypted block in every 10-block unit, with the CBC chain
+// running across the encrypted blocks.
 func TestApplyPatternCBC_Pattern19(t *testing.T) {
 	key := []byte("fedcba9876543210")
 	iv := []byte("iv--------------")

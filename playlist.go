@@ -19,19 +19,20 @@ import (
 )
 
 var (
-	// errLiveEntry: the entry's manifest turned out live. A playlist run skips
-	// it instead of recording until stopped.
+	// errLiveEntry means the entry's manifest turned out to be a live stream. A
+	// playlist run skips it instead of recording until it is stopped.
 	errLiveEntry = errors.New("live stream")
-	// errExists: the entry's muxed output is already on disk.
+	// errExists means the entry's muxed output is already on disk.
 	errExists = errors.New("already downloaded")
 )
 
 // downloadPlaylist downloads the selected entries of an IPTV M3U list, -titles
-// at a time (default one: an IPTV account allows only a connection or two),
-// each to <dir>/<group>/<title>.<ext>. Live channels and titles already on disk
-// are skipped, so rerunning the same command resumes the batch. A failed title
-// is reported and the rest still run. Titles in flight together share one
-// status line (their combined progress); their messages print above it.
+// of them at a time (the default is one, because an IPTV account allows only
+// one or two connections). Each goes to <dir>/<group>/<title>.<ext>. Live
+// channels and titles already on disk are skipped, so running the same command
+// again resumes the batch. A failed title is reported and the rest still run.
+// Titles running at the same time share one status line that shows their
+// combined progress; their messages print above it.
 func downloadPlaylist(ctx context.Context, cancel context.CancelFunc, j job, pl *manifest.Master) error {
 	if j.o.serve != "" {
 		return fmt.Errorf("-serve restreams one stream, not an M3U playlist")
@@ -57,7 +58,7 @@ func downloadPlaylist(ctx context.Context, cancel context.CancelFunc, j job, pl 
 	if dir == "" {
 		dir = "."
 	}
-	interruptHandler(false, nil, cancel) // Ctrl-C stops the batch; rerun to resume
+	interruptHandler(false, nil, cancel) // Ctrl-C stops the batch; run again to resume
 	j.skipLive = true
 	par := max(1, j.o.titles)
 	stopProg := func() {}
@@ -67,7 +68,7 @@ func downloadPlaylist(ctx context.Context, cancel context.CancelFunc, j job, pl 
 		go j.prog.Render(stop)
 		stopProg = func() {
 			close(stop)
-			time.Sleep(50 * time.Millisecond) // let renderer print the final line
+			time.Sleep(50 * time.Millisecond) // give the renderer time to print the final line
 		}
 	}
 	var (
@@ -89,7 +90,7 @@ dispatch:
 			continue
 		}
 		base := filepath.Join(dir, safeName(e.GroupID, ""), safeName(e.Name, "entry-"+e.ID))
-		if used[base] { // two entries with one title in one group
+		if used[base] { // two entries share a title in the same group
 			base += " (" + e.ID + ")"
 		}
 		used[base] = true
@@ -137,8 +138,8 @@ dispatch:
 }
 
 // downloadEntry loads one entry and downloads it to base plus the extension
-// its kind implies: a direct file keeps its own (.mkv, .mp4, …), a manifest
-// is muxed to .mp4.
+// its kind calls for. A direct file keeps its own extension (.mkv, .mp4 and so
+// on); a manifest is muxed to .mp4.
 func (j job) downloadEntry(ctx context.Context, cancel context.CancelFunc, u, base string) error {
 	master, kind, err := source.LoadManifest(ctx, j.client, u, j.logv)
 	if err != nil {
@@ -149,9 +150,9 @@ func (j job) downloadEntry(ctx context.Context, cancel context.CancelFunc, u, ba
 	}
 	out := base + ".mp4"
 	if kind == source.FileKind {
-		out = base + filepath.Ext(master.Streams[0].Name) // resume and "already complete" are the file path's
+		out = base + filepath.Ext(master.Streams[0].Name) // the file download handles resume and "already complete"
 	} else if _, err := os.Stat(out); err == nil {
-		return errExists // the muxed output only appears once the title is done
+		return errExists // the muxed output exists only once the title is done
 	}
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return err
@@ -163,8 +164,8 @@ func (j job) downloadEntry(ctx context.Context, cancel context.CancelFunc, u, ba
 }
 
 // selectEntries applies -pick (entry numbers as -list shows them), -group and
-// -match (case-insensitive regexes on group-title and title); all must hold.
-// None given selects everything.
+// -match (case-insensitive regexes on the group-title and the title). An entry
+// must pass all of them. With none given, every entry is selected.
 func selectEntries(all []*manifest.Stream, pick, group, match string) ([]*manifest.Stream, error) {
 	var want map[int]bool
 	if pick != "" {
@@ -200,7 +201,7 @@ func selectEntries(all []*manifest.Stream, pick, group, match string) ([]*manife
 	return out, nil
 }
 
-// parsePick parses "3,7-12" into the set {3,7,8,…,12}.
+// parsePick turns "3,7-12" into the set {3,7,8,…,12}.
 func parsePick(s string) (map[int]bool, error) {
 	want := map[int]bool{}
 	for _, part := range strings.Split(s, ",") {
@@ -220,9 +221,10 @@ func parsePick(s string) (map[int]bool, error) {
 	return want, nil
 }
 
-// safeName makes a playlist title or group a file/folder name on every OS:
-// characters Windows forbids become '_', trailing dots and spaces (Windows
-// drops them) go, and it is capped at 100 characters. Empty gives def.
+// safeName turns a playlist title or group into a file or folder name that
+// works on every OS. Characters Windows forbids become '_', trailing dots and
+// spaces are removed (Windows drops them), and the name is capped at 100
+// characters. An empty result gives def.
 func safeName(s, def string) string {
 	s = strings.Map(func(r rune) rune {
 		if r < 32 || strings.ContainsRune(`<>:"/\|?*`, r) {

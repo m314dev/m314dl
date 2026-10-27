@@ -156,7 +156,8 @@ func TestSegmentList(t *testing.T) {
 
 func TestSegmentBaseInit(t *testing.T) {
 	// SegmentBase must split off the init header so a CENC stream can read its
-	// tenc; the media segment starts after the init range (no double download).
+	// tenc; the media segment starts right after the init range (no double
+	// download).
 	mpd := `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet><Representation id="v" bandwidth="1"><BaseURL>media.mp4</BaseURL><SegmentBase indexRange="1571-9138"><Initialization range="0-1570"/></SegmentBase></Representation></AdaptationSet></Period></MPD>`
 	m, err := Parse([]byte(mpd), "https://ex.com/d/x.mpd")
 	if err != nil {
@@ -172,10 +173,10 @@ func TestSegmentBaseInit(t *testing.T) {
 	}
 }
 
-// mpdTrickMode mirrors a real CMAF VOD (issue #8): a trick-play AdaptationSet
-// whose representation ties the real top rendition on height and bandwidth,
-// and a SegmentTemplate whose nominal per-segment duration differs between
-// video and audio (539859 vs 539890 @90kHz) with no SegmentTimeline.
+// mpdTrickMode copies the shape of a real CMAF VOD (issue #8): a trick-play
+// AdaptationSet whose representation ties the real top rendition on height and
+// bandwidth, and a SegmentTemplate whose nominal per-segment duration differs
+// between video and audio (539859 vs 539890 @90kHz) with no SegmentTimeline.
 const mpdTrickMode = `<?xml version="1.0"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT5176.640S">
  <Period id="period0" start="PT0.040S">
@@ -209,7 +210,7 @@ func TestTrickModeDroppedAndTemplateCountsAgree(t *testing.T) {
 		t.Fatalf("streams = %v / %v", v, a)
 	}
 	// ceil(5176.640 / (539859/90000)) == ceil(5176.640 / (539890/90000)) == 863:
-	// the per-track nominal durations differ but the $Number$ range must not.
+	// the nominal durations differ per track, but the $Number$ range must not.
 	for _, st := range m.Streams {
 		if n := len(st.Segments); n != 863 {
 			t.Fatalf("%s segments = %d, want 863", st.Name, n)
@@ -236,7 +237,7 @@ func TestISODuration(t *testing.T) {
 }
 
 // mpdAdPeriod: period 2 reuses id "v1" but re-encodes at a different resolution
-// (an SSAI ad / bumper), which must NOT be spliced into the content track.
+// (an SSAI ad or bumper), which must not be spliced into the content track.
 const mpdAdPeriod = `<?xml version="1.0"?>
 <MPD type="static" mediaPresentationDuration="PT13S">
  <Period duration="PT10S">
@@ -261,7 +262,7 @@ func TestMultiPeriodAdNotMerged(t *testing.T) {
 	if len(m.Streams) != 2 {
 		t.Fatalf("incompatible ad period should be a separate track: got %d streams, want 2", len(m.Streams))
 	}
-	// content track keeps its 2 segments, no ad spliced in
+	// the content track keeps its 2 segments, with no ad spliced in
 	if n := len(m.Streams[0].Segments); n != 2 {
 		t.Fatalf("content track segs = %d, want 2 (no ad spliced)", n)
 	}

@@ -1,10 +1,11 @@
-// benchserver serves the fixture streams with optional simulated network
-// conditions so downloader benchmarks are reproducible.
+// benchserver serves the fixture streams and can imitate network conditions,
+// so downloader benchmarks can be repeated with the same results.
 //
 //	benchserver -root ../streams -port 8090 -latency 30ms -rate 2000000
 //
-// -latency: first-byte delay per request (RTT simulation)
-// -rate: per-response bytes/sec cap (0 = unlimited)
+// -latency: delay before the first byte of each response (imitates the RTT,
+// the round-trip time of a request)
+// -rate: cap on bytes per second for each response (0 means unlimited)
 package main
 
 import (
@@ -40,7 +41,8 @@ func main() {
 	}
 }
 
-// throttled is a token-bucket writer: sleeps so the response averages rate B/s.
+// throttled is a token-bucket writer. It sleeps as needed so the response
+// averages rate bytes per second.
 type throttled struct {
 	http.ResponseWriter
 	rate   int64
@@ -58,7 +60,7 @@ func (t *throttled) Write(p []byte) (int, error) {
 		}
 		now := time.Now()
 		t.bucket += int64(now.Sub(t.last).Seconds() * float64(t.rate))
-		if t.bucket > t.rate { // cap burst at 1s worth
+		if t.bucket > t.rate { // cap a burst at one second's worth
 			t.bucket = t.rate
 		}
 		t.last = now

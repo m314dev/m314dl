@@ -72,7 +72,7 @@ func TestWorkerChannelLifecycle(t *testing.T) {
 		t.Fatalf("channel view wrong: %+v", v)
 	}
 
-	// The master references the track immediately; wait for real segments to
+	// The master playlist lists the track right away; wait for real segments to
 	// appear in the media playlist.
 	deadline := time.Now().Add(10 * time.Second)
 	served := false

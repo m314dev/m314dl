@@ -2,6 +2,6 @@
 
 package serve
 
-// ramBacked is only detected on Linux (where /tmp is commonly tmpfs); other
+// ramBacked is detected only on Linux, where /tmp is often tmpfs. Other
 // platforms never warn.
 func ramBacked(string) bool { return false }

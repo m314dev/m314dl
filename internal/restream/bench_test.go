@@ -25,7 +25,7 @@ func buildVODPublisher(b *testing.B, n int) *Publisher {
 }
 
 // BenchmarkDASHManifest measures the served (cached) DASH manifest cost on a
-// 3000-segment VOD — what a polling player actually hits.
+// 3000-segment VOD, which is what a polling player actually hits.
 func BenchmarkDASHManifest(b *testing.B) {
 	pub := buildVODPublisher(b, 3000)
 	b.ReportAllocs()
@@ -35,8 +35,8 @@ func BenchmarkDASHManifest(b *testing.B) {
 	}
 }
 
-// BenchmarkDASHManifestUncached forces a full re-render every call (cache
-// disabled) so the delta against BenchmarkDASHManifest shows what the
+// BenchmarkDASHManifestUncached forces a full re-render on every call (cache
+// disabled), so the difference against BenchmarkDASHManifest shows what the
 // version-counter body cache saves on a long timeline.
 func BenchmarkDASHManifestUncached(b *testing.B) {
 	pub := buildVODPublisher(b, 3000)

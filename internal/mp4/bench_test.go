@@ -7,9 +7,9 @@ import (
 	"testing"
 )
 
-// BenchmarkDecryptFragment measures native CENC/CBCS decryption throughput on
-// a real shaka fragment. Reports MB/s so decrypt cost can be compared against
-// network bandwidth.
+// BenchmarkDecryptFragment measures how fast our own CENC and cbcs decryption
+// runs on a real fragment packaged by shaka. It reports MB/s so the cost of
+// decrypting can be compared with network bandwidth.
 func BenchmarkDecryptFragment(b *testing.B) {
 	dir := fixtureDir()
 	key, _ := hex.DecodeString("0123456789abcdef0123456789abcdef")

@@ -119,7 +119,8 @@ func TestByteRangeChain(t *testing.T) {
 
 func TestDRMDetected(t *testing.T) {
 	// Widevine/PlayReady keyformats are CENC (fMP4); their key is looked up from
-	// the init's tenc, so the manifest URI is not treated as a fetchable key.
+	// the init segment's tenc box, so the manifest URI is not treated as a key
+	// to fetch.
 	pl := `#EXTM3U
 #EXT-X-TARGETDURATION:6
 #EXT-X-KEY:METHOD=SAMPLE-AES,URI="data:text/plain;base64,AAAA",KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
@@ -136,8 +137,9 @@ s1.ts
 	}
 }
 
-// A FairPlay SAMPLE-AES stream stays SAMPLE-AES: its raw key is user-supplied
-// and it decrypts natively (cbcs for fMP4, or the TS SAMPLE-AES path for TS).
+// A FairPlay SAMPLE-AES stream stays SAMPLE-AES: its raw key comes from the
+// user and it decrypts natively (cbcs for fMP4, or the TS SAMPLE-AES path for
+// TS).
 func TestFairPlaySampleAES(t *testing.T) {
 	pl := `#EXTM3U
 #EXT-X-TARGETDURATION:6

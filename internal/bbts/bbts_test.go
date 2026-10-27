@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// A TS with no "mdcm|" SDT never goes "ready", so Decrypt must pass every packet
-// through byte-for-byte. This exercises the packet loop + PSI push without
-// needing a real encrypted sample.
+// A TS with no "mdcm|" SDT never becomes "ready", so Decrypt must pass every
+// packet through byte for byte. This exercises the packet loop and the PSI push
+// without needing a real encrypted sample.
 func TestClearStreamPassesThrough(t *testing.T) {
 	// 3 sync-prefixed packets: a PAT, an SDT (no mdcm), and a video packet.
 	pkt := func(pid uint16, pusi bool) []byte {
@@ -45,7 +45,8 @@ func TestBadKeyLength(t *testing.T) {
 	}
 }
 
-// splitPipe/hexBytes underpin IV extraction; check the exact "mdcm|..." shape.
+// splitPipe and hexBytes do the IV extraction; check them against the exact
+// "mdcm|..." shape.
 func TestHexBytesAndSplit(t *testing.T) {
 	parts := splitPipe("mdcm|prov|svc|Xdeadbeefdeadbeefdeadbeefdeadbeef")
 	if len(parts) != 4 || parts[0] != "mdcm" {

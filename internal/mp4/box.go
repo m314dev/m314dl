@@ -1,6 +1,8 @@
-// Package mp4 is a minimal ISO base media file format (ISO/IEC 14496-12)
-// reader, just enough to parse CENC protection metadata and decrypt
-// fragmented MP4 samples in-process — no mp4decrypt, no shaka-packager.
+// Package mp4 is a small reader for the ISO base media file format (ISO/IEC
+// 14496-12), the box structure behind MP4 files. It does just enough to read
+// CENC protection metadata (CENC is the common encryption standard for MP4,
+// ISO/IEC 23001-7) and to decrypt fragmented MP4 samples inside this program,
+// with no need for external tools such as mp4decrypt or shaka-packager.
 package mp4
 
 import (
@@ -9,16 +11,17 @@ import (
 	"fmt"
 )
 
-// box is a parsed ISO-BMFF box header plus its raw payload (the bytes after
-// the header, still including any child boxes for containers).
+// box is one parsed box: its header fields plus the raw payload. The payload
+// is every byte after the header. For a container box it still holds the
+// child boxes, unparsed.
 type box struct {
 	typ     string
-	off     int64  // offset of the box (its size field) within the parsed buffer
-	hdrLen  int64  // size of size+type(+largesize) header
-	payload []byte // bytes after the header, length = size - hdrLen
+	off     int64  // where the box starts (its size field) in the parsed buffer
+	hdrLen  int64  // header length: size + type, plus largesize if present (8 or 16)
+	payload []byte // bytes after the header; length = size - hdrLen
 }
 
-// containers holds box types whose payload is itself a sequence of boxes.
+// containers lists the box types whose payload is itself a list of boxes.
 var containers = map[string]bool{
 	"moov": true, "trak": true, "mdia": true, "minf": true, "stbl": true,
 	"moof": true, "traf": true, "mvex": true, "edts": true, "dinf": true,
@@ -27,13 +30,16 @@ var containers = map[string]bool{
 	"udta": true, "meta": true,
 }
 
-// Sample-entry prefix lengths before child boxes begin: 8-byte SampleEntry
-// base plus the codec-specific block. Visual = 70, audio v0 = 20, audio v1
-// = 36. We try each and validate by exact box tiling, so a wrong guess is
-// rejected rather than mis-parsed.
+// sampleEntrySkips lists how many bytes a sample entry has before its child
+// boxes begin: the 8-byte SampleEntry base plus a codec-specific block. The
+// block is 70 bytes for visual entries, 20 for audio version 0 and 36 for
+// audio version 1. We try each length and accept it only when the remaining
+// bytes split exactly into boxes, so a wrong guess is rejected instead of
+// being parsed as garbage.
 var sampleEntrySkips = []int{8 + 70, 8 + 20, 8 + 36, 8 + 28, 8}
 
-// walk calls fn for every top-level box in buf. Return false from fn to stop.
+// walk calls fn for every top-level box in buf, in order. fn returns false to
+// stop early.
 func walk(buf []byte, fn func(b box) bool) error {
 	var off int64
 	for off < int64(len(buf)) {
@@ -59,13 +65,13 @@ func readBox(buf []byte, off int64) (box, int64, error) {
 	typ := string(buf[off+4 : off+8])
 	hdr := int64(8)
 	switch size {
-	case 1: // 64-bit largesize
+	case 1: // size 1 means a 64-bit largesize field follows the type
 		if off+16 > int64(len(buf)) {
 			return box{}, 0, errors.New("mp4: truncated largesize")
 		}
 		size = int64(binary.BigEndian.Uint64(buf[off+8:]))
 		hdr = 16
-	case 0: // extends to end of buffer
+	case 0: // size 0 means the box runs to the end of the buffer
 		size = int64(len(buf)) - off
 	}
 	if size < hdr || size > int64(len(buf))-off {
@@ -74,13 +80,14 @@ func readBox(buf []byte, off int64) (box, int64, error) {
 	return box{typ: typ, off: off, hdrLen: hdr, payload: buf[off+hdr : off+size]}, off + size, nil
 }
 
-// children walks the child boxes of a container box's payload.
+// children calls fn for every child box inside a container box.
 func (b box) children(fn func(c box) bool) error {
 	return walk(b.payload, fn)
 }
 
-// find returns the first descendant box matching the given type path.
-// find(buf, "moov","trak","mdia") descends container by container.
+// find follows a path of box types and returns the box at its end.
+// find(buf, "moov", "trak", "mdia") takes the first moov, then the first trak
+// inside it, then the first mdia inside that.
 func find(buf []byte, path ...string) (box, bool) {
 	cur := buf
 	var found box
@@ -105,7 +112,8 @@ func find(buf []byte, path ...string) (box, bool) {
 	return box{}, false
 }
 
-// fullBox reads the version+flags of a FullBox payload.
+// fullBox reads the version byte and the 3-byte flags that start a FullBox
+// payload, and returns them along with the bytes that follow.
 func fullBox(payload []byte) (version byte, flags uint32, rest []byte, err error) {
 	if len(payload) < 4 {
 		return 0, 0, nil, errors.New("mp4: truncated fullbox")
@@ -115,10 +123,11 @@ func fullBox(payload []byte) (version byte, flags uint32, rest []byte, err error
 	return version, flags, payload[4:], nil
 }
 
-// sampleEntryChildren finds child boxes (e.g. sinf) inside a sample entry box
-// (encv/enca) by skipping the fixed SampleEntry prefix. The prefix length
-// differs between visual and audio entries, so we scan forward for the first
-// plausible box start instead of hardcoding.
+// sampleEntryChildren returns the child boxes (such as sinf) of a sample entry
+// box (encv/enca) by skipping the fixed prefix in front of them. The prefix
+// length differs between visual and audio entries, so instead of hardcoding
+// one length we try each known length and keep the first that lands on a
+// real box boundary.
 func sampleEntryChildren(b box) []byte {
 	p := b.payload
 	for _, skip := range sampleEntrySkips {
@@ -126,7 +135,8 @@ func sampleEntryChildren(b box) []byte {
 			return p[skip:]
 		}
 	}
-	// fall back to the first exact tiling even without sinf (non-encrypted use)
+	// No sinf found (a clear, unencrypted entry has none). Fall back to the
+	// first length whose remainder splits exactly into boxes.
 	for _, skip := range sampleEntrySkips {
 		if skip <= len(p) && tilesExactly(p[skip:]) {
 			return p[skip:]
@@ -147,9 +157,9 @@ func hasChild(buf []byte, typ string) bool {
 	return found
 }
 
-// tilesExactly reports whether buf is a sequence of well-formed boxes that
-// exactly fills buf with no leftover bytes. A strong signal that buf starts at
-// a real box boundary. Empty buf tiles trivially.
+// tilesExactly reports whether buf is a run of well-formed boxes that fills it
+// exactly, with no bytes left over. That is a strong sign that buf starts at a
+// real box boundary. An empty buf counts as tiling.
 func tilesExactly(buf []byte) bool {
 	off := 0
 	for off < len(buf) {

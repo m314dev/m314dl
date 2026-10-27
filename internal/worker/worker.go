@@ -1,9 +1,10 @@
-// Worker mode (-worker): a multi-channel restream agent a controller (e.g. the
-// m314 panel) drives over HTTP. One process holds many channels; each channel
-// downloads and decrypts its source and republishes it live, served at
-// /{id}/live.m3u8 (or /live.ts, /live.mpd). Channels run in-process — the media
-// is already in RAM in the packager, so there is no subprocess to babysit and no
-// reverse proxy to a child's port.
+// Package worker is the worker mode (-worker): a restream agent that runs many
+// channels and that a controller (for example the m314 panel) drives over
+// HTTP. One process holds many channels. Each channel downloads and decrypts
+// its source and republishes it live at /{id}/live.m3u8 (or /live.ts,
+// /live.mpd). Channels run inside this process: the media is already in RAM
+// in the packager, so there is no child process to look after and no reverse
+// proxy to a child's port.
 //
 // Control API (Bearer -worker-secret):
 //
@@ -13,8 +14,9 @@
 //	DELETE /api/channels/{id}   -> stop and remove
 //	GET    /api/health          -> {"status":"ok","channels":3,"max":32,"version":..,cpu/ram/disk/net}
 //
-// Media (unauthenticated, like any origin — access control is the controller's
-// job): GET /{id}/... routes to that channel's HLS/TS/DASH handler.
+// Media is served without authentication, like any origin; access control is
+// the controller's job. GET /{id}/... routes to that channel's HLS/TS/DASH
+// handler.
 package worker
 
 import (
@@ -47,11 +49,12 @@ type workerServer struct {
 	ffmpegPath  string
 	logv        func(string, ...any)
 
-	// spool is where channels stage segments. Each worker instance owns one and
-	// clears it on startup: a channel removes its own directory when it stops,
-	// but a killed or restarted process never gets to, and the leftovers are
-	// invisible and unbounded. One restart-heavy day left 1430 directories and
-	// 43GB behind, on the same disk the live segments were being written to.
+	// spool is where channels stage their segments. Each worker instance owns
+	// one and clears it on startup. A channel removes its own directory when it
+	// stops, but a process that is killed or restarted never gets the chance,
+	// and the leftovers are invisible and grow without limit. One day with many
+	// restarts left 1430 directories and 43GB behind, on the same disk the live
+	// segments were being written to.
 	spool string
 
 	mu       sync.RWMutex
@@ -86,13 +89,13 @@ func newWorkerServer(secret string, maxChannels int, ffmpegPath, version string,
 }
 
 // useSpool claims a staging directory for this worker and clears whatever a
-// previous run left in it. base is the -spool-dir override; "" resolves per
-// serve.SpoolBase (the current directory — real disk, unlike the tmpfs the
-// system temp dir usually is on Linux).
+// previous run left in it. base is the -spool-dir override; "" is resolved by
+// serve.SpoolBase to the current directory, which is real disk, unlike the
+// system temp dir, which is usually tmpfs on Linux.
 //
-// The directory is named for the address the worker listens on, so two workers
-// on one host never share or delete each other's staging area, and a restart of
-// either reclaims exactly its own leftovers.
+// The directory is named after the address the worker listens on, so two
+// workers on one host never share or delete each other's staging area, and a
+// restart of either one reclaims exactly its own leftovers.
 func (w *workerServer) useSpool(addr, base string) error {
 	base, err := serve.SpoolBase(base)
 	if err != nil {
@@ -257,14 +260,14 @@ func (w *workerServer) apiHealth(rw http.ResponseWriter, r *http.Request) {
 	w.mu.RUnlock()
 	httpx.WriteJSON(rw, healthOut{
 		Status: "ok", Channels: n, Max: w.maxChannels,
-		// The version is what tells a panel the worker is deployed at all: with
-		// none reported, its server list showed every node as "not deployed"
-		// however healthy the node actually was.
+		// The version is how a panel knows the worker is deployed at all. When
+		// none was reported, its server list showed every node as "not
+		// deployed", no matter how healthy the node was.
 		Version: w.version,
 	})
 }
 
-// healthOut is what GET /api/health answers.
+// healthOut is the reply to GET /api/health.
 type healthOut struct {
 	Status   string `json:"status"`
 	Channels int    `json:"channels"`
@@ -292,10 +295,10 @@ func (w *workerServer) channel(id string) *channel {
 
 // ─── channel lifecycle ───────────────────────────────────────────────────────
 
-// startChannel resolves the source, selects streams, builds the output, and
-// launches the downloads in the background. It blocks only for the manifest
-// fetch + selection, so start errors (bad URL, DRM without a key) surface in the
-// response; a running channel is then served immediately.
+// startChannel loads the source, selects the streams, builds the output, and
+// starts the downloads in the background. It blocks only for the manifest
+// fetch and the selection, so a start error (a bad URL, DRM without a key)
+// shows up in the response. A channel that started is served right away.
 func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 	headers := req.Headers
 	if headers == nil {
@@ -351,7 +354,8 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		cancel: cancel, tmpDir: tmpDir, state: "running", live: live, started: time.Now(),
 	}
 
-	// Register, guarding against a racing start of the same id / a full table.
+	// Register the channel, checking again for a racing start of the same id
+	// or a full table.
 	w.mu.Lock()
 	if _, exists := w.channels[req.ID]; exists {
 		w.mu.Unlock()
@@ -373,10 +377,10 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 }
 
 // runChannel downloads every track into its sink until the source ends or the
-// channel is stopped, then finalizes state and cleans up.
+// channel is stopped, then records the final state and cleans up.
 func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *httpx.Client, kind string, keys map[[16]byte][]byte, jobs []serve.Job) {
-	// End the presentation on cancel too, so an ffmpeg-remux writer blocked on a
-	// stalled pipe unblocks with EPIPE and the errgroup can return.
+	// End the presentation on cancel too, so an ffmpeg remux writer stuck on a
+	// stalled pipe gets EPIPE and the errgroup can return.
 	go func() {
 		<-ctx.Done()
 		ch.pres.End()
@@ -392,14 +396,14 @@ func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *http
 	case err != nil:
 		ch.state, ch.errMsg = "error", err.Error()
 	default:
-		ch.state = "done" // finite source finished; still served (ENDLIST)
+		ch.state = "done" // a finite source finished; it is still served (ENDLIST)
 	}
 	ch.mu.Unlock()
 
 	// A finished VOD channel keeps serving its spooled segments from tmpDir, so
-	// the spool must outlive the download and go only when the channel does
-	// (stop/removal cancels ctx). A stale spool from a crash is swept by
-	// useSpool at the next startup.
+	// the spool must outlive the download and go away only when the channel does
+	// (stop or removal cancels ctx). useSpool sweeps a stale spool left by a
+	// crash at the next startup.
 	<-ctx.Done()
 	os.RemoveAll(ch.tmpDir)
 }
@@ -451,7 +455,7 @@ func normFormat(f string) string {
 	}
 }
 
-// parseSelection parses the three selector expressions (empty sv defaults to best).
+// parseSelection parses the three selector expressions. An empty sv means best.
 func parseSelection(sv, sa, ss string) (ve, ae, se *pick.Expr, err error) {
 	if sv == "" {
 		sv = "best"
@@ -472,20 +476,21 @@ func parseSelection(sv, sa, ss string) (ve, ae, se *pick.Expr, err error) {
 	return ve, ae, se, nil
 }
 
-// selectAndExpand selects the requested streams and, for HLS, fetches each
-// media playlist; for DASH, splits on-demand (SegmentBase) files by their sidx
-// (mirrors run()'s expansion). It fails fast on a CENC track
-// with no key so a misconfigured channel reports the reason at start.
+// selectAndExpand selects the requested streams. For HLS it fetches each media
+// playlist; for DASH it splits on-demand (SegmentBase) files into segments by
+// their sidx index, the same expansion run() does. It fails at once on a CENC
+// track with no key, so a channel that is set up wrong reports the reason at
+// start.
 func selectAndExpand(ctx context.Context, client *httpx.Client, kind string, master *manifest.Master, ve, ae, se *pick.Expr, keys map[[16]byte][]byte, logv func(string, ...any)) ([]*manifest.Stream, error) {
 	selected := pick.Select(master.Streams, ve, ae, se)
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("no streams matched the selection")
 	}
-	// A video selection that matches nothing must not quietly leave an
-	// audio-only channel. It runs, every metric reads healthy, and the first
-	// person to notice is a viewer looking at a black screen — which is exactly
-	// how a quality preference of "720" against a source publishing 768x432
-	// took the picture off a live channel.
+	// A video selection that matches nothing must not silently leave an
+	// audio-only channel. Such a channel runs, every metric looks healthy, and
+	// the first person to notice is a viewer looking at a black screen. That is
+	// exactly how a quality preference of "720" against a source publishing
+	// 768x432 took the picture off a live channel.
 	if wantsVideo(ve) && !hasKind(selected, manifest.Video) && hasKind(master.Streams, manifest.Video) {
 		return nil, fmt.Errorf("no video stream matched the selection; the source publishes %s "+
 			"(use -sv none for an audio-only channel)", videoSummary(master.Streams))
@@ -529,8 +534,8 @@ func hasKind(streams []*manifest.Stream, k manifest.MediaType) bool {
 	return false
 }
 
-// videoSummary lists the resolutions a source does publish, so the error names
-// the alternatives instead of only rejecting what was asked for.
+// videoSummary lists the resolutions a source does publish, so the error can
+// name the alternatives as well as reject what was asked for.
 func videoSummary(streams []*manifest.Stream) string {
 	var out []string
 	seen := map[string]bool{}

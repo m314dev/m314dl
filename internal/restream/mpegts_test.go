@@ -35,7 +35,7 @@ func TestCCRewriteAcrossSegments(t *testing.T) {
 		}
 	}
 
-	// Second segment restarts its source counters at 0 — output must continue.
+	// Second segment restarts its source counters at 0; output must continue.
 	seg2 := append(tsPacket(0x100, 0), tsPacket(0x100, 0)...)
 	c.rewrite(seg2)
 	for i, want := range []byte{3, 4} {
@@ -92,9 +92,9 @@ func TestTSBroadcastFanout(t *testing.T) {
 
 // A subscriber that never drains exceeds its byte budget and is kicked (and
 // unsubscribed, so no further gapped units reach it), while the producer never
-// blocks and a subscriber that keeps draining keeps receiving — the exact
-// opposite of the drm worker's serial-stall (a stuck viewer there froze
-// everyone). Single-goroutine and deterministic: if publish ever blocked, this
+// blocks and a subscriber that keeps draining keeps receiving. That is the
+// exact opposite of the drm worker's serial stall, where a stuck viewer froze
+// everyone. Single-goroutine and deterministic: if publish ever blocked, this
 // test would deadlock instead of failing.
 func TestTSSlowSubscriberKicked(t *testing.T) {
 	old := maxSubQueuedBytes
@@ -133,7 +133,7 @@ func TestTSSlowSubscriberKicked(t *testing.T) {
 }
 
 // A new subscriber is primed with the most recent published unit, so a joiner
-// has media immediately instead of waiting up to a whole segment interval.
+// has media at once instead of waiting up to a whole segment interval.
 func TestTSSubscriberPrimedWithLast(t *testing.T) {
 	b := NewTSBroadcaster()
 	b.publish([]byte("SEG-1"))
@@ -214,7 +214,7 @@ func TestTSSinkRewritesAndPublishes(t *testing.T) {
 	default:
 		t.Fatal("sink did not publish segment")
 	}
-	// The sink must own its copy — mutating the caller's buffer must not touch
+	// The sink must own its copy. Changing the caller's buffer must not touch
 	// what was published.
 	seg[0] = 0
 	// (nothing to assert beyond no panic / no shared-mutation; covered by -race)

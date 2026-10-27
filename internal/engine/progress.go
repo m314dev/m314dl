@@ -14,8 +14,8 @@ import (
 	"github.com/m314dev/m314dl/internal/ui"
 )
 
-// Progress aggregates counters across all concurrently-downloading streams.
-// Speed is a sliding 5-second window, not a lifetime average.
+// Progress adds up the counters of every stream downloading at the same time.
+// Speed is measured over the last 5 seconds, so it is not a lifetime average.
 type Progress struct {
 	total      atomic.Int64
 	done       atomic.Int64
@@ -24,13 +24,13 @@ type Progress struct {
 	conns      atomic.Int64 // segment fetches in flight right now
 
 	mu       sync.Mutex
-	samples  []sample // ring of (time, bytes) for windowed speed
+	samples  []sample // ring of (time, bytes) samples for the windowed speed
 	live     bool
 	start    time.Time
 	end      time.Time     // when Render stopped; zero while it runs
 	interval time.Duration // render tick override; 0 = default (1s TTY, 5s piped)
 	name     string        // output file shown at the end of the terminal line
-	tty      bool          // set by Render: draw the bar shape, not the piped one
+	tty      bool          // set by Render: draw the bar shape instead of the piped one
 
 	outMu sync.Mutex          // serializes status-line draws and Log
 	lw    *progressLineWriter // set while Render runs
@@ -41,8 +41,8 @@ type sample struct {
 	b int64
 }
 
-// NewProgress creates a progress aggregator. interval overrides the render
-// cadence for both the TTY and piped branches; 0 keeps the defaults.
+// NewProgress creates a Progress. interval overrides how often the line is
+// redrawn, both on a TTY and when piped; 0 keeps the defaults.
 func NewProgress(live bool, interval time.Duration) *Progress {
 	return &Progress{live: live, start: time.Now(), interval: interval}
 }
@@ -66,9 +66,10 @@ func (p *Progress) AddBytes(n int64) {
 	cur := p.bytes.Add(n)
 	now := time.Now()
 	p.mu.Lock()
-	// At most one sample per 100ms. A sample per Read let a few dozen busy
-	// workers fill the ring within milliseconds, so the window Speed measures
-	// shrank under its 0.1s floor and a fast download read "0B/s | ETA ?".
+	// Keep at most one sample per 100ms. Taking a sample on every Read let a
+	// few dozen busy workers fill the ring within milliseconds. The window that
+	// Speed measures then shrank below its 0.1s floor, and a fast download
+	// showed "0B/s | ETA ?".
 	if k := len(p.samples); k == 0 || now.Sub(p.samples[k-1].t) >= 100*time.Millisecond {
 		p.samples = append(p.samples, sample{now, cur})
 		if len(p.samples) > 256 {
@@ -110,14 +111,14 @@ func fmtBytes(b int64) string {
 
 // Line renders one status line.
 //
-// Piped (not a terminal), the two shapes below (VOD: "pct% | done/total segs |
-// bytes | speed/s | ETA x"; live: "REC elapsed | segs | bytes | speed/s") are a
-// stable, machine-parseable contract. External tools and the -rpc server parse
-// them, so keep the field order and separators stable; "ETA ?" is the deliberate
-// unknown-ETA sentinel.
+// When output is piped (not a terminal), the two shapes below are a fixed
+// format that programs parse. VOD: "pct% | done/total segs | bytes | speed/s |
+// ETA x". Live: "REC elapsed | segs | bytes | speed/s". External tools and the
+// -rpc server read these lines, so keep the field order and the separators as
+// they are. "ETA ?" is the agreed marker for an unknown ETA.
 //
-// On a terminal the line is for a person instead: a bar, the size so far with
-// the estimated total, the fetches in flight, and the file name, in color when
+// On a terminal the line is for a person: a bar, the size so far with the
+// estimated total, the fetches in flight, and the file name, in color when
 // ui.Color allows. A terminal line is redrawn in place and never parsed.
 func (p *Progress) Line() string {
 	done, total := p.done.Load(), p.total.Load()
@@ -151,7 +152,7 @@ func (p *Progress) Line() string {
 	}
 	size := fmtBytes(bytes)
 	if total > 0 && done >= total {
-		eta = "0s" // the piped shape keeps its "?" sentinel; a person wants to see it finished
+		eta = "0s" // the piped shape keeps its "?" marker; a person wants to see it finished
 	} else if estTotal > 0 {
 		size += "/~" + fmtBytes(estTotal)
 	}
@@ -160,9 +161,10 @@ func (p *Progress) Line() string {
 		done, total, size, rate, ui.Paint(ui.Yellow, "ETA "+eta), tail)
 }
 
-// estimate derives the percentage, the ETA string ("?" when unknown) and the
+// estimate computes the percentage, the ETA string ("?" when unknown) and the
 // projected total size (0 when unknown) from the counters. Both projections
-// assume the segments so far are typical, so they wait for a handful of them.
+// assume the segments seen so far are typical, so they wait until a handful
+// have finished.
 func (p *Progress) estimate(done, total, bytes int64, speed float64) (pct float64, eta string, estTotal int64) {
 	if total > 0 {
 		pct = float64(done) / float64(total) * 100
@@ -220,10 +222,11 @@ func (p *Progress) Summary(outSize int64) string {
 	return fmt.Sprintf("%s, %s at %s/s", fmtBytes(outSize), elapsed.Round(time.Second), fmtBytes(avg))
 }
 
-// Render prints progress to stderr until stop is closed. On a TTY it rewrites
-// one line; otherwise it prints a plain line each interval (machine-parseable,
-// survives redirection, no ANSI garbage). Default cadence is 1s on a TTY and
-// 5s when piped, overridable via NewProgress's interval.
+// Render prints progress to stderr until stop is closed. On a TTY it redraws
+// one line in place. Otherwise it prints a plain line every interval, which
+// programs can parse, survives redirection and has no ANSI escape codes in it.
+// The default interval is 1s on a TTY and 5s when piped; NewProgress's
+// interval overrides it.
 func (p *Progress) Render(stop <-chan struct{}) {
 	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
 	interval := time.Second
@@ -285,13 +288,14 @@ func (p *Progress) Log(line string) {
 	fmt.Fprintln(out, line)
 }
 
-// progressLineWriter redraws one line in place. It pads with spaces to erase
-// the previous draw instead of using a clear-line escape, which classic Windows
-// consoles don't interpret by default. Widths are terminal columns (ui.Width),
-// so color codes and the bar glyphs in the line don't count against the
-// terminal width. The same width limit applies to ticks and the final line;
-// leave one spare column to avoid terminal auto-wrap (including at an
-// exact-width boundary).
+// progressLineWriter redraws one line in place. It erases the previous draw by
+// padding with spaces instead of a clear-line escape code, because classic
+// Windows consoles do not understand that code by default. Widths are counted
+// in terminal columns (ui.Width), so color codes and the bar glyphs do not
+// count against the terminal width. The same width limit applies to every tick
+// and to the final line. One column is left spare so the terminal never wraps
+// the line on its own, including when the line is exactly as wide as the
+// terminal.
 type progressLineWriter struct {
 	out      io.Writer
 	tty      bool

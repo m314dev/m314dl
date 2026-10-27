@@ -1,7 +1,8 @@
-// RPC server mode (-rpc): a small HTTP/JSON API for submitting and watching
-// download jobs remotely. Each job runs as a child m314dl process with the
-// client-supplied CLI args, so every feature (selection, keys, resume,
-// graceful-stop signal semantics) works identically to local runs.
+// Package rpc is the RPC server mode (-rpc): a small HTTP/JSON API for
+// submitting and watching download jobs from another machine. Each job runs as
+// a child m314dl process with the CLI args the client supplied, so every
+// feature (selection, keys, resume, the stop signal behaviour) works exactly as
+// it does in a local run.
 //
 //	POST /add            {"url":"...","args":["-o","x.mp4"]} -> {"id":1}
 //	GET  /jobs           -> [{"id":1,"state":"running","progress":"42% | ..."},...]
@@ -9,14 +10,15 @@
 //	POST /jobs/{id}/stop -> SIGINT (graceful; repeat to abort, like ^C ^C)
 //	GET  /health         -> {"status":"ok","running":3,"total":57,"max":64}
 //
-// Built to run unattended in production: bounded memory (finished jobs are
-// reaped, per-job logs are capped), no lock contention (each job's output is
-// buffered under its own lock, never the server's), an admission cap so a flood
-// of /add can't fork-bomb the host, graceful shutdown that stops children, and
-// crash-safety so children die with the parent (Linux).
+// It is built to run unattended in production. Memory is bounded: finished
+// jobs are reaped and each job's log is capped. There is no lock contention,
+// because each job's output is buffered under its own lock, never the
+// server's. An admission cap stops a flood of /add from fork-bombing the host.
+// Shutdown is graceful and stops the children, and on Linux the children die
+// with the parent even after a crash.
 //
-// Auth: "Authorization: Bearer <secret>" when -rpc-secret is set; a secret is
-// mandatory on non-loopback binds.
+// Auth: "Authorization: Bearer <secret>" when -rpc-secret is set. A secret is
+// required when binding an address that is not loopback.
 package rpc
 
 import (
@@ -42,13 +44,14 @@ import (
 const (
 	rpcLogCap     = 256 << 10 // keep the last 256KB of each job's output
 	rpcMaxBody    = 64 << 10  // cap the /add request body
-	rpcMaxRetain  = 5000      // hard ceiling on retained (incl. finished) jobs
+	rpcMaxRetain  = 5000      // hard limit on kept jobs, finished ones included
 	rpcReapPeriod = 30 * time.Second
 )
 
-// rpcJob is one download job. Server-owned identity/timing fields are set once
-// and then read-only; the live fields (state, progress, log) are guarded by the
-// job's own mutex, so a chatty child never contends on the server lock.
+// rpcJob is one download job. The identity and timing fields the server owns
+// are set once and then only read. The live fields (state, progress, log) are
+// guarded by the job's own mutex, so a child that prints a lot never fights
+// for the server lock.
 type rpcJob struct {
 	id      int64
 	url     string
@@ -56,7 +59,7 @@ type rpcJob struct {
 	started time.Time
 	cmd     *exec.Cmd
 
-	endedNano atomic.Int64 // 0 while running; set once on exit (lock-free reaping)
+	endedNano atomic.Int64 // 0 while running; set once on exit, so reaping needs no lock
 
 	mu       sync.Mutex
 	state    string // running | done | error
@@ -66,9 +69,9 @@ type rpcJob struct {
 }
 
 type rpcServer struct {
-	exe     string // binary to spawn for jobs (self)
+	exe     string // binary to run for jobs (this same program)
 	secret  string
-	maxJobs int           // 0 = unlimited
+	maxJobs int           // 0 means unlimited
 	retain  time.Duration // keep finished jobs at least this long
 
 	nextID atomic.Int64
@@ -104,7 +107,7 @@ func ServeRPC(addr, secret string, maxJobs int, retain time.Duration, version st
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           s.handler(),
-		ReadHeaderTimeout: 10 * time.Second, // slowloris guard
+		ReadHeaderTimeout: 10 * time.Second, // guard against slow-header (slowloris) clients
 	}
 
 	stopReaper := make(chan struct{})
@@ -163,8 +166,9 @@ func (s *rpcServer) add(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Admission: reserve a running slot before spawning so a flood of /add can't
-	// fork-bomb the host. Reserve and register under one lock so the cap is exact.
+	// Admission: take a running slot before spawning, so a flood of /add cannot
+	// fork-bomb the host. Take the slot and register the job under one lock, so
+	// the cap is exact.
 	cmd := exec.Command(s.exe, append(append([]string{}, req.Args...), req.URL)...)
 	hardenCmd(cmd) // die with the parent (Linux); own process group
 	j := &rpcJob{url: req.URL, args: req.Args, started: time.Now(), cmd: cmd, state: "running"}
@@ -205,7 +209,7 @@ func (s *rpcServer) list(w http.ResponseWriter, r *http.Request) {
 		snapshot = append(snapshot, j)
 	}
 	s.mu.RUnlock()
-	// Copy each job's live fields under its own lock — never the server lock.
+	// Copy each job's live fields under its own lock, never the server lock.
 	out := make([]jobView, len(snapshot))
 	for i, j := range snapshot {
 		out[i] = j.view(false)
@@ -237,7 +241,7 @@ func (s *rpcServer) stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := j.cmd.Process.Signal(os.Interrupt); err != nil {
-		j.cmd.Process.Kill() // Windows can't deliver SIGINT; hard-stop instead
+		j.cmd.Process.Kill() // Windows cannot deliver SIGINT; kill the process instead
 	}
 	httpx.WriteJSON(w, map[string]string{"status": "stopping"})
 }
@@ -259,8 +263,9 @@ func (s *rpcServer) byID(r *http.Request) *rpcJob {
 	return s.jobs[id]
 }
 
-// reapLoop bounds memory: it drops jobs that finished longer than retain ago,
-// and if the map still exceeds the hard ceiling, drops the oldest finished ones.
+// reapLoop keeps memory bounded. It drops jobs that finished more than retain
+// ago, and if the map is still over the hard limit, it drops the oldest
+// finished ones too.
 func (s *rpcServer) reapLoop(stop <-chan struct{}) {
 	t := time.NewTicker(rpcReapPeriod)
 	defer t.Stop()
@@ -286,7 +291,7 @@ func (s *rpcServer) reap(now time.Time) {
 	if len(s.jobs) <= rpcMaxRetain {
 		return
 	}
-	// Over the hard ceiling: drop the oldest finished jobs first.
+	// Over the hard limit: drop the oldest finished jobs first.
 	finished := make([]*rpcJob, 0, len(s.jobs))
 	for _, j := range s.jobs {
 		if j.endedNano.Load() > 0 {
@@ -359,10 +364,10 @@ func (j *rpcJob) view(includeLog bool) jobView {
 	return v
 }
 
-// jobWriter captures a child's combined output into its job, under the job's own
-// lock (never the server lock), keeping a bounded log and the latest progress
-// line (progress lines contain " segs | " — a stable contract, see
-// engine.Progress.Line).
+// jobWriter captures a child's combined output into its job, under the job's
+// own lock (never the server lock). It keeps a bounded log and the latest
+// progress line. A progress line contains " segs | ", which is a stable
+// contract; see engine.Progress.Line.
 type jobWriter struct{ j *rpcJob }
 
 func (jw *jobWriter) Write(p []byte) (int, error) {

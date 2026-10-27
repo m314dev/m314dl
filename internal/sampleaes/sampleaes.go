@@ -1,31 +1,37 @@
 // Package sampleaes decrypts HLS SAMPLE-AES elementary streams inside an
-// MPEG-2 transport stream, per Apple's "MPEG-2 Stream Encryption Format for
-// HTTP Live Streaming".
+// MPEG-2 transport stream, following Apple's "MPEG-2 Stream Encryption Format
+// for HTTP Live Streaming".
 //
-// SAMPLE-AES encrypts the media samples, not whole segments: within each
-// elementary stream the codec payload is AES-128-CBC encrypted in a
-// codec-specific pattern while headers and structural bytes stay in the clear.
-// Only the content key is supplied from outside; everything else (which PIDs
-// carry which codec, sample boundaries) is read from the TS itself.
+// SAMPLE-AES leaves the segment container alone and encrypts only the media
+// samples inside it. Within each elementary stream (one audio or video track
+// of the TS) the codec payload is encrypted with AES-128-CBC in a pattern that
+// depends on the codec, while headers and structural bytes stay readable. The
+// caller supplies only the content key. Everything else, such as which PIDs
+// carry which codec and where each sample starts and ends, is read from the TS
+// itself.
 //
-// Two codecs are handled: AAC in ADTS and H.264. A SAMPLE-AES encoder ciphers
-// the sample in place inside the *escaped* NAL (the 1-in-10 encrypted blocks sit
-// within the emulation-prevented bitstream) and then re-runs start-code
-// emulation prevention over the ciphered NAL — which adds one EP layer for the
-// ciphertext's new 00 00 0x runs. Decryption is the exact inverse: strip that
-// one EP layer, decipher the blocks in place, and return the NAL. The result is
-// the original clear escaped NAL, unchanged; the length shrinks only because the
-// ciphertext's added EP layer is gone (so the video PES is re-packetized). No EP
-// is re-applied. AAC frames carry no emulation prevention and keep their length,
-// so they are deciphered fully in place. The PMT's encrypted stream_type values
-// are rewritten to their clear equivalents so a downstream demuxer treats the
-// result as clear.
+// Two codecs are handled: AAC in ADTS and H.264. An H.264 NAL unit is normally
+// "escaped": emulation-prevention (EP) bytes are inserted so that no byte run
+// inside it looks like a start code. A SAMPLE-AES encoder encrypts the sample
+// in place inside that escaped NAL (the 1-in-10 encrypted blocks sit within the
+// emulation-prevented bitstream) and then runs start-code emulation prevention
+// again over the encrypted NAL. That adds one more EP layer, covering the new
+// 00 00 0x runs the ciphertext produced. Decryption is the exact inverse: strip
+// that one EP layer, decrypt the blocks in place, and return the NAL. The
+// result is the original clear escaped NAL, unchanged. Its length shrinks only
+// because the ciphertext's added EP layer is gone, which is why the video PES
+// is re-packetized. No EP is added back. AAC frames carry no emulation
+// prevention and keep their length, so they are decrypted fully in place. The
+// PMT's encrypted stream_type values are rewritten to their clear equivalents
+// so a downstream demuxer treats the result as clear.
 //
-// Implemented to the spec's encryption listings (2-1 for H.264, 2-2 for AAC) and
-// cross-checked against the reference decoders (hls.js, and ffmpeg's
+// The code follows the spec's encryption listings (2-1 for H.264, 2-2 for AAC)
+// and was checked against the reference decoders (hls.js, and ffmpeg's
 // hls_sample_encryption.c) and against real streams encrypted by Bento4's
-// mp42hls. AC-3/E-AC-3 and HEVC are not decrypted; an encrypted stream of those
-// types is reported rather than silently passed through as if clear.
+// mp42hls. AC-3 and E-AC-3 are not decrypted; an encrypted stream of either
+// type is reported as an error instead of being passed through as if it were
+// clear. HEVC has no stream_type mapping here at all, so an HEVC stream's
+// packets pass through untouched, still encrypted.
 package sampleaes
 
 import (
@@ -56,14 +62,14 @@ const (
 	codecOther codec = iota
 	codecAVC
 	codecAAC
-	codecAC3  // detected only, to fail loudly (not decrypted)
-	codecEAC3 // detected only, to fail loudly (not decrypted)
+	codecAC3  // detected only so Decrypt can report it; not decrypted
+	codecEAC3 // detected only so Decrypt can report it; not decrypted
 )
 
-// Decrypt returns a clean transport stream with the SAMPLE-AES samples in seg
-// decrypted using the 16-byte key and 16-byte iv. A buffer that is not a
-// transport stream (no sync alignment) or that carries no SAMPLE-AES streams is
-// returned unchanged.
+// Decrypt decrypts the SAMPLE-AES samples in seg with the 16-byte key and
+// 16-byte iv and returns a clean transport stream. A buffer that is not a
+// transport stream (no sync bytes at 188-byte spacing) or that carries no
+// SAMPLE-AES streams is returned unchanged.
 func Decrypt(seg, key, iv []byte) ([]byte, error) {
 	if len(key) != 16 {
 		return nil, fmt.Errorf("sampleaes: key is %d bytes, want 16", len(key))
@@ -82,8 +88,9 @@ func Decrypt(seg, key, iv []byte) ([]byte, error) {
 	body := seg[start:]
 	n := len(body) / pktLen
 
-	// A slot holds already-rendered output bytes, or is a placeholder filled
-	// when a video PES finalizes. Output keeps source order by first packet.
+	// A slot holds output bytes that are ready, or stands in for a video PES
+	// whose bytes are filled in once the whole PES has been collected. Slots
+	// keep the source order of each item's first packet.
 	type slot struct{ data []byte }
 	type span struct {
 		s   *slot
@@ -94,19 +101,19 @@ func Decrypt(seg, key, iv []byte) ([]byte, error) {
 		pid     uint16
 		c       codec
 		payload []byte
-		slot    *slot   // video: placeholder for the re-packetized PES
-		header  []byte  // video: first packet's TS header + adaptation field
-		spans   []span  // audio: where the (length-preserving) payload writes back
+		slot    *slot  // video: placeholder for the re-packetized PES
+		header  []byte // video: first packet's TS header + adaptation field
+		spans   []span // audio: where the same-length decrypted payload is written back
 	}
 
 	var out []*slot
 	emit := func(b []byte) { out = append(out, &slot{data: b}) }
 
 	var (
-		pmtPID   uint16
-		havePMT  bool
-		elems    = map[uint16]codec{}
-		asm      = map[uint16]*pesAsm{}
+		pmtPID  uint16
+		havePMT bool
+		elems   = map[uint16]codec{}
+		asm     = map[uint16]*pesAsm{}
 	)
 
 	flushAudio := func(a *pesAsm) error {
@@ -171,8 +178,9 @@ func Decrypt(seg, key, iv []byte) ([]byte, error) {
 		c, isMedia := elems[id]
 		off := payloadOffset(p)
 		if !isMedia || off >= pktLen {
-			// non-media, or a media packet with no payload (PCR-only): pass
-			// through so its adaptation field / PCR is preserved.
+			// Not a media packet, or a media packet with no payload (PCR only).
+			// Pass it through unchanged so its adaptation field and PCR (the
+			// program clock reference) survive.
 			emit(dup(p))
 			continue
 		}
@@ -184,24 +192,26 @@ func Decrypt(seg, key, iv []byte) ([]byte, error) {
 				}
 				s := &slot{}
 				out = append(out, s)
-				// Preserve the first packet's TS header + adaptation field (PCR,
-				// random-access flag) onto the re-packetized PES.
-				// ponytail: an adaptation field on a *continuation* packet of a
-				// video PES (uncommon; PCR usually rides the PES-start packet) is
-				// dropped — PTS/DTS in the PES header survive, so players re-derive
-				// timing. Carry per-packet adaptation fields if a stream needs it.
+				// Keep the first packet's TS header and adaptation field (PCR,
+				// random-access flag) on the re-packetized PES.
+				// ponytail: an adaptation field on a continuation packet of a
+				// video PES is dropped. That is uncommon; the PCR usually rides on
+				// the packet that starts the PES. The PTS/DTS timestamps in the PES
+				// header survive, so players can rebuild the timing. Carry
+				// per-packet adaptation fields if a stream needs it.
 				a := &pesAsm{pid: id, c: c, slot: s, header: dup(p[:off])}
 				a.payload = append(a.payload, p[off:]...)
 				asm[id] = a
 			} else if a := asm[id]; a != nil {
 				a.payload = append(a.payload, p[off:]...)
 			} else {
-				emit(dup(p)) // continuation with no start; can't reassemble
+				emit(dup(p)) // continuation with no start seen; cannot reassemble
 			}
 			continue
 		}
 
-		// audio: emitted in place, decrypted (length-preserving) at flush.
+		// Audio: emit the packet now and decrypt it in place at flush time. The
+		// length does not change.
 		emit(dup(p))
 		s := out[len(out)-1]
 		if pusi(p) {
@@ -223,7 +233,7 @@ func Decrypt(seg, key, iv []byte) ([]byte, error) {
 		}
 	}
 	if !havePMT {
-		return seg, nil // no PMT: cannot identify streams, leave untouched
+		return seg, nil // no PMT, so streams cannot be identified; leave untouched
 	}
 
 	var buf bytes.Buffer
@@ -236,8 +246,8 @@ func Decrypt(seg, key, iv []byte) ([]byte, error) {
 	return result, nil
 }
 
-// firstSync returns the offset of the first of three sync bytes 188 bytes
-// apart, or -1 if the buffer is not a transport stream.
+// firstSync returns the offset of the first of three sync bytes spaced 188
+// bytes apart, or -1 if the buffer is not a transport stream.
 func firstSync(b []byte) int {
 	for i := 0; i+2*pktLen < len(b); i++ {
 		if b[i] == sync && b[i+pktLen] == sync && b[i+2*pktLen] == sync {
@@ -273,8 +283,9 @@ func payloadOffset(p []byte) int {
 
 func dup(b []byte) []byte { return append([]byte(nil), b...) }
 
-// patPMTPID reads the first program's PMT PID from a PAT packet (a PAT fits in
-// one packet).
+// patPMTPID reads the first program's PMT PID from a PAT packet. The PAT
+// (program association table) lists each program and the PID of its PMT
+// (program map table). A PAT fits in one packet.
 func patPMTPID(p []byte) (uint16, bool) {
 	off := payloadOffset(p)
 	if off >= pktLen {
@@ -304,8 +315,8 @@ func patPMTPID(p []byte) (uint16, bool) {
 	return 0, false
 }
 
-// rewritePMT identifies each elementary stream's codec and returns a copy of
-// the PMT packet with encrypted stream_type values rewritten to their clear
+// rewritePMT works out each elementary stream's codec and returns a copy of the
+// PMT packet with the encrypted stream_type values rewritten to their clear
 // equivalents and the section CRC recomputed. A PMT fits in a single packet.
 func rewritePMT(p []byte) (map[uint16]codec, []byte, bool) {
 	out := dup(p)
@@ -343,11 +354,11 @@ func rewritePMT(p []byte) (map[uint16]codec, []byte, bool) {
 	return elems, out, true
 }
 
-// codecFor maps a PMT stream_type to its codec and clear stream_type. It
-// accepts both the SAMPLE-AES encrypted types (spec §3) and the normal types:
-// the manifest already tells us the stream is SAMPLE-AES, and some packagers do
-// not remap the stream_type. enc reports whether the type was an encrypted one
-// (and so must be rewritten to clear).
+// codecFor maps a PMT stream_type to its codec and its clear stream_type. It
+// accepts both the SAMPLE-AES encrypted types (spec §3) and the normal types,
+// because the manifest already says the stream is SAMPLE-AES and some packagers
+// do not remap the stream_type. enc reports whether the type was an encrypted
+// one, which means it must be rewritten to clear.
 func codecFor(stype byte) (clear byte, c codec, enc bool) {
 	switch stype {
 	case 0xdb:
@@ -370,9 +381,9 @@ func codecFor(stype byte) (clear byte, c codec, enc bool) {
 	return 0, codecOther, false
 }
 
-// unsupportedCodecs reports an error if the PMT carries an encrypted codec we
-// decrypt neither, rather than rewriting it to clear and leaving the samples
-// scrambled.
+// unsupportedCodecs returns an error when the PMT lists an encrypted codec this
+// package cannot decrypt. Without this check the stream_type would be rewritten
+// to clear while the samples stayed scrambled.
 func unsupportedCodecs(elems map[uint16]codec) error {
 	for _, c := range elems {
 		switch c {
@@ -386,13 +397,13 @@ func unsupportedCodecs(elems map[uint16]codec) error {
 }
 
 // pesPayload returns the offset of the elementary-stream data within a PES
-// packet (past the PES header), or -1 if the buffer is not a PES packet.
+// packet (just past the PES header), or -1 if the buffer is not a PES packet.
 func pesPayload(pes []byte) int {
 	if len(pes) < 9 || pes[0] != 0 || pes[1] != 0 || pes[2] != 1 {
 		return -1
 	}
 	if pes[6]&0xc0 != 0x80 {
-		return 6 // no PES header extension (unexpected for A/V)
+		return 6 // no PES header extension (unexpected for audio or video)
 	}
 	off := 9 + int(pes[8])
 	if off > len(pes) {
@@ -404,7 +415,8 @@ func pesPayload(pes []byte) int {
 // ---- codec decryption ----
 
 // decryptAudio decrypts each audio frame in an audio PES's elementary stream in
-// place (length is preserved: whole-block CBC, no emulation prevention).
+// place. The length does not change: CBC works on whole blocks and audio has no
+// emulation prevention.
 func decryptAudio(es []byte, c codec, block cipher.Block, iv []byte) error {
 	if c != codecAAC {
 		return nil // only AAC reaches here (AC-3 is rejected earlier)
@@ -434,7 +446,7 @@ func decryptAAC(frame []byte, block cipher.Block, iv []byte) {
 		return // nothing after the 16-byte leader
 	}
 	start := hdr + aacLeader
-	end := hdr + (raw &^ 15) // whole 16-byte blocks; trailing raw%16 stay clear
+	end := hdr + (raw &^ 15) // whole blocks only; the last raw%16 bytes stay clear
 	if end <= start {
 		return
 	}
@@ -442,8 +454,8 @@ func decryptAAC(frame []byte, block cipher.Block, iv []byte) {
 }
 
 // decryptVideoPES decrypts the H.264 NAL units in a video PES and returns the
-// PES with its (possibly reduced) length reflected in the PES_packet_length
-// field. A protected NAL shrinks because deciphering strips the one EP layer the
+// PES with its new, possibly smaller, length written into the PES_packet_length
+// field. A protected NAL shrinks because decryption strips the one EP layer the
 // encoder added over the ciphertext (see decryptAVCNAL); nothing is re-escaped.
 func decryptVideoPES(pes []byte, block cipher.Block, iv []byte) []byte {
 	es := pesPayload(pes)
@@ -457,8 +469,9 @@ func decryptVideoPES(pes []byte, block cipher.Block, iv []byte) []byte {
 	out := make([]byte, 0, es+len(newES))
 	out = append(out, pes[:es]...)
 	out = append(out, newES...)
-	// PES_packet_length counts bytes after the length field. Video PES commonly
-	// use 0 (unbounded); keep 0, else recompute and clamp when it overflows.
+	// PES_packet_length counts the bytes after the length field. Video PES
+	// packets commonly use 0 (unbounded); keep 0 in that case. Otherwise
+	// recompute it, and fall back to 0 if it would not fit in 16 bits.
 	if pes[4] != 0 || pes[5] != 0 {
 		n := len(out) - 6
 		if n > 0xffff {
@@ -470,7 +483,7 @@ func decryptVideoPES(pes []byte, block cipher.Block, iv []byte) []byte {
 }
 
 // decryptVideoES walks the Annex-B NAL units in a video elementary stream,
-// decrypting protected ones, and returns the rebuilt stream.
+// decrypts the protected ones, and returns the rebuilt stream.
 func decryptVideoES(es []byte, block cipher.Block, iv []byte) []byte {
 	type sc struct{ pos, prefix int } // pos = index of 00 00 01; prefix = 3 or 4
 	var scs []sc
@@ -492,7 +505,7 @@ func decryptVideoES(es []byte, block cipher.Block, iv []byte) []byte {
 	out := make([]byte, 0, len(es)+64)
 	out = append(out, es[:scs[0].pos-(scs[0].prefix-3)]...)
 	for i, s := range scs {
-		// Emit a 3-byte 00 00 01 start-code prefix. A source 4-byte prefix
+		// Emit a 3-byte 00 00 01 start-code prefix. A 4-byte prefix in the source
 		// (00 00 00 01) is normalized to 3 bytes: both are valid Annex-B
 		// delimiters and the extra leading zero carries no NAL data. (The
 		// boundary math via s.prefix keeps that leading zero out of the NAL.)
@@ -511,15 +524,16 @@ func decryptVideoES(es []byte, block cipher.Block, iv []byte) []byte {
 }
 
 // decryptAVCNAL decrypts one H.264 NAL unit (spec Listing 2-1). NAL types other
-// than 1/5, or units of 48 bytes or fewer, are returned unchanged.
+// than 1/5, and units of 48 bytes or fewer, are returned unchanged.
 //
-// The emulation-prevention bytes are removed once and NOT re-applied. SAMPLE-AES
-// encoders apply start-code emulation prevention over the *already-encrypted*
-// NAL (the encrypted blocks sit inside the escaped bitstream): removing one
-// layer recovers the encrypted NAL, and decrypting it yields the original clear
-// NAL with its own emulation prevention intact. Re-escaping would double-escape
-// and corrupt the slice. This matches the reference decoders (e.g. ffmpeg's
-// hls_sample_encryption remove_scep_3_bytes + decrypt, with no re-escape).
+// The emulation-prevention bytes are removed once and never added back.
+// SAMPLE-AES encoders apply start-code emulation prevention over the NAL after
+// encrypting it (the encrypted blocks sit inside the escaped bitstream).
+// Removing one layer recovers the encrypted NAL, and decrypting that gives the
+// original clear NAL with its own emulation prevention still in place.
+// Re-escaping would escape it twice and corrupt the slice. This matches the
+// reference decoders (for example ffmpeg's hls_sample_encryption, which runs
+// remove_scep_3_bytes and then decrypts, with no re-escape).
 func decryptAVCNAL(nal []byte, block cipher.Block, iv []byte) []byte {
 	if len(nal) == 0 {
 		return nal
@@ -529,7 +543,7 @@ func decryptAVCNAL(nal []byte, block cipher.Block, iv []byte) []byte {
 		return nal
 	}
 	raw := discardEP(nal)
-	dec := cipher.NewCBCDecrypter(block, iv) // IV resets per NAL; copies iv
+	dec := cipher.NewCBCDecrypter(block, iv) // the IV restarts for each NAL; this copies iv
 	data, rem := avcLeader, len(raw)-avcLeader
 	for rem > 0 {
 		if rem > 16 {
@@ -547,8 +561,8 @@ func decryptAVCNAL(nal []byte, block cipher.Block, iv []byte) []byte {
 	return raw
 }
 
-// cbc decrypts buf in place as AES-128-CBC starting from iv (buf length must be
-// a multiple of 16). iv is not modified.
+// cbc decrypts buf in place as AES-128-CBC starting from iv. The length of buf
+// must be a multiple of 16. iv is not modified.
 func cbc(buf []byte, block cipher.Block, iv []byte) {
 	if len(buf) == 0 || len(buf)%16 != 0 {
 		return
@@ -557,11 +571,12 @@ func cbc(buf []byte, block cipher.Block, iv []byte) {
 }
 
 // discardEP removes H.264 emulation-prevention bytes: every 00 00 03 becomes
-// 00 00, provided at least one byte follows the 03 (a trailing 00 00 03 at the
-// very end of the NAL is left intact). This matches the RBSP extraction used by
-// H.264 decoders — the removal does NOT depend on the byte after the 03, so a
-// 00 00 03 in encrypted (pseudo-random) data is stripped just the same, keeping
-// the de-escaped length exactly what the encryptor's protected-region math used.
+// 00 00, as long as at least one byte follows the 03 (a 00 00 03 at the very
+// end of the NAL is left alone). This matches the RBSP extraction that H.264
+// decoders use. The removal does not look at the byte after the 03, so a
+// 00 00 03 inside encrypted (pseudo-random) data is stripped just the same.
+// That keeps the de-escaped length exactly what the encryptor used when it
+// worked out the protected regions.
 func discardEP(data []byte) []byte {
 	out := make([]byte, 0, len(data))
 	i := 0
@@ -580,8 +595,8 @@ func discardEP(data []byte) []byte {
 // ---- re-packetization ----
 
 // packetize splits a PES payload into 188-byte TS packets on pid. The first
-// packet keeps firstHeader (its original TS header and adaptation field, so PCR
-// and random-access flags survive); the last short packet is padded with
+// packet keeps firstHeader (its original TS header and adaptation field, so the
+// PCR and random-access flag survive). The last, short packet is padded with
 // adaptation-field stuffing. Continuity counters are fixed later by renumberCC.
 func packetize(pid uint16, firstHeader, payload []byte) []byte {
 	out := make([]byte, 0, len(payload)+2*pktLen)
@@ -612,12 +627,13 @@ func packetize(pid uint16, firstHeader, payload []byte) []byte {
 	return out
 }
 
-// lastPacket builds a full 188-byte packet from a short remaining payload,
-// padding the difference with adaptation-field stuffing.
+// lastPacket builds a full 188-byte packet from a short remaining payload and
+// fills the gap with adaptation-field stuffing.
 func lastPacket(hdr, rest []byte) []byte {
 	p := make([]byte, 0, pktLen)
 	if len(hdr) == 4 && (hdr[3]>>4)&0x3 == 1 {
-		// no adaptation yet: switch to adaptation+payload and stuff.
+		// no adaptation field yet: switch to adaptation field plus payload
+		// and fill the gap with stuffing.
 		afLen := pktLen - 4 - 1 - len(rest) // bytes after the length byte
 		p = append(p, hdr[0], hdr[1], hdr[2], (hdr[3]&0x0f)|0x30)
 		p = append(p, byte(afLen))
@@ -639,10 +655,10 @@ func lastPacket(hdr, rest []byte) []byte {
 	return p
 }
 
-// renumberCC rewrites each PID's continuity counter into one continuous
-// sequence within the segment, starting from that PID's first packet's counter
-// (so an unmodified PID keeps its cross-segment continuity while a re-packetized
-// one becomes consistent).
+// renumberCC rewrites each PID's continuity counter into one unbroken sequence
+// within the segment, starting from the counter in that PID's first packet. A
+// PID that was not modified keeps its continuity with the previous segment, and
+// a re-packetized PID becomes consistent.
 func renumberCC(ts []byte) {
 	next := map[uint16]byte{}
 	seen := map[uint16]bool{}

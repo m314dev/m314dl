@@ -7,16 +7,18 @@ import (
 	"time"
 )
 
-// Server exposes a Publisher over HTTP as a live HLS origin:
+// Server exposes a Publisher over HTTP as a live HLS origin. HLS is HTTP Live
+// Streaming: a player fetches a playlist, then the short media files it lists.
 //
-//	GET /live.m3u8          → multivariant (master) playlist
-//	GET /{track}/index.m3u8 → a track's media playlist
-//	GET /{track}/init.mp4   → a track's fMP4 init segment (EXT-X-MAP target)
-//	GET /{track}/{seg}      → one media segment (000123.ts / .m4s)
+//	GET /live.m3u8          the multivariant (master) playlist
+//	GET /{track}/index.m3u8 one track's media playlist
+//	GET /{track}/init.mp4   one track's fMP4 init segment (the EXT-X-MAP target)
+//	GET /{track}/{seg}      one media segment (000123.ts or .m4s)
 //
-// Playlists are rendered fresh per request (no-cache); segments are served with
-// http.ServeContent so players get Range, ETag, and conditional requests for
-// free, straight from the shared in-memory window — one copy feeds every viewer.
+// Playlists are built fresh for every request and sent with no-cache. Segments
+// go out through http.ServeContent, so players get Range, ETag and conditional
+// requests for free, straight from the shared in-memory window. One copy of
+// each segment feeds every viewer.
 type Server struct {
 	pub *Publisher
 }
@@ -32,11 +34,12 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// DASHHandler serves the same in-memory window as a DASH presentation:
+// DASHHandler serves the same in-memory window as a DASH presentation. DASH is
+// the MPEG streaming format; its manifest is an XML file called an MPD.
 //
-//	GET /live.mpd         → the manifest (SegmentTemplate + SegmentTimeline)
-//	GET /{track}/init.mp4 → init segment (shared with the HLS handler)
-//	GET /{track}/{seg}    → one media segment (shared with the HLS handler)
+//	GET /live.mpd         the manifest (SegmentTemplate plus SegmentTimeline)
+//	GET /{track}/init.mp4 init segment (shared with the HLS handler)
+//	GET /{track}/{seg}    one media segment (shared with the HLS handler)
 func (s *Server) DASHHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /live.mpd", s.mpd)
@@ -51,8 +54,9 @@ const (
 )
 
 // readyTimeout bounds how long a manifest request waits for the first segment
-// of every track. Under every common player's manifest timeout (dash.js 10s,
-// Shaka 30s); past it an incomplete DASH presentation returns a retryable 503.
+// of every track. It stays under every common player's manifest timeout
+// (dash.js 10s, Shaka 30s). Past it, an incomplete DASH presentation returns a
+// 503 that the player can retry.
 const readyTimeout = 8 * time.Second
 
 func (s *Server) mpd(w http.ResponseWriter, r *http.Request) {
@@ -60,19 +64,20 @@ func (s *Server) mpd(w http.ResponseWriter, r *http.Request) {
 	cors(w)
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	if !s.pub.Ready() {
-		// A timeout (or failed download) doesn't make an empty timeline valid.
-		// Never let a player initialize successfully on an unplayable MPD.
+		// A timeout (or a failed download) does not make an empty timeline
+		// valid. Never let a player initialize successfully on an MPD it
+		// cannot play.
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "DASH presentation not ready: waiting for a segment from every track", http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", mimeMPD)
-	// ServeContent (not a bare Write) so the response carries Content-Length and
-	// answers Range requests: ffmpeg's DASH demuxer sends "Range: bytes=0-" and
-	// cannot finalize a chunked, length-less manifest reply ("Unable to read to
-	// manifest"). Browsers (dash.js, Shaka) tolerate the bare write; ffmpeg does
-	// not. modtime zero disables Last-Modified/caching, which the no-store header
-	// already forbids.
+	// ServeContent instead of a bare Write, so the response carries
+	// Content-Length and answers Range requests. ffmpeg's DASH demuxer sends
+	// "Range: bytes=0-" and cannot finish a chunked manifest reply that has no
+	// length ("Unable to read to manifest"). Browsers (dash.js, Shaka) accept
+	// the bare write; ffmpeg does not. A zero modtime turns off Last-Modified
+	// and caching, which the no-store header already forbids.
 	http.ServeContent(w, r, "live.mpd", time.Time{}, bytes.NewReader(s.pub.DASHManifest()))
 }
 
@@ -115,16 +120,17 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("seg")
 	data, path, modtime, ok := t.segmentByName(name)
 	if !ok {
-		// Aged out of the window, or never existed. 404 is correct: a live
-		// client should already have advanced to a newer segment.
+		// The segment aged out of the window, or never existed. 404 is right:
+		// a live client should already have moved on to a newer segment.
 		http.NotFound(w, r)
 		return
 	}
 	cors(w)
 	w.Header().Set("Content-Type", segmentMIME(name))
 	if path != "" {
-		// VOD: bytes live in a spool file, fully written before it was listed.
-		// ServeFile keeps Range/conditional handling and streams from disk.
+		// VOD: the bytes live in a spool file that was fully written before
+		// the segment was listed. ServeFile keeps the Range and conditional
+		// handling and streams from disk.
 		http.ServeFile(w, r, path)
 		return
 	}
@@ -134,22 +140,23 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 func writePlaylist(w http.ResponseWriter, body []byte) {
 	cors(w)
 	w.Header().Set("Content-Type", mimeM3U8)
-	// Playlists change every segment; never let a cache pin a stale window.
+	// Playlists change with every segment. Never let a cache hold on to a
+	// stale window.
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.Write(body)
 }
 
-// NewTSServer serves a continuous MPEG-TS broadcast:
+// NewTSServer serves a continuous MPEG-TS (transport stream) broadcast:
 //
-//	GET /live.ts → one never-ending transport stream, fanned out from the
-//	              shared broadcaster; each viewer joins on a segment boundary.
+//	GET /live.ts  one never-ending transport stream, fanned out from the
+//	              shared broadcaster. Each viewer joins on a segment boundary.
 func NewTSServer(b *TSBroadcaster) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /live.ts", func(w http.ResponseWriter, r *http.Request) {
 		if b.Ended() {
-			// The broadcast is over and holds no rewind buffer: an empty 200
-			// that immediately closes just looks like a broken stream to a
-			// player, so refuse the join outright.
+			// The broadcast is over and keeps no rewind buffer. An empty 200
+			// that closes at once looks like a broken stream to a player, so
+			// refuse the join outright.
 			http.NotFound(w, r)
 			return
 		}
@@ -176,7 +183,7 @@ func NewTSServer(b *TSBroadcaster) http.Handler {
 		for {
 			// A kicked subscriber's queue has a gap after it (the unit that
 			// overflowed was never queued), so check kicked before draining
-			// more data — bytes past the gap would corrupt the viewer's TS.
+			// more data. Bytes past the gap would corrupt the viewer's TS.
 			select {
 			case <-sub.kicked:
 				return // fell too far behind
@@ -191,7 +198,8 @@ func NewTSServer(b *TSBroadcaster) http.Handler {
 				return // fell too far behind
 			case <-b.done:
 				// Stream ended: deliver what was already queued (the finite
-				// tail) instead of cutting the viewer off mid-buffer.
+				// tail) instead of cutting the viewer off partway through
+				// its buffer.
 				for {
 					select {
 					case seg := <-sub.data:

@@ -21,8 +21,9 @@ const (
 var testKID = [16]byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}
 
 // playReadyHeader builds a base64 PlayReady Object carrying a WRMHEADER with
-// the given CENC KID (stored GUID-style, little-endian first three fields).
-// v4.0 puts the KID in <KID>text</KID>; later versions in <KID VALUE="…">.
+// the given CENC KID, stored GUID style with the first three fields in
+// little-endian order. Version 4.0 puts the KID in <KID>text</KID>; later
+// versions use <KID VALUE="…">.
 func playReadyHeader(kid [16]byte, v41 bool) string {
 	g := kid
 	g[0], g[1], g[2], g[3] = g[3], g[2], g[1], g[0]
@@ -120,7 +121,8 @@ func TestParseClear(t *testing.T) {
 	if m.Live || m.URL != baseURL {
 		t.Fatalf("master: live=%v url=%q", m.Live, m.URL)
 	}
-	// 2 video + 2 audio + 1 text; the HEVC level is dropped (no init synthesis)
+	// 2 video + 2 audio + 1 text; the HEVC level is dropped because no init
+	// can be built for it
 	if len(m.Streams) != 5 {
 		for _, st := range m.Streams {
 			t.Logf("  %s %s", st.ID, st)
@@ -132,8 +134,8 @@ func TestParseClear(t *testing.T) {
 	if v.Type != manifest.Video || v.Width != 640 || v.Height != 360 || v.Bandwidth != 1000000 || v.Codecs != "avc1.42c00d" {
 		t.Fatalf("video stream: %+v", v)
 	}
-	// timeline: r=2 → two 2s chunks at 0 and 2s; explicit t=5s (a gap); then a
-	// chunk with no d that runs to the 8s presentation end
+	// timeline: r=2 gives two 2s chunks at 0 and 2s; an explicit t=5s leaves a
+	// gap; then a chunk with no d runs to the 8s presentation end
 	wantURLs := []string{
 		"https://cdn.example.invalid/vod/movie.ism/QualityLevels(1000000)/Fragments(video=0)",
 		"https://cdn.example.invalid/vod/movie.ism/QualityLevels(1000000)/Fragments(video=20000000)",
@@ -171,7 +173,8 @@ func TestParseClear(t *testing.T) {
 		t.Fatalf("audio segments: %+v", a.Segments)
 	}
 	decodeInit(t, a)
-	// HE-AAC with no CodecPrivateData: ASC derived from SamplingRate/Channels
+	// HE-AAC with no CodecPrivateData: the ASC is built from SamplingRate and
+	// Channels
 	if he := byID(t, m, "audio_eng.1.1"); he.Codecs != "mp4a.40.5" || he.Init == nil {
 		t.Fatalf("HE-AAC stream: %+v", he)
 	}
@@ -196,7 +199,7 @@ func TestParseProtected(t *testing.T) {
 				t.Fatalf("v41=%v: segment key %+v", v41, seg.Key)
 			}
 		}
-		// the synthesized init carries the tenc the decryptor reads
+		// the synthesized init carries the tenc box the decryptor reads
 		info, err := mp4.ParseInit(decodeInit(t, v))
 		if err != nil || info == nil || info.DefaultKID != testKID || info.Scheme != mp4.SchemeCENC || info.PerSampleIVLen != 8 {
 			t.Fatalf("v41=%v: init protection %+v err=%v", v41, info, err)
@@ -209,8 +212,8 @@ func TestParseProtected(t *testing.T) {
 			t.Fatal("text marked encrypted")
 		}
 	}
-	// a Protection element whose header yields no KID: still CENC, zero KID
-	// (the -key value or a bare key then stands in)
+	// a Protection element whose header yields no KID: still CENC, with an
+	// all-zero KID (the -key value or a bare key then stands in)
 	m, err := mss.Parse([]byte(manifestXML(`<Protection><ProtectionHeader SystemID="EDEF8BA9-79D6-4ACE-A3C8-27DCD51D21ED">AAAAAA==</ProtectionHeader></Protection>`)), baseURL)
 	if err != nil {
 		t.Fatal(err)

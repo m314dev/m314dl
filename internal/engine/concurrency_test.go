@@ -24,11 +24,11 @@ func TestDecidePlateauHolds(t *testing.T) {
 	// Once throughput stops improving, slow-start ends and the limit holds.
 	s := ctlState{slowStart: true, prevTP: 1000}
 	limit := 32
-	limit, s = decide(limit, 1000, 0, adaptiveMin, adaptiveMax, s) // flat → exit slow start
+	limit, s = decide(limit, 1000, 0, adaptiveMin, adaptiveMax, s) // flat: slow start ends
 	if s.slowStart {
 		t.Fatal("slow-start should have ended on plateau")
 	}
-	got, _ := decide(limit, 1000, 0, adaptiveMin, adaptiveMax, s) // still flat → hold
+	got, _ := decide(limit, 1000, 0, adaptiveMin, adaptiveMax, s) // still flat: hold
 	if got != limit {
 		t.Fatalf("plateau should hold at %d, moved to %d", limit, got)
 	}

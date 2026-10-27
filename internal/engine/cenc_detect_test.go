@@ -27,7 +27,7 @@ func box(typ string, payload ...[]byte) []byte {
 }
 
 // encryptedInit is a minimal init segment whose video sample entry is `encv`
-// carrying a tenc box — the shape a packager emits for CENC content.
+// with a tenc box inside, the shape a packager emits for CENC content.
 func encryptedInit(kid [16]byte) []byte {
 	tenc := box("tenc", append([]byte{
 		0, 0, 0, 0, // version 0, flags
@@ -52,10 +52,11 @@ func encryptedInit(kid [16]byte) []byte {
 
 // A manifest that says nothing about encryption does not make a stream clear.
 //
-// Some packagers omit ContentProtection entirely. Judging the stream by the
-// manifest alone means copying encrypted samples straight through: the player
-// gets a black picture with working audio, and nothing anywhere reports a
-// fault. The init segment is the authority, so the refusal must come from it.
+// Some packagers leave out ContentProtection entirely. If we judged the stream
+// by the manifest alone, encrypted samples would be copied straight through:
+// the player gets a black picture with working audio, and nothing anywhere
+// reports a fault. The init segment has the final say, so the refusal must
+// come from it.
 func TestEncryptionIsDetectedFromTheInitNotTheManifest(t *testing.T) {
 	kid := [16]byte{0xab, 0xcd, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
 	initSeg := encryptedInit(kid)
@@ -87,7 +88,7 @@ func TestEncryptionIsDetectedFromTheInitNotTheManifest(t *testing.T) {
 	if !bytes.Contains([]byte(err.Error()), []byte("no key for stream")) {
 		t.Fatalf("error = %v, want it to say no key is available", err)
 	}
-	// And it must name the KID, so an operator can go and fetch that key.
+	// It must also name the KID, so an operator can go and fetch that key.
 	if !strings.Contains(err.Error(), "abcd0102") {
 		t.Fatalf("error = %v, want it to name the KID", err)
 	}
@@ -122,14 +123,14 @@ func TestKnownKeyDecryptsAnInitDetectedStream(t *testing.T) {
 }
 
 // cbcsInit is a minimal init whose sample entry declares the cbcs scheme
-// (constant IV, 1:9 pattern) — the shape an fMP4 HLS SAMPLE-AES stream uses.
+// (constant IV, 1:9 pattern), the shape an fMP4 HLS SAMPLE-AES stream uses.
 func cbcsInit(kid [16]byte, constIV []byte) []byte {
 	tenc := box("tenc", append(append([]byte{
 		1, 0, 0, 0, // version 1 (pattern present), flags
-		0,          // reserved
+		0,            // reserved
 		(1 << 4) | 9, // crypt_byte_block=1, skip_byte_block=9
-		1,          // is_protected
-		0,          // per_sample_IV_size = 0 -> constant IV
+		1,            // is_protected
+		0,            // per_sample_IV_size = 0 -> constant IV
 	}, kid[:]...), append([]byte{byte(len(constIV))}, constIV...)...))
 	schi := box("schi", tenc)
 	schm := box("schm", []byte{0, 0, 0, 0}, []byte("cbcs"), []byte{0, 1, 0, 0})
@@ -141,8 +142,8 @@ func cbcsInit(kid [16]byte, constIV []byte) []byte {
 	return box("moov", box("trak", box("mdia", box("minf", box("stbl", stsd)))))
 }
 
-// An fMP4 stream flagged SAMPLE-AES (== cbcs) with a supplied key is routed
-// through the CENC/cbcs decryptor, not refused.
+// An fMP4 stream flagged SAMPLE-AES (which is cbcs) with a supplied key goes
+// through the CENC/cbcs decryptor instead of being refused.
 func TestSampleAESfMP4RoutesToCBCS(t *testing.T) {
 	kid := [16]byte{0x11, 0x22, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	constIV := bytes.Repeat([]byte{0x42}, 16)

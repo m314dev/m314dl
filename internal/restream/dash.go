@@ -8,30 +8,31 @@ import (
 	"github.com/m314dev/m314dl/internal/manifest"
 )
 
-// Live/VOD DASH output. The same Track window that feeds HLS also feeds a DASH
-// SegmentTemplate+SegmentTimeline manifest — one AdaptationSet per media type,
-// one Representation per track, each with its own timeline built from the
-// segments' real durations. SegmentTimeline (over $Number$/$Time$ arithmetic) is
-// the robust choice: it states each segment's start and duration explicitly, so
-// variable-duration segments and a source that rewinds its own numbering can't
-// desync the manifest from what's on disk.
+// Live and VOD DASH output. The same Track window that feeds HLS also feeds a
+// DASH SegmentTemplate+SegmentTimeline manifest: one AdaptationSet per media
+// type, one Representation per track, each with its own timeline built from
+// the segments' real durations. SegmentTimeline, instead of plain
+// $Number$/$Time$ arithmetic, is the safe choice. It states each segment's
+// start and duration explicitly, so variable-duration segments and a source
+// that rewinds its own numbering cannot put the manifest out of step with what
+// is on disk.
 //
 // A dynamic (live) MPD advertises minimumUpdatePeriod so players re-fetch it;
 // a static (VOD) MPD lists the whole timeline and a mediaPresentationDuration.
 // A finite source that is still downloading is presented the way a live channel
-// is: dynamic, availabilityStartTime at the run start, no timeShiftBufferDepth
-// (so the whole spool stays seekable back to t=0). The wall clock gates
-// availability exactly as for live, so every player's default live-edge math
-// (now − AST − delay) lands inside the spooled timeline. Back-dating AST to make
-// the spool "available" instantly was tried and broke dash.js outright: its DVR
-// window is wall-clock derived by default, so it sought ~24h in and never
-// played. Once the download completes the MPD still stays dynamic, without a
-// mediaPresentationDuration and with minimumUpdatePeriod, until the wall clock
-// has passed the end. A static MPD handed to a mid-session dash.js made it end
-// playback at whatever it had buffered. Late joiners after the end get a
-// static, fully seekable VOD. DASH segments are fMP4 — a TS source must be
-// remuxed first (a later phase), which the coordinator enforces before choosing
-// this output.
+// is: dynamic, availabilityStartTime (AST) at the run start, and no
+// timeShiftBufferDepth (so the whole spool stays seekable back to t=0). The
+// wall clock controls availability exactly as for live, so every player's
+// default live-edge math (now minus AST minus delay) lands inside the spooled
+// timeline. Back-dating AST to make the spool "available" at once was tried and
+// broke dash.js outright: its DVR window comes from the wall clock by default,
+// so it sought ~24h in and never played. Once the download completes the MPD
+// still stays dynamic, without a mediaPresentationDuration and with
+// minimumUpdatePeriod, until the wall clock has passed the end. A static MPD
+// handed to a mid-session dash.js made it end playback at whatever it had
+// buffered. Late joiners after the end get a static, fully seekable VOD. DASH
+// segments are fMP4; a TS source must be remuxed first (a later phase), which
+// the coordinator enforces before choosing this output.
 
 const isoTime = "2006-01-02T15:04:05Z"
 
@@ -42,8 +43,8 @@ func (p *Publisher) DASHManifest() []byte {
 	td := p.maxTargetDur()
 	now := p.now().UTC()
 	total := p.totalDur()
-	// aired: a completed finite source whose wall-clock "broadcast" is over —
-	// no session can still be playing it as live, so it may go static.
+	// aired: a completed finite source whose wall-clock "broadcast" is over.
+	// No session can still be playing it as live, so it may go static.
 	aired := done && now.Sub(p.start).Seconds() >= total
 
 	var b strings.Builder
@@ -62,35 +63,37 @@ func (p *Publisher) DASHManifest() []byte {
 		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" timeShiftBufferDepth="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
 			p.start.UTC().Format(isoTime), now.Format(isoTime), td, td*float64(windowSize), td*3)
 	case !aired:
-		// Finite source that has not yet "aired" out in wall-clock time —
-		// whether still downloading or fully spooled — is served exactly like a
+		// A finite source that has not yet "aired" out in wall-clock time,
+		// whether still downloading or fully spooled, is served exactly like a
 		// live channel: dynamic, availabilityStartTime at the run start,
-		// minimumUpdatePeriod so players keep refreshing, no timeShiftBufferDepth
-		// (absent = infinite, so t=0 stays seekable). No mediaPresentationDuration
-		// yet, for two reasons: a static flip mid-session freezes dash.js where
-		// it buffered (its "media finished" flag), and ffmpeg's demuxer refuses a
-		// dynamic MPD that carries a duration ("Unable to read to manifest").
-		// A player's live edge tracks now−AST (wall clock), not the fully spooled
-		// timeline, so a from-the-start session plays 1:1 and arrives at the end
-		// just as the broadcast airs and the static MPD below takes over.
+		// minimumUpdatePeriod so players keep refreshing, and no
+		// timeShiftBufferDepth (absent means infinite, so t=0 stays seekable).
+		// No mediaPresentationDuration yet, for two reasons: a static flip
+		// mid-session freezes dash.js where it buffered (its "media finished"
+		// flag), and ffmpeg's demuxer refuses a dynamic MPD that carries a
+		// duration ("Unable to read to manifest"). A player's live edge follows
+		// the wall clock (now minus AST), not the fully spooled timeline, so a
+		// from-the-start session plays 1:1 and arrives at the end just as the
+		// broadcast airs and the static MPD below takes over.
 		fmt.Fprintf(&b, ` availabilityStartTime=%q publishTime=%q minimumUpdatePeriod="PT%.0fS" suggestedPresentationDelay="PT%.0fS"`,
 			p.start.UTC().Format(isoTime), now.Format(isoTime), td, td*3)
 	default:
 		// Aired: the wall clock has passed the end, so no session can still be
-		// playing it live. Become a plain static VOD — late joiners start at 0
+		// playing it live. Become a plain static VOD. Late joiners start at 0
 		// and get the whole seekable timeline.
 		fmt.Fprintf(&b, ` mediaPresentationDuration="PT%.3fS"`, total)
 	}
 	b.WriteString(">\n")
-	// The Period body (adaptation sets + timelines) is the O(segments) part and
-	// depends only on the tracks, not on the wall clock, so it is cached; the
-	// header above carries the per-request publishTime and live/aired phase.
+	// The Period body (adaptation sets and timelines) is the O(segments) part.
+	// It depends only on the tracks, not on the wall clock, so it is cached.
+	// The header above carries the per-request publishTime and the live/aired
+	// phase.
 	b.Write(p.dashBody())
 	b.WriteString("</MPD>\n")
 	return []byte(b.String())
 }
 
-// dashBody renders (and caches) the <Period> body, rebuilding only when a
+// dashBody renders (and caches) the <Period> body, rebuilding it only when a
 // segment is added, an init arrives, or the stream ends. Many pollers on a long
 // growing VOD then share one render instead of each re-walking every segment.
 func (p *Publisher) dashBody() []byte {
@@ -132,8 +135,8 @@ func (p *Publisher) isLive() bool {
 	return false
 }
 
-// allEnded reports whether every track has finished (End was called), i.e. the
-// presentation is complete and a VOD MPD may go static.
+// allEnded reports whether every track has finished (End was called), that is,
+// the presentation is complete and a VOD MPD may go static.
 func (p *Publisher) allEnded() bool {
 	for _, t := range p.tracks {
 		t.mu.RLock()
@@ -205,8 +208,8 @@ func writeAdaptationSet(b *strings.Builder, t *Track, contentType, mime string) 
 	b.WriteString(">\n")
 
 	if contentType == "audio" && t.channels != "" {
-		// Preserve the scheme alongside its value: a Dolby hex speaker mask
-		// (e.g. F801) must not be relabelled as an MPEG channel index.
+		// Keep the scheme next to its value: a Dolby hex speaker mask (e.g.
+		// F801) must not be relabelled as an MPEG channel index.
 		scheme := t.channelScheme
 		if scheme == "" {
 			scheme = "urn:mpeg:dash:23003:3:audio_channel_configuration:2011"
@@ -228,8 +231,8 @@ func writeAdaptationSet(b *strings.Builder, t *Track, contentType, mime string) 
 }
 
 // writeTimeline emits <S> entries, collapsing runs of equal-duration segments
-// into a single entry with @r. Every run carries an explicit @t, so a gap or a
-// trimmed window can never leave the timeline mis-anchored.
+// into one entry with @r. Every run carries an explicit @t, so a gap or a
+// trimmed window can never leave the timeline anchored at the wrong time.
 func writeTimeline(b *strings.Builder, segs []*segment) {
 	for i := 0; i < len(segs); {
 		d := int64(math.Round(segs[i].dur * 1000))
