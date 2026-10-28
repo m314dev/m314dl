@@ -80,14 +80,34 @@ func parseTime(h, m, s, ms string) float64 {
 // removed later).
 func parseVTT(text string) []Cue {
 	var cues []Cue
+	// HLS puts an X-TIMESTAMP-MAP header in every WebVTT segment. It ties the
+	// cue times of that segment to the MPEG-TS clock (PTS) the video uses. off
+	// is what to add to a cue time to land on that clock. base is the clock
+	// value of the first segment's anchor; subtracting it puts the first segment
+	// at zero, which is where ffmpeg puts the video when it muxes. Without the
+	// header both stay zero and cue times pass through as written.
+	var off, base float64
+	haveBase := false
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	for i := 0; i < len(lines); i++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "X-TIMESTAMP-MAP=") {
+			if o, pts, ok := timestampMap(strings.TrimSpace(lines[i])); ok {
+				off = o
+				if !haveBase {
+					base, haveBase = pts, true
+				}
+			}
+			continue
+		}
 		m := vttCueLineRe.FindStringSubmatch(lines[i])
 		if m == nil {
 			continue
 		}
-		start := parseTime(m[1], m[2], m[3], m[4])
-		end := parseTime(m[5], m[6], m[7], m[8])
+		start := parseTime(m[1], m[2], m[3], m[4]) + off - base
+		end := parseTime(m[5], m[6], m[7], m[8]) + off - base
+		if start < 0 {
+			start = 0 // a cue that began before the first anchor; keep what is left of it
+		}
 		var body []string
 		for j := i + 1; j < len(lines); j++ {
 			l := strings.TrimRight(lines[j], " \t")
@@ -108,6 +128,32 @@ func parseVTT(text string) []Cue {
 		}
 	}
 	return dedupe(cues)
+}
+
+// timestampMap reads an HLS "X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000"
+// line, in either attribute order. It returns the seconds to add to a cue time
+// of that segment to get its PTS, and the PTS the LOCAL time is anchored to.
+// MPEGTS counts in 90 kHz ticks.
+// ponytail: no 33-bit PTS wrap handling; a wrap needs a file over 26 hours.
+func timestampMap(line string) (off, pts float64, ok bool) {
+	var local float64
+	for _, f := range strings.Split(strings.TrimPrefix(line, "X-TIMESTAMP-MAP="), ",") {
+		switch f = strings.TrimSpace(f); {
+		case strings.HasPrefix(f, "MPEGTS:"):
+			v, err := strconv.ParseFloat(f[len("MPEGTS:"):], 64)
+			if err != nil {
+				return 0, 0, false
+			}
+			pts, ok = v/90000, true
+		case strings.HasPrefix(f, "LOCAL:"):
+			m := vttTimeRe.FindStringSubmatch(f)
+			if m == nil {
+				return 0, 0, false
+			}
+			local = parseTime(m[1], m[2], m[3], m[4])
+		}
+	}
+	return pts - local, pts, ok
 }
 
 var ttmlPRe = regexp.MustCompile(`(?s)<p[^>]*?begin="([^"]+)"[^>]*?end="([^"]+)"[^>]*>(.*?)</p>`)

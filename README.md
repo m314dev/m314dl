@@ -271,9 +271,10 @@ H.264) works too when you supply the key.
 
 ### Subtitles
 
-WebVTT (deduped across concatenated segments), TTML to SRT (a lenient regex
-parser that copes with non-compliant XML), and native fMP4 `wvtt` and `stpp`
-extraction. `wvtt` timing comes from the MP4 sample metadata, including empty
+WebVTT (deduped across concatenated segments, with each HLS segment's
+`X-TIMESTAMP-MAP` applied so cues line up with the video even when its clock
+does not start at zero), TTML to SRT (a lenient regex parser that copes with
+non-compliant XML), and native fMP4 `wvtt` and `stpp` extraction. `wvtt` timing comes from the MP4 sample metadata, including empty
 gaps and cues split across samples. SRT and VTT conversion doesn't need FFmpeg.
 Subtitles are muxed with ISO 639-2 language tags, or written as separate files
 with `-sub-external`. If a conversion fails, the raw subtitle file is kept so you

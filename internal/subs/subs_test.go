@@ -119,3 +119,49 @@ func TestSRTFormat(t *testing.T) {
 		t.Fatalf("srt time = %s", s)
 	}
 }
+
+// Two HLS WebVTT segments whose cue times restart at zero in each segment. The
+// X-TIMESTAMP-MAP header carries the real position: segment two starts ten
+// seconds after segment one.
+const vttSegmentLocal = `WEBVTT
+X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000
+
+00:00:01.000 --> 00:00:02.000
+a
+
+WEBVTT
+X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:1800000
+
+00:00:01.000 --> 00:00:02.000
+b
+`
+
+func TestVTTTimestampMapSegmentLocal(t *testing.T) {
+	cues := parseVTT(vttSegmentLocal)
+	if len(cues) != 2 || cues[0].Start != 1 || cues[0].End != 2 || cues[1].Start != 11 || cues[1].End != 12 {
+		t.Fatalf("cues = %+v, want a at 1-2 and b at 11-12", cues)
+	}
+}
+
+// Cue times written in presentation time while the video's clock starts at ten
+// seconds. The map says LOCAL ten seconds is PTS ten seconds, so after the
+// video is moved to zero the cue has to move with it.
+func TestVTTTimestampMapPresentationTime(t *testing.T) {
+	vtt := "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:10.000\n\n" +
+		"00:00:11.000 --> 00:00:12.000\nlate by ten without the map\n\n" +
+		"00:00:09.500 --> 00:00:10.500\nbegan before the anchor\n"
+	cues := parseVTT(vtt)
+	if len(cues) != 2 || cues[1].Start != 1 || cues[1].End != 2 {
+		t.Fatalf("cues = %+v, want the second cue at 1-2", cues)
+	}
+	if cues[0].Start != 0 || cues[0].End != 0.5 {
+		t.Fatalf("early cue = %+v, want it clamped to 0-0.5", cues[0])
+	}
+}
+
+func TestVTTWithoutTimestampMapUnchanged(t *testing.T) {
+	cues := parseVTT(vttConcat)
+	if cues[0].Start != 1 || cues[2].End != 7 {
+		t.Fatalf("cues moved without a map: %+v", cues)
+	}
+}
