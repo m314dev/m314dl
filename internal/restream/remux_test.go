@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,9 +13,17 @@ import (
 )
 
 // Feed a real fMP4 rendition through the FFmpeg remux and confirm valid MPEG-TS
-// comes out. Exercises the pipe/fd wiring end to end; skips where ffmpeg or the
-// fixtures are not present.
-func TestRemuxFMP4ToTS(t *testing.T) {
+// comes out. Exercises the loopback TCP wiring end to end; skips where ffmpeg or
+// the fixtures are not present.
+func TestRemuxFMP4ToTS(t *testing.T) { testRemux(t, 1) }
+
+// Two tracks, each fed from its own goroutine the way the serve run loop does.
+// FFmpeg probes input 0 before it even connects to input 1, so track 1's first
+// write has to wait without stalling track 0. A deadlock here shows up as the
+// 5 second collection window ending with no output.
+func TestRemuxTwoTracks(t *testing.T) { testRemux(t, 2) }
+
+func testRemux(t *testing.T, ntracks int) {
 	ffmpeg, err := mux.FindFFmpeg("")
 	if err != nil {
 		t.Skip("ffmpeg not found")
@@ -27,23 +36,32 @@ func TestRemuxFMP4ToTS(t *testing.T) {
 
 	b := NewTSBroadcaster()
 	sub := b.Subscribe()
-	rem, err := NewRemuxTS(ffmpeg, 1, nil, b, nil)
+	rem, err := NewRemuxTS(ffmpeg, ntracks, nil, b, nil)
 	if err != nil {
 		t.Fatalf("NewRemuxTS: %v", err)
 	}
-	sink := rem.Sink(0)
-	if err := sink.Init(initData); err != nil {
-		t.Fatalf("Init: %v", err)
+	var wg sync.WaitGroup
+	for n := 0; n < ntracks; n++ {
+		wg.Add(1)
+		go func(sink engine.Sink) {
+			defer wg.Done()
+			if err := sink.Init(initData); err != nil {
+				t.Errorf("Init: %v", err)
+				return
+			}
+			for i := 0; i < 4; i++ {
+				seg, err := os.ReadFile(filepath.Join(fxDir, fmt.Sprintf("seg%04d.m4s", i)))
+				if err != nil {
+					break
+				}
+				if err := sink.Segment(engine.SegmentInfo{}, seg); err != nil {
+					t.Errorf("Segment %d: %v", i, err)
+					return
+				}
+			}
+		}(rem.Sink(n))
 	}
-	for i := 0; i < 4; i++ {
-		seg, err := os.ReadFile(filepath.Join(fxDir, fmt.Sprintf("seg%04d.m4s", i)))
-		if err != nil {
-			break
-		}
-		if err := sink.Segment(engine.SegmentInfo{}, seg); err != nil {
-			t.Fatalf("Segment %d: %v", i, err)
-		}
-	}
+	wg.Wait()
 	rem.End() // closing the inputs makes ffmpeg flush; pump publishes the rest
 
 	// Collect whatever FFmpeg produced (poll up to a few seconds).

@@ -3,7 +3,7 @@ package restream
 import (
 	"fmt"
 	"io"
-	"os"
+	"net"
 	"os/exec"
 	"strings"
 	"sync"
@@ -16,8 +16,16 @@ import (
 // The pure-Go TS path (mpegts.go) only works when the source is already a muxed
 // transport stream. When it is not (an fMP4/CMAF source, or separate video and
 // audio that must be muxed together), RemuxTS fills the gap. It feeds each
-// ordered, decrypted input track into FFmpeg over its own pipe and reads one
-// continuous MPEG-TS from FFmpeg's stdout into the broadcaster.
+// ordered, decrypted input track into FFmpeg over its own loopback TCP
+// connection and reads one continuous MPEG-TS from FFmpeg's stdout into the
+// broadcaster.
+//
+// Why TCP and not pipes. Handing FFmpeg extra pipes as fd 3, 4 and so on only
+// works where a child inherits numbered files from its parent, which is Unix.
+// Windows passes a child exactly three handles (stdin, stdout, stderr), and Go
+// refuses ExtraFiles there outright. A loopback listener per track needs no
+// inheritance at all: FFmpeg connects to it like any URL, so the same code runs
+// on every platform and the Linux tests cover what Windows users run.
 //
 // This is the one deliberate, bounded use of FFmpeg that the rest of the engine
 // avoids, and it keeps the properties that made the pure path good:
@@ -38,14 +46,51 @@ const remuxReadChunk = 256 << 10 // read FFmpeg stdout in ~256KB chunks
 type RemuxTS struct {
 	b      *TSBroadcaster
 	cmd    *exec.Cmd
-	inputs []*os.File // parent write ends, one per track (child reads pipe:3..)
+	inputs []*trackConn // one per track, in -map order
 	stderr *strings.Builder
 	logv   func(string, ...any)
 	closed sync.Once
 }
 
-// NewRemuxTS starts the FFmpeg remuxer. It creates ntracks input pipes and
-// exposes them to the child as pipe:3, pipe:4, and so on. transcodeArgs
+// trackConn is one input track's loopback connection to FFmpeg. FFmpeg opens
+// its inputs one at a time and probes each before opening the next, so the
+// connection for track 1 does not exist until track 0 has delivered enough to
+// be understood. The first Write therefore waits for FFmpeg to connect. Each
+// track runs in its own goroutine upstream, so that wait never holds up
+// another track's feed.
+type trackConn struct {
+	ln   net.Listener
+	once sync.Once
+	conn net.Conn
+	err  error
+}
+
+func (t *trackConn) accept() {
+	t.conn, t.err = t.ln.Accept()
+	t.ln.Close() // one connection per track; nothing else gets to knock
+}
+
+func (t *trackConn) Write(p []byte) (int, error) {
+	t.once.Do(t.accept)
+	if t.err != nil {
+		return 0, t.err
+	}
+	return t.conn.Write(p)
+}
+
+// Close shuts the track. Closing the listener first frees a Write that is
+// still waiting in Accept; the once.Do then waits for that Write to settle
+// before conn is read, so there is no race on it.
+func (t *trackConn) Close() {
+	t.ln.Close()
+	t.once.Do(func() { t.err = net.ErrClosed })
+	if t.conn != nil {
+		t.conn.Close()
+	}
+}
+
+// NewRemuxTS starts the FFmpeg remuxer. It opens one loopback listener per
+// track and hands FFmpeg their tcp:// addresses as inputs. transcodeArgs
 // replaces the output codec args; nil means stream copy.
 func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadcaster, logv func(string, ...any)) (*RemuxTS, error) {
 	if ntracks < 1 {
@@ -56,21 +101,22 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 	}
 
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
-	var extra []*os.File // child-side read ends, become fd 3,4,…
-	var inputs []*os.File
+	var inputs []*trackConn
 	for i := 0; i < ntracks; i++ {
-		r, w, err := os.Pipe()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
-			return nil, err
+			for _, in := range inputs {
+				in.Close()
+			}
+			return nil, fmt.Errorf("remux: listen for track %d: %w", i, err)
 		}
-		extra = append(extra, r)
-		inputs = append(inputs, w)
+		inputs = append(inputs, &trackConn{ln: ln})
 		// -thread_queue_size well above FFmpeg's default of 8. With several
 		// input demuxers reading at once the default queue fills up, FFmpeg
-		// logs "Thread message queue blocking" and can stall, and the pipe
+		// logs "Thread message queue blocking" and can stall, and the track
 		// writers then block with it. A deeper queue absorbs bursty per-input
 		// arrival.
-		args = append(args, "-thread_queue_size", "512", "-i", fmt.Sprintf("pipe:%d", 3+i))
+		args = append(args, "-thread_queue_size", "512", "-i", "tcp://"+ln.Addr().String())
 	}
 	for i := 0; i < ntracks; i++ {
 		args = append(args, "-map", fmt.Sprint(i))
@@ -86,7 +132,6 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 	args = append(args, "-max_muxing_queue_size", "1024", "-f", "mpegts", "pipe:1")
 
 	cmd := exec.Command(ffmpeg, args...)
-	cmd.ExtraFiles = extra // r[0] becomes fd 3, r[1] fd 4, …
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -94,17 +139,11 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 
+	rm := &RemuxTS{b: b, cmd: cmd, inputs: inputs, stderr: &stderr, logv: logv}
 	if err := cmd.Start(); err != nil {
+		rm.End()
 		return nil, fmt.Errorf("start ffmpeg remux: %w", err)
 	}
-	// The child holds its own copies (dups) of the read ends. The parent must
-	// close its copies so an input pipe reaches EOF once we close its write
-	// end.
-	for _, r := range extra {
-		r.Close()
-	}
-
-	rm := &RemuxTS{b: b, cmd: cmd, inputs: inputs, stderr: &stderr, logv: logv}
 	go rm.pump(stdout)
 	return rm, nil
 }
@@ -140,18 +179,22 @@ func (rm *RemuxTS) pump(stdout io.ReadCloser) {
 			rm.logv("ffmpeg remux exited: %v", err)
 		}
 	}
+	// FFmpeg is gone, so a track still waiting for it to connect would wait
+	// forever. Closing the inputs turns that wait into a write error, the same
+	// way a pipe with no reader would have failed.
+	rm.End()
 }
 
 // Sink returns the engine.Sink that feeds input track i.
 func (rm *RemuxTS) Sink(i int) engine.Sink { return remuxTrackSink{w: rm.inputs[i]} }
 
-// End closes the input pipes so FFmpeg drains and exits; pump then ends the
-// broadcaster. Safe to call more than once. Implements the presentation
+// End closes the input connections so FFmpeg drains and exits; pump then ends
+// the broadcaster. Safe to call more than once. Implements the presentation
 // contract used by the restream run loop.
 func (rm *RemuxTS) End() {
 	rm.closed.Do(func() {
-		for _, w := range rm.inputs {
-			w.Close()
+		for _, in := range rm.inputs {
+			in.Close()
 		}
 	})
 }
@@ -159,9 +202,9 @@ func (rm *RemuxTS) End() {
 func (rm *RemuxTS) StatusLine() string { return rm.b.StatusLine() }
 
 // remuxTrackSink writes one track's init and segments into its FFmpeg input
-// pipe. For fMP4 the init (ftyp+moov) is written first, then the fragments.
-// That is exactly a fragmented-MP4 byte stream, which FFmpeg demuxes from the
-// pipe.
+// connection. For fMP4 the init (ftyp+moov) is written first, then the
+// fragments. That is exactly a fragmented-MP4 byte stream, which FFmpeg demuxes
+// from the socket.
 type remuxTrackSink struct{ w io.Writer }
 
 func (s remuxTrackSink) Init(data []byte) error {
