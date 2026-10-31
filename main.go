@@ -45,7 +45,9 @@ import (
 	"github.com/m314dev/m314dl/internal/worker"
 )
 
-var version = "0.3.6" // goreleaser sets this with -ldflags "-X main.version=..."
+// version is "dev" in a plain go build. GoReleaser sets the real one with
+// -ldflags "-X main.version=...", so this value never needs a bump at a tag.
+var version = "dev"
 
 type multiFlag []string
 
@@ -846,8 +848,8 @@ func sidecarSubPath(outPath string, st *manifest.Stream, format string, used map
 // check is disabled. It returns a channel that delivers the newer tag, or ""
 // when there is none. When the check is off it returns nil.
 func startUpdateCheck(o *options) <-chan string {
-	if o.noUpdateCheck || os.Getenv("M314DL_NO_UPDATE_CHECK") != "" {
-		return nil
+	if o.noUpdateCheck || os.Getenv("M314DL_NO_UPDATE_CHECK") != "" || version == "dev" {
+		return nil // a source build has no version to compare, so every release would look newer
 	}
 	dir, err := os.UserCacheDir()
 	if err != nil {
