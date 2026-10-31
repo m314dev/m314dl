@@ -140,6 +140,7 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 	cmd.Stderr = &stderr
 
 	rm := &RemuxTS{b: b, cmd: cmd, inputs: inputs, stderr: &stderr, logv: logv}
+	logv("ffmpeg remux: %s %s", ffmpeg, strings.Join(args, " "))
 	if err := cmd.Start(); err != nil {
 		rm.End()
 		return nil, fmt.Errorf("start ffmpeg remux: %w", err)
@@ -173,8 +174,15 @@ func (rm *RemuxTS) pump(stdout io.ReadCloser) {
 	// FFmpeg output ended: no more segments will be broadcast.
 	rm.b.End()
 	if err := rm.cmd.Wait(); err != nil {
+		// Keep the whole tail of stderr, not just the last line. ffmpeg prints
+		// the cause ("Connection to tcp://... failed: ...", "moov atom not
+		// found") on an earlier line and ends with a generic "Error opening
+		// input files", which on its own says nothing.
 		if msg := strings.TrimSpace(rm.stderr.String()); msg != "" {
-			rm.logv("ffmpeg remux exited: %v: %s", err, lastLine(msg))
+			if len(msg) > 2000 {
+				msg = msg[len(msg)-2000:]
+			}
+			rm.logv("ffmpeg remux exited: %v\n%s", err, msg)
 		} else {
 			rm.logv("ffmpeg remux exited: %v", err)
 		}
@@ -215,11 +223,4 @@ func (s remuxTrackSink) Init(data []byte) error {
 func (s remuxTrackSink) Segment(_ engine.SegmentInfo, data []byte) error {
 	_, err := s.w.Write(data)
 	return err
-}
-
-func lastLine(s string) string {
-	if i := strings.LastIndexByte(strings.TrimRight(s, "\n"), '\n'); i >= 0 {
-		return s[i+1:]
-	}
-	return s
 }
