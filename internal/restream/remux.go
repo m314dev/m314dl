@@ -74,14 +74,13 @@ func NewRemuxTS(ffmpeg string, ntracks int, transcodeArgs []string, b *TSBroadca
 	}
 	defer release() // runs after Start, on every path out of here
 	rm := &RemuxTS{b: b, cmd: cmd, stderr: new(strings.Builder), logv: logv}
+	// No -thread_queue_size on the inputs. FFmpeg 9.1 dropped it as an input
+	// option and refuses the whole command line when it sees one, and it had
+	// done nothing for inputs since the 7.0 scheduler anyway. Older builds
+	// keep their default queue; a full queue there only means the track
+	// writer waits on its pipe a little longer.
 	for _, t := range tracks {
 		rm.inputs = append(rm.inputs, t.w)
-		// -thread_queue_size well above FFmpeg's default of 8. With several
-		// input demuxers reading at once the default queue fills up, FFmpeg
-		// logs "Thread message queue blocking" and can stall, and the track
-		// writers then block with it. A deeper queue absorbs bursty per-input
-		// arrival.
-		cmd.Args = append(cmd.Args, "-thread_queue_size", "512")
 		cmd.Args = append(cmd.Args, t.args...)
 	}
 	for i := 0; i < ntracks; i++ {
