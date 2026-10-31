@@ -2,7 +2,9 @@
 package hls
 
 import (
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -287,7 +289,56 @@ func parseKey(attrs, baseURL string) (*manifest.Key, error) {
 		}
 		k.IV = b
 	}
+
+	if strings.HasPrefix(a["URI"], "skd://") {
+		applySKD(k, a["URI"][len("skd://"):])
+	}
 	return k, nil
+}
+
+// decodeBase64 decodes a Base64-encoded payload using either
+// raw standard Base64 or raw URL-safe Base64 encoding.
+func decodeBase64(payload string) ([]byte, error) {
+	var data []byte
+	var err error
+
+	for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
+		data, err = enc.DecodeString(payload)
+		if err == nil {
+			break
+		}
+	}
+	return data, err
+}
+
+// applySKD extracts the kid and iv values from base64 encoded json
+// skd:// URI, {"KeyId":"<uuid>","IV":"<base64>"}
+func applySKD(k *manifest.Key, payload string) {
+	payload = strings.TrimRight(payload, "=")
+	data, err := decodeBase64(payload)
+	if err != nil {
+		return
+	}
+
+	var skd struct{ KeyID, IV string }
+	err = json.Unmarshal(data, &skd)
+	if err != nil {
+		return
+	}
+
+	kid, err := hex.DecodeString(strings.ReplaceAll(skd.KeyID, "-", ""))
+	if err == nil && len(kid) == 16 {
+		copy(k.KID[:], kid)
+	}
+
+	if k.IV == nil && skd.IV != "" {
+		iv := strings.TrimRight(skd.IV, "=")
+		data, err := decodeBase64(iv)
+		if err == nil && len(data) == 16 {
+			k.IV = data
+			return
+		}
+	}
 }
 
 func hasAudioCodec(codecs string) bool {
