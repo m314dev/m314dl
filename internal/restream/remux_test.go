@@ -13,8 +13,8 @@ import (
 )
 
 // Feed a real fMP4 rendition through the FFmpeg remux and confirm valid MPEG-TS
-// comes out. Exercises the loopback TCP wiring end to end; skips where ffmpeg or
-// the fixtures are not present.
+// comes out. Exercises the pipe wiring of this platform end to end; skips where
+// ffmpeg or the fixtures are not present.
 func TestRemuxFMP4ToTS(t *testing.T) { testRemux(t, 1) }
 
 // Two tracks, each fed from its own goroutine the way the serve run loop does.
