@@ -49,6 +49,12 @@ const (
 // playlists. Tracks are added once at startup; after that only their segment
 // windows change, so the track list itself needs no lock after setup.
 type Publisher struct {
+	// AllowInitChange says the output can present a new init mid-stream. HLS
+	// can: each init gets its own name and the playlist switches EXT-X-MAP.
+	// The DASH output has one init per track in its MPD, so it cannot. Set it
+	// before AddTrack.
+	AllowInitChange bool
+
 	tracks []*Track
 	byID   map[string]*Track
 	start  time.Time
@@ -72,6 +78,7 @@ func NewPublisher() *Publisher {
 // before serving; exactly one download stream writes the returned sink.
 func (p *Publisher) AddTrack(t *Track) engine.Sink {
 	t.ver = &p.ver
+	t.initChangeOK = p.AllowInitChange
 	p.tracks = append(p.tracks, t)
 	p.byID[t.ID] = t
 	return t
@@ -213,7 +220,8 @@ type Track struct {
 
 	ver *atomic.Int64 // shared publisher version; goes up on every segment, init or end
 
-	pendingDisc bool // the next segment starts a new run after a gap; mark it
+	pendingDisc  bool // the next segment starts a new run after a gap; mark it
+	initChangeOK bool // see Publisher.AllowInitChange
 
 	mu          sync.RWMutex
 	init        []byte
@@ -297,6 +305,9 @@ func (t *Track) Init(data []byte) error {
 	t.bumpVer()
 	return nil
 }
+
+// InitChangeOK implements engine.InitChanger.
+func (t *Track) InitChangeOK() bool { return t.initChangeOK }
 
 // initName is the URL a playlist uses for init number i. The first keeps the
 // plain name every earlier release served.

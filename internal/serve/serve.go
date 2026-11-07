@@ -217,10 +217,10 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 		if err := requireFMP4(streams); err != nil {
 			return nil, nil, "", nil, err
 		}
-		pub, jobs := buildPublisherJobs(streams, tmpDir)
+		pub, jobs := buildPublisherJobs(streams, tmpDir, false)
 		return pub, restream.NewServer(pub).DASHHandler(), "/live.mpd", jobs, nil
 	case "", "hls":
-		pub, jobs := buildPublisherJobs(streams, tmpDir)
+		pub, jobs := buildPublisherJobs(streams, tmpDir, true)
 		return pub, restream.NewServer(pub).Handler(), "/live.m3u8", jobs, nil
 	default:
 		return nil, nil, "", nil, fmt.Errorf("-serve-format %q: want hls, ts, or dash", o.Format)
@@ -238,8 +238,9 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 // Neither shape is paced. Live arrives at its own rhythm, and the VOD spool
 // has no live edge to overrun, so players pull from the growing on-disk
 // playlist at their own rate.
-func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Publisher, []Job) {
+func buildPublisherJobs(streams []*manifest.Stream, tmpDir string, initChanges bool) (*restream.Publisher, []Job) {
 	pub := restream.NewPublisher()
+	pub.AllowInitChange = initChanges
 	namer := newNamer()
 	var jobs []Job
 	for _, st := range streams {

@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -65,6 +66,16 @@ type Config struct {
 	Sink Sink
 
 	fileURL *fileURL // direct file behind an expiring redirect; set by DownloadFile
+}
+
+// InitChanger is an optional Sink capability: a sink that can take a new init
+// segment mid-stream (the HLS publisher, which lists every init under its own
+// name). A sink without it, such as the ffmpeg TS remux, gets only segments
+// that decode with the first init; the others, typically a server side ad
+// break with its own encoding, are skipped and the stream resumes when the
+// first init returns.
+type InitChanger interface {
+	InitChangeOK() bool
 }
 
 // Sink is where one stream's ordered, decrypted segments go. It is the point
@@ -818,7 +829,13 @@ func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, stat
 		paceStart  time.Time     // wall clock when realtime pacing began
 		mediaClock time.Duration // media time emitted since pacing began
 		emitted    int           // segments emitted (for the prime burst)
+		firstInit  []byte        // the init the stream started with
+		skipping   bool          // inside a run of segments the sink cannot take
 	)
+	canChange := false
+	if ic, ok := cfg.Sink.(InitChanger); ok {
+		canChange = ic.InitChangeOK()
+	}
 	commit := func(idx int64, p pend) error {
 		if p.hole {
 			return nil
@@ -828,7 +845,31 @@ func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, stat
 			return err
 		}
 		if p.it.isInit {
+			first := firstInit == nil
+			if first {
+				firstInit = data
+			}
+			same := first || bytes.Equal(data, firstInit)
+			if !same && !canChange {
+				if !skipping {
+					cfg.Verbose("live: the source switched to a different init (an ad break?); this output cannot follow, skipping until it switches back")
+				}
+				skipping = true
+				return nil
+			}
+			skipping = false
+			// Fragments are retagged to their init's track id, so follow the
+			// init that is now in force.
+			if id := mp4.SoleTrackID(data); id != 0 {
+				trackID = id
+			}
+			if same && !first && !canChange {
+				return nil // the sink still holds this init
+			}
 			return cfg.Sink.Init(data)
+		}
+		if skipping {
+			return nil
 		}
 		info := SegmentInfo{Seq: p.it.seq}
 		if p.it.seg != nil {

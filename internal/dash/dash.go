@@ -194,46 +194,20 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 				}
 				key := st.ID
 				if prev, ok := byKey[key]; ok {
-					// The same track ID shows up again in a later period. Join
-					// the two (with a discontinuity) only when the encoding
-					// really continues: same codecs, resolution, init segment
-					// and content key. Ad or bumper periods (SSAI) and
-					// per-period re-encodes differ in at least one of those, so
-					// they stay separate tracks the caller can drop (for example
-					// -sv segsMin=2:plistDurMin=20m). Joining them would splice
-					// ads in or drop a period's init.
-					if len(segs) > 0 && mergeCompatible(prev, st, init, firstSegKey(segs)) {
-						// Some packagers list the segment at the boundary in
-						// both periods (the last number of one is the first
-						// number of the next). That repeat proves the timeline
-						// runs on unbroken, so it is dropped and no
-						// discontinuity is marked. Otherwise the join is a
-						// splice and the player has to be told. A SegmentBase
-						// placeholder is left alone: two periods slicing one
-						// whole file share its URL on purpose.
-						if n := len(prev.Segments); n > 0 && segs[0].Index == nil && segs[0].URL == prev.Segments[n-1].URL {
-							segs = segs[1:]
-						} else {
-							segs[0].Discontinuity = true
-						}
-						base := int64(len(prev.Segments))
-						for i := range segs {
-							segs[i].Seq = base + int64(i)
-						}
-						prev.Segments = append(prev.Segments, segs...)
+					// The same track ID shows up again in a later period.
+					if joinPeriod(prev, st, init, segs, live) {
 						continue
 					}
-					// Incompatible, and the manifest is live: drop it. The live
-					// edge of a channel with server side ads sits in its last
-					// period, so every period has to be read, and the content
-					// periods above already joined into one track. An ad period
-					// listed as its own track would only tempt the picker, and
-					// its index in the ID would change as old periods roll off.
 					if live {
+						// A different codec family cannot share a playlist with
+						// the track, and listing it as a track of its own would
+						// only tempt the picker, with an index in its ID that
+						// shifts as old periods roll off. A live viewer skips it.
 						continue
 					}
-					// incompatible: give it an ID unique to this period so it is
-					// a separate, filterable track instead of colliding.
+					// VOD: keep it as a separate, filterable track instead of
+					// colliding (for example -sv segsMin=2:plistDurMin=20m
+					// drops short ad and bumper periods).
 					st.ID = fmt.Sprintf("%s.p%d", st.ID, pi)
 					key = st.ID
 				}
@@ -606,6 +580,91 @@ func parseFrameRate(s string) float64 {
 	}
 	v, _ := strconv.ParseFloat(s, 64)
 	return v
+}
+
+// joinPeriod appends a later period's segments to prev, the track with the
+// same ID from an earlier period, when the two can play as one stream, and
+// reports whether it did. Two shapes join:
+//
+//   - The encoding continues: same codecs, size, init and key. Segments the
+//     packager listed in both periods (the last number of one is the first of
+//     the next) are kept once. A join through such a shared boundary is
+//     seamless; any other join marks the first new segment as a discontinuity.
+//   - Live only: a period of the same codec family with its own init, which is
+//     what a server side ad break looks like. It is spliced in with its init on
+//     every segment and a discontinuity, so a viewer sees the ad instead of a
+//     frozen picture, and the content that follows gets its init back with
+//     another discontinuity. For a file download the period stays a separate
+//     track, as before, so ads are not written into the recording.
+//
+// SegmentBase placeholders are never treated as duplicates: two periods slicing
+// one whole file share its URL on purpose.
+func joinPeriod(prev, st *manifest.Stream, init *manifest.InitMap, segs []manifest.Segment, live bool) bool {
+	if len(segs) == 0 {
+		return false
+	}
+	compatible := mergeCompatible(prev, st, init, firstSegKey(segs))
+	if !compatible && !(live && codecFamily(prev.Codecs) == codecFamily(st.Codecs)) {
+		return false
+	}
+	have := map[string]bool{}
+	for _, s := range prev.Segments {
+		if s.Index == nil {
+			have[s.URL] = true
+		}
+	}
+	dup := 0
+	for dup < len(segs) && segs[dup].Index == nil && have[segs[dup].URL] {
+		dup++
+	}
+	segs = segs[dup:]
+	if len(segs) == 0 {
+		return true
+	}
+	seamless := false
+	if n := len(prev.Segments); dup > 0 && compatible && n > 0 {
+		seamless = sameInit(segInitOf(prev.Segments[n-1], prev), init)
+	}
+	if !seamless {
+		segs[0].Discontinuity = true
+	}
+	if !compatible {
+		for i := range segs {
+			segs[i].Init = init
+		}
+	}
+	base := int64(len(prev.Segments))
+	for i := range segs {
+		segs[i].Seq = base + int64(i)
+	}
+	prev.Segments = append(prev.Segments, segs...)
+	return true
+}
+
+// segInitOf is the init a segment decodes with: its own, else the track's.
+func segInitOf(s manifest.Segment, st *manifest.Stream) *manifest.InitMap {
+	if s.Init != nil {
+		return s.Init
+	}
+	return st.Init
+}
+
+// codecFamily reduces a CODECS value to what has to match for two periods to
+// share one playlist: the codec itself, not its profile or level. The HEVC
+// names (hvc1, hev1, and the Dolby Vision dvh1 and dvhe) are one family, as
+// are avc1 and avc3.
+func codecFamily(c string) string {
+	c = strings.ToLower(c)
+	if i := strings.IndexByte(c, '.'); i >= 0 {
+		c = c[:i]
+	}
+	switch c {
+	case "avc1", "avc3":
+		return "avc"
+	case "hvc1", "hev1", "dvh1", "dvhe":
+		return "hevc"
+	}
+	return c
 }
 
 // mergeCompatible reports whether cur (a later period with the same track ID)

@@ -448,6 +448,13 @@ client.)
   Pass `-serve-transcode '<ffmpeg args>'` to re-encode instead of copying, for
   example `-c:v libx264 -preset veryfast -c:a aac`.
 
+A live DASH source with several periods (programme breaks, server side ads) is
+followed across all of them. Content periods that continue the same encoding
+join seamlessly. An ad break with its own encoding is spliced into the HLS
+output with a discontinuity and its own init, so viewers see the ad rather
+than a frozen picture; the TS and DASH outputs cannot switch init mid-stream
+and skip the break instead.
+
 ### DASH output
 
 `GET /live.mpd` serves a SegmentTemplate + SegmentTimeline manifest and the same

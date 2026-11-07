@@ -289,7 +289,7 @@ const mpdLiveAdPeriods = `<?xml version="1.0"?>
    <SegmentTemplate media="c/$Number$.m4s" initialization="c/init.mp4" timescale="1" startNumber="1">
     <SegmentTimeline><S t="0" d="2" r="1"/></SegmentTimeline>
    </SegmentTemplate>
-   <Representation id="v1" bandwidth="1000" width="640" height="360"/>
+   <Representation id="v1" codecs="avc1.4d401f" bandwidth="1000" width="640" height="360"/>
   </AdaptationSet>
  </Period>
  <Period id="ad" start="PT4S">
@@ -297,7 +297,7 @@ const mpdLiveAdPeriods = `<?xml version="1.0"?>
    <SegmentTemplate media="ad/$Number$.m4s" initialization="ad/init.mp4" timescale="1" startNumber="1">
     <SegmentTimeline><S t="0" d="2"/></SegmentTimeline>
    </SegmentTemplate>
-   <Representation id="v1" bandwidth="5000" width="1280" height="720"/>
+   <Representation id="v1" codecs="AD_CODECS" bandwidth="5000" width="1280" height="720"/>
   </AdaptationSet>
  </Period>
  <Period id="c2" start="PT6S">
@@ -305,13 +305,58 @@ const mpdLiveAdPeriods = `<?xml version="1.0"?>
    <SegmentTemplate media="c/$Number$.m4s" initialization="c/init.mp4" timescale="1" startNumber="2">
     <SegmentTimeline><S t="2" d="2" r="2"/></SegmentTimeline>
    </SegmentTemplate>
-   <Representation id="v1" bandwidth="1000" width="640" height="360"/>
+   <Representation id="v1" codecs="avc1.4d401f" bandwidth="1000" width="640" height="360"/>
   </AdaptationSet>
  </Period>
 </MPD>`
 
-func TestLiveFollowsEveryPeriod(t *testing.T) {
-	m, err := Parse([]byte(mpdLiveAdPeriods), "https://ex.com/x.mpd")
+// An ad break of the same codec family is spliced into the live track with its
+// own init and a discontinuity on both sides; the boundary segment the content
+// periods share is kept once.
+func TestLiveSplicesSameFamilyAdPeriod(t *testing.T) {
+	mpd := strings.Replace(mpdLiveAdPeriods, "AD_CODECS", "avc1.4d4020", 1)
+	m, err := Parse([]byte(mpd), "https://ex.com/x.mpd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Streams) != 1 {
+		t.Fatalf("live streams = %d, want one track", len(m.Streams))
+	}
+	segs := m.Streams[0].Segments
+	want := []struct {
+		url  string
+		disc bool
+		init string
+	}{
+		{"https://ex.com/c/1.m4s", false, ""},
+		{"https://ex.com/c/2.m4s", false, ""},
+		{"https://ex.com/ad/1.m4s", true, "https://ex.com/ad/init.mp4"},
+		{"https://ex.com/c/3.m4s", true, ""}, // c2's own copy of 2 is a repeat and is dropped
+		{"https://ex.com/c/4.m4s", false, ""},
+	}
+	if len(segs) != len(want) {
+		t.Fatalf("segments = %d, want %d: %+v", len(segs), len(want), segs)
+	}
+	for i, w := range want {
+		init := ""
+		if segs[i].Init != nil {
+			init = segs[i].Init.URL
+		}
+		if segs[i].URL != w.url || segs[i].Discontinuity != w.disc || init != w.init {
+			t.Fatalf("segment %d = url %s disc %v init %q, want %s %v %q", i, segs[i].URL, segs[i].Discontinuity, init, w.url, w.disc, w.init)
+		}
+	}
+	if m.Streams[0].Init.URL != "https://ex.com/c/init.mp4" {
+		t.Fatalf("track init = %s, want the content init", m.Streams[0].Init.URL)
+	}
+}
+
+// An ad in a different codec family cannot share the playlist and is left out
+// of a live track; the content periods still join through their shared
+// boundary segment with no discontinuity.
+func TestLiveDropsOtherFamilyAdPeriod(t *testing.T) {
+	mpd := strings.Replace(mpdLiveAdPeriods, "AD_CODECS", "hvc1.1.6.L93.B0", 1)
+	m, err := Parse([]byte(mpd), "https://ex.com/x.mpd")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,9 +364,6 @@ func TestLiveFollowsEveryPeriod(t *testing.T) {
 		t.Fatalf("live streams = %d, want the content track alone", len(m.Streams))
 	}
 	segs := m.Streams[0].Segments
-	// c1 lists 1 and 2, c2 lists 2, 3 and 4: the shared boundary segment is
-	// kept once and, since it proves the timeline continues, no discontinuity
-	// is marked.
 	if len(segs) != 4 {
 		t.Fatalf("segments = %d, want 4 (both content periods, boundary once, no ad)", len(segs))
 	}

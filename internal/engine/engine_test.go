@@ -699,3 +699,62 @@ func TestAES128CiphertextNotTakenForFakeImage(t *testing.T) {
 		t.Fatalf("got %d bytes, want %d", len(got), len(ct))
 	}
 }
+
+// initLogSink records inits and segments; canChange says whether it accepts a
+// new init mid-stream (engine.InitChanger).
+type initLogSink struct {
+	canChange bool
+	inits     []string
+	segs      []string
+}
+
+func (s *initLogSink) InitChangeOK() bool  { return s.canChange }
+func (s *initLogSink) Init(d []byte) error { s.inits = append(s.inits, string(d)); return nil }
+func (s *initLogSink) Segment(_ SegmentInfo, d []byte) error {
+	s.segs = append(s.segs, string(d))
+	return nil
+}
+
+// A live stream whose middle segments carry a different init (a spliced ad
+// break). A sink that can switch init gets everything, with the content init
+// sent again when it returns. A sink that cannot gets only the segments that
+// decode with the first init, and never a second init.
+func TestSinkInitChangeFollowedOrSkipped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "[%s]", r.URL.Path)
+	}))
+	defer srv.Close()
+	build := func() *manifest.Stream {
+		st := &manifest.Stream{ID: "t", Type: manifest.Video, Init: &manifest.InitMap{URL: srv.URL + "/content-init"}}
+		ad := &manifest.InitMap{URL: srv.URL + "/ad-init"}
+		for i := 0; i < 5; i++ {
+			seg := manifest.Segment{URL: fmt.Sprintf("%s/seg%d", srv.URL, i), Seq: int64(i), Duration: 1}
+			if i == 2 || i == 3 {
+				seg.Init = ad
+			}
+			st.Segments = append(st.Segments, seg)
+		}
+		return st
+	}
+	client, _ := httpx.New(httpx.Options{})
+	for _, canChange := range []bool{true, false} {
+		sink := &initLogSink{canChange: canChange}
+		if err := DownloadStream(context.Background(), Config{Client: client, Threads: 2, Sink: sink}, build(), filepath.Join(t.TempDir(), "o"), nil); err != nil {
+			t.Fatal(err)
+		}
+		if canChange {
+			if len(sink.inits) != 3 || len(sink.segs) != 5 {
+				t.Fatalf("switching sink: inits=%v segs=%v, want 3 inits (content, ad, content) and 5 segments", sink.inits, sink.segs)
+			}
+			continue
+		}
+		if len(sink.inits) != 1 || len(sink.segs) != 3 {
+			t.Fatalf("fixed-init sink: inits=%v segs=%v, want the content init once and 3 content segments", sink.inits, sink.segs)
+		}
+		for _, s := range sink.segs {
+			if strings.Contains(s, "seg2") || strings.Contains(s, "seg3") {
+				t.Fatalf("ad segment reached a sink that cannot switch init: %v", sink.segs)
+			}
+		}
+	}
+}
