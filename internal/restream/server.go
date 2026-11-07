@@ -29,7 +29,6 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /live.m3u8", s.master)
 	mux.HandleFunc("GET /{track}/index.m3u8", s.media)
-	mux.HandleFunc("GET /{track}/init.mp4", s.initSeg)
 	mux.HandleFunc("GET /{track}/{seg}", s.segment)
 	return mux
 }
@@ -43,7 +42,6 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) DASHHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /live.mpd", s.mpd)
-	mux.HandleFunc("GET /{track}/init.mp4", s.initSeg)
 	mux.HandleFunc("GET /{track}/{seg}", s.segment)
 	return mux
 }
@@ -95,22 +93,6 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	writePlaylist(w, t.mediaPlaylist())
 }
 
-func (s *Server) initSeg(w http.ResponseWriter, r *http.Request) {
-	t, ok := s.pub.Track(r.PathValue("track"))
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	data, modtime, ok := t.initSegment()
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	cors(w)
-	w.Header().Set("Content-Type", "video/mp4")
-	http.ServeContent(w, r, "init.mp4", modtime, bytes.NewReader(data))
-}
-
 func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 	t, ok := s.pub.Track(r.PathValue("track"))
 	if !ok {
@@ -118,6 +100,19 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.PathValue("seg")
+	// init.mp4, init1.mp4 and so on: the init segments, one per distinct init
+	// the source sent. Media segments never start with "init".
+	if strings.HasPrefix(name, "init") {
+		data, modtime, ok := t.initSegment(name)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		cors(w)
+		w.Header().Set("Content-Type", "video/mp4")
+		http.ServeContent(w, r, name, modtime, bytes.NewReader(data))
+		return
+	}
 	data, path, modtime, ok := t.segmentByName(name)
 	if !ok {
 		// The segment aged out of the window, or never existed. 404 is right:

@@ -167,9 +167,6 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 		if pDur == 0 && len(doc.Periods) == 1 {
 			pDur = mpdDur
 		}
-		if live && pi > 0 {
-			break // live: only the first period listed is parsed; each refresh parses the manifest again and follows whatever the source lists first
-		}
 		for ai, as := range p.AdaptationSets {
 			aBase := resolveChain(pBase, as.BaseURL)
 			for ri, rep := range as.Representations {
@@ -206,12 +203,33 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 					// -sv segsMin=2:plistDurMin=20m). Joining them would splice
 					// ads in or drop a period's init.
 					if len(segs) > 0 && mergeCompatible(prev, st, init, firstSegKey(segs)) {
-						segs[0].Discontinuity = true
+						// Some packagers list the segment at the boundary in
+						// both periods (the last number of one is the first
+						// number of the next). That repeat proves the timeline
+						// runs on unbroken, so it is dropped and no
+						// discontinuity is marked. Otherwise the join is a
+						// splice and the player has to be told. A SegmentBase
+						// placeholder is left alone: two periods slicing one
+						// whole file share its URL on purpose.
+						if n := len(prev.Segments); n > 0 && segs[0].Index == nil && segs[0].URL == prev.Segments[n-1].URL {
+							segs = segs[1:]
+						} else {
+							segs[0].Discontinuity = true
+						}
 						base := int64(len(prev.Segments))
 						for i := range segs {
 							segs[i].Seq = base + int64(i)
 						}
 						prev.Segments = append(prev.Segments, segs...)
+						continue
+					}
+					// Incompatible, and the manifest is live: drop it. The live
+					// edge of a channel with server side ads sits in its last
+					// period, so every period has to be read, and the content
+					// periods above already joined into one track. An ad period
+					// listed as its own track would only tempt the picker, and
+					// its index in the ID would change as old periods roll off.
+					if live {
 						continue
 					}
 					// incompatible: give it an ID unique to this period so it is

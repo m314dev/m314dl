@@ -14,11 +14,13 @@
 package restream
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -194,6 +196,7 @@ type Track struct {
 	mu          sync.RWMutex
 	init        []byte
 	initAt      time.Time
+	inits       [][]byte // every distinct init seen, in order; a segment points at one by index
 	segs        []*segment
 	byName      map[string]*segment // name -> segment, so a lookup is O(1) instead of a scan
 	targetDur   float64
@@ -211,6 +214,7 @@ type segment struct {
 	seq     int64
 	dur     float64
 	startMS int64 // presentation start time in ms (DASH SegmentTimeline @t)
+	initIdx int   // index into Track.inits of the init this segment decodes with
 	disc    bool
 	size    int64
 	data    []byte // live window only; a VOD segment's bytes live on disk
@@ -253,15 +257,32 @@ func segmentIsFMP4(st *manifest.Stream) bool {
 }
 
 // Init implements engine.Sink: stores the fMP4 initialization segment (the
-// headers a player needs before it can decode any media segment).
+// headers a player needs before it can decode any media segment). A live
+// source can change its init mid-stream, for example when a channel with
+// server side ads moves to a new period. Each distinct init is kept under its
+// own name, so segments still in the window keep decoding with the init they
+// were made for while new segments point at the new one.
 func (t *Track) Init(data []byte) error {
-	buf := append([]byte(nil), data...)
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if n := len(t.inits); n > 0 && bytes.Equal(t.inits[n-1], data) {
+		return nil // the source re-sent the same init; nothing changes
+	}
+	buf := append([]byte(nil), data...)
+	t.inits = append(t.inits, buf)
 	t.init = buf
 	t.initAt = time.Now()
-	t.mu.Unlock()
 	t.bumpVer()
 	return nil
+}
+
+// initName is the URL a playlist uses for init number i. The first keeps the
+// plain name every earlier release served.
+func initName(i int) string {
+	if i == 0 {
+		return "init.mp4"
+	}
+	return fmt.Sprintf("init%d.mp4", i)
 }
 
 // bumpVer marks the cached playlist and manifest bodies stale after a change.
@@ -307,10 +328,16 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 	seg := &segment{
 		name: name,
 		seq:  t.seq, dur: dur, startMS: t.nextStartMS, disc: info.Discontinuity,
-		size: int64(len(data)), at: time.Now(),
+		initIdx: len(t.inits) - 1,
+		size:    int64(len(data)), at: time.Now(),
 	}
 	if t.live {
 		seg.data = append([]byte(nil), data...)
+	}
+	// A segment made for a different init than the one before it is a format
+	// change in HLS terms, and the playlist must say so.
+	if n := len(t.segs); n > 0 && t.segs[n-1].initIdx != seg.initIdx {
+		seg.disc = true
 	}
 	if t.byName == nil {
 		t.byName = make(map[string]*segment)
@@ -369,14 +396,27 @@ func (t *Track) segmentByName(name string) (data []byte, path string, modtime ti
 	return nil, t.spoolPath(name), s.at, true
 }
 
-// initSegment returns the fMP4 init bytes and modtime.
-func (t *Track) initSegment() ([]byte, time.Time, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if t.init == nil {
+// initSegment returns the fMP4 init bytes and modtime for a playlist name
+// such as init.mp4 or init2.mp4.
+func (t *Track) initSegment(name string) ([]byte, time.Time, bool) {
+	var i int
+	switch {
+	case name == "init.mp4":
+	case strings.HasPrefix(name, "init") && strings.HasSuffix(name, ".mp4"):
+		n, err := strconv.Atoi(name[len("init") : len(name)-len(".mp4")])
+		if err != nil || n < 1 {
+			return nil, time.Time{}, false
+		}
+		i = n
+	default:
 		return nil, time.Time{}, false
 	}
-	return t.init, t.initAt, true
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if i >= len(t.inits) {
+		return nil, time.Time{}, false
+	}
+	return t.inits[i], t.initAt, true
 }
 
 // bitrateLocked returns the track's bitrate: the declared value, else the peak
@@ -433,12 +473,16 @@ func (t *Track) mediaPlaylist() []byte {
 		seq = visible[0].seq
 	}
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", seq)
-	if t.fmp4 && t.init != nil {
-		b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
-	}
+	// EXT-X-MAP names the init for the segments that follow it. It is written
+	// before the first segment and again wherever the init changes.
+	curInit := -1
 	for _, s := range visible {
 		if s.disc {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
+		if t.fmp4 && s.initIdx >= 0 && s.initIdx != curInit {
+			curInit = s.initIdx
+			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"%s\"\n", initName(curInit))
 		}
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n%s\n", s.dur, s.name)
 	}

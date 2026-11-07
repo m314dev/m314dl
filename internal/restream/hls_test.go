@@ -308,3 +308,40 @@ func TestVODSpoolsToDisk(t *testing.T) {
 		t.Fatalf("spooled segment content-type = %q", rec.Header().Get("Content-Type"))
 	}
 }
+
+// A live source can change its init mid-stream (a channel with server side
+// ads moving to a new period). Segments already in the window must keep the
+// init they were made for, the new ones get the new init, and the playlist
+// marks the change as a discontinuity with a new EXT-X-MAP.
+func TestInitChangeKeepsBothInits(t *testing.T) {
+	pub := NewPublisher()
+	sink := pub.AddTrack(TrackFromStream("video", &manifest.Stream{Type: manifest.Video, ID: "v", Init: &manifest.InitMap{URL: "i"}}, true, ""))
+	sink.Init([]byte("INIT-A"))
+	sink.Segment(engine.SegmentInfo{Duration: 2}, []byte("a0"))
+	sink.Init([]byte("INIT-A")) // the same init again changes nothing
+	sink.Segment(engine.SegmentInfo{Duration: 2}, []byte("a1"))
+	sink.Init([]byte("INIT-B"))
+	sink.Segment(engine.SegmentInfo{Duration: 2}, []byte("b0"))
+
+	pl := string(pub.tracks[0].mediaPlaylist())
+	want := "#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:2.000,\n000000.m4s\n#EXTINF:2.000,\n000001.m4s\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init1.mp4\"\n#EXTINF:2.000,\n000002.m4s\n"
+	if !strings.Contains(pl, want) {
+		t.Fatalf("playlist does not switch init once:\n%s", pl)
+	}
+
+	h := NewServer(pub).Handler()
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		return rec
+	}
+	if rec := get("/video/init.mp4"); rec.Code != 200 || rec.Body.String() != "INIT-A" {
+		t.Fatalf("init.mp4: code=%d body=%q", rec.Code, rec.Body)
+	}
+	if rec := get("/video/init1.mp4"); rec.Code != 200 || rec.Body.String() != "INIT-B" {
+		t.Fatalf("init1.mp4: code=%d body=%q", rec.Code, rec.Body)
+	}
+	if rec := get("/video/init2.mp4"); rec.Code != 404 {
+		t.Fatalf("init2.mp4 should 404, got %d", rec.Code)
+	}
+}
