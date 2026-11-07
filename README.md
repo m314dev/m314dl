@@ -105,7 +105,7 @@ Run `m314dl -h` for the full flag list.
 | Inputs | HLS (`.m3u8`, TS and fMP4), DASH (`.mpd`), Smooth Streaming (`.ism/Manifest`), plain files, IPTV M3U lists, web pages with a stream URL in them, copy-as-curl commands |
 | Decryption | CENC, cbcs, cens and cbc1 (ISO/IEC 23001-7), HLS AES-128 and SAMPLE-AES, BBTS; all in process, per segment, while downloading |
 | Live | records from the live edge or the whole DVR window, with a time limit, deduped across refreshes, and a clean stop on Ctrl-C |
-| Output | MP4, MKV or any ffmpeg container; subtitles muxed in or written as SRT/VTT sidecars |
+| Output | MP4, MKV or any ffmpeg container; Dolby Vision kept (`dvh1` entry and `dvcC` box); subtitles muxed in or written as SRT/VTT sidecars |
 | Resume | byte-exact resume after a clean exit or a hard kill; one temp folder per download |
 | Serving | republish a stream as live HLS, MPEG-TS or DASH; a multi-channel worker and an RPC job server for running it unattended |
 | Platforms | Linux, macOS, Windows (amd64, arm64, armv7 on Linux), Docker |

@@ -623,7 +623,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		if r.st.Type != manifest.Subtitles {
 			muxInputs = append(muxInputs, mux.Input{
 				Path: r.path, Type: r.st.Type, Language: r.st.Language,
-				Name: r.st.Name, Default: r.st.Default,
+				Name: r.st.Name, Default: r.st.Default, Codecs: r.st.Codecs,
 			})
 			continue
 		}

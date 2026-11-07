@@ -19,6 +19,7 @@ type Input struct {
 	Language string
 	Name     string
 	Default  bool
+	Codecs   string // the manifest's CODECS value for this track, if it had one
 }
 
 func exeName(name string) string {
@@ -62,6 +63,21 @@ func subCodec(ext string) string {
 	return ""
 }
 
+// dolbyVisionTag returns the MP4 sample entry to force for a Dolby Vision
+// video track, or "" to leave ffmpeg's choice alone. A CODECS value of
+// dvh1.05.06 or dvhe.05.06 means a profile whose base layer is not plain
+// HEVC, and such a track has to be tagged dvh1 or no player treats it as
+// Dolby Vision. ffmpeg itself always writes hev1 for HEVC, so it has to be
+// told. A profile 8 track keeps its hvc1 or hev1 tag by design, since its base
+// layer plays as ordinary HEVC; the dvcC box alone marks it.
+func dolbyVisionTag(codecs string) string {
+	c := strings.ToLower(codecs)
+	if strings.HasPrefix(c, "dvh1") || strings.HasPrefix(c, "dvhe") {
+		return "dvh1"
+	}
+	return ""
+}
+
 // Mux merges inputs into outPath. The container type comes from the file
 // extension. Streams are copied as they are, with no re-encoding. On failure
 // the error carries the last part of ffmpeg's stderr output.
@@ -69,6 +85,21 @@ func Mux(ffmpeg string, inputs []Input, outPath string) error {
 	if len(inputs) == 0 {
 		return fmt.Errorf("mux: no inputs")
 	}
+	cmd := exec.Command(ffmpeg, muxArgs(inputs, outPath)...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := stderr.String()
+		if len(msg) > 2000 {
+			msg = msg[len(msg)-2000:]
+		}
+		return fmt.Errorf("ffmpeg mux failed: %w\n%s", err, msg)
+	}
+	return nil
+}
+
+// muxArgs builds the ffmpeg command line for Mux.
+func muxArgs(inputs []Input, outPath string) []string {
 	ext := strings.ToLower(filepath.Ext(outPath))
 	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
 	for _, in := range inputs {
@@ -131,22 +162,23 @@ func Mux(ffmpeg string, inputs []Input, outPath string) error {
 	}
 	if ext == ".mp4" || ext == ".m4v" || ext == ".mov" {
 		args = append(args, "-movflags", "+faststart")
+		for _, in := range inputs {
+			if in.Type == manifest.Video {
+				if tag := dolbyVisionTag(in.Codecs); tag != "" {
+					args = append(args, "-tag:v", tag)
+				}
+			}
+		}
 	}
 	if ext == ".ts" {
 		args = append(args, "-f", "mpegts")
 	}
+	// Without this ffmpeg silently drops the Dolby Vision configuration box
+	// (dvcC/dvvC) from MP4 and Matroska output and the file plays as plain
+	// HDR10 or SDR. It only loosens what the muxer is willing to write.
+	args = append(args, "-strict", "unofficial")
 	args = append(args, outPath)
-	cmd := exec.Command(ffmpeg, args...)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := stderr.String()
-		if len(msg) > 2000 {
-			msg = msg[len(msg)-2000:]
-		}
-		return fmt.Errorf("ffmpeg mux failed: %w\n%s", err, msg)
-	}
-	return nil
+	return args
 }
 
 // ExtractSubtitle converts a raw subtitle stream file into outPath. The input
