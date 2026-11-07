@@ -95,6 +95,8 @@ type options struct {
 	serve            string
 	serveFormat      string
 	serveTranscode   string
+	serveIdle        time.Duration
+	workerIdle       time.Duration
 	spoolDir         string
 	worker           string
 	workerSecret     string
@@ -240,6 +242,8 @@ func run() error {
 	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams live on this address (e.g. :8314) instead of downloading to a file")
 	flag.StringVar(&o.serveFormat, "serve-format", "hls", "restream output: hls (/live.m3u8), ts (continuous MPEG-TS at /live.ts), or dash (/live.mpd; needs an fMP4 source)")
 	flag.StringVar(&o.serveTranscode, "serve-transcode", "", "restream ts remux: ffmpeg output codec args to transcode instead of copy, e.g. '-c:v libx264 -preset veryfast -c:a aac' (implies the ffmpeg remux path)")
+	flag.DurationVar(&o.serveIdle, "serve-idle", 0, "restream: on demand; start the live source with the first viewer and release it after this long with no viewer (e.g. 30s; 0 = always on, minimum 5s)")
+	flag.DurationVar(&o.workerIdle, "worker-idle", 0, "-worker: default on-demand idle period for channels that do not set \"idle\" (0 = always on)")
 	flag.StringVar(&o.spoolDir, "spool-dir", "", "restream (-serve/-worker): directory for spooled segments and temp part files (default: current directory). Must be real disk — a seekable VOD spools the whole asset here, and /tmp is usually RAM-backed tmpfs on Linux")
 	flag.StringVar(&o.worker, "worker", "", "run as a multi-channel restream worker on this address (e.g. :7001); drive it via POST /api/channels, serve /{id}/live.m3u8. See internal/worker")
 	flag.StringVar(&o.workerSecret, "worker-secret", "", "bearer token for -worker control API (required when binding a non-loopback address)")
@@ -283,7 +287,10 @@ func run() error {
 				fmt.Fprintf(os.Stderr, "[v] "+format+"\n", args...)
 			}
 		}
-		return worker.ServeWorker(o.worker, o.workerSecret, o.workerMaxChan, o.ffmpegPath, o.spoolDir, version, logv)
+		if o.workerIdle != 0 && o.workerIdle < serve.MinIdle {
+			return fmt.Errorf("-worker-idle must be at least %s", serve.MinIdle)
+		}
+		return worker.ServeWorker(o.worker, o.workerSecret, o.workerMaxChan, o.ffmpegPath, o.spoolDir, version, o.workerIdle, logv)
 	}
 	// Concurrency adapts on its own unless the user set -t by hand.
 	tPinned := false
@@ -432,6 +439,41 @@ func (j job) progress(live bool) (prog *engine.Progress, stop func()) {
 	}
 }
 
+// expandSelected fills in what the master manifest leaves out for the chosen
+// streams: HLS media playlists are fetched, DASH SegmentBase files are split by
+// their sidx, and a CENC stream without a key is refused up front. It reports
+// whether any of the streams is live.
+func expandSelected(ctx context.Context, client *httpx.Client, kind string, selected []*manifest.Stream, keys map[[16]byte][]byte, logv func(string, ...any)) (bool, error) {
+	live := false
+	for _, st := range selected {
+		if kind == "hls" && !st.SegmentsFull {
+			body, finalURL, err := client.FetchBytes(ctx, st.PlaylistURL, "")
+			if err != nil {
+				return false, fmt.Errorf("fetch media playlist for %s: %w", st.ID, err)
+			}
+			st.PlaylistURL = finalURL
+			if err := hls.ParseMedia(body, finalURL, st); err != nil {
+				return false, err
+			}
+		}
+		if kind == "dash" {
+			if err := source.ExpandIndexed(ctx, client, st, logv); err != nil {
+				return false, err
+			}
+		}
+		if st.Live {
+			live = true
+		}
+		if len(st.Segments) == 0 {
+			return false, fmt.Errorf("stream %s has no segments", st.ID)
+		}
+		if k := st.Segments[0].Key; k != nil && k.Method == manifest.EncCENC && len(keys) == 0 {
+			return false, fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
+		}
+	}
+	return live, nil
+}
+
 // download turns one loaded input into its output. A direct file is written
 // as it is. A manifest goes through track selection, download and mux.
 func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL string, master *manifest.Master, kind string) error {
@@ -474,43 +516,51 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 		j.say("selected: %-4s %s", st.ID, st)
 	}
 
-	// Expand the HLS media playlists, for the selected streams only.
-	live := master.Live
-	for _, st := range selected {
-		if kind == "hls" && !st.SegmentsFull {
-			body, finalURL, err := client.FetchBytes(ctx, st.PlaylistURL, "")
-			if err != nil {
-				return fmt.Errorf("fetch media playlist for %s: %w", st.ID, err)
-			}
-			st.PlaylistURL = finalURL
-			if err := hls.ParseMedia(body, finalURL, st); err != nil {
-				return err
-			}
-		}
-		if kind == "dash" {
-			if err := source.ExpandIndexed(ctx, client, st, logv); err != nil {
-				return err
-			}
-		}
-		if st.Live {
-			live = true
-		}
-		if len(st.Segments) == 0 {
-			return fmt.Errorf("stream %s has no segments", st.ID)
-		}
-		if k := st.Segments[0].Key; k != nil && k.Method == manifest.EncCENC && len(keys) == 0 {
-			return fmt.Errorf("stream %s is CENC/DRM-protected; supply the content key with -key KID:KEY", st.ID)
-		}
+	live, err := expandSelected(ctx, client, kind, selected, keys, logv)
+	if err != nil {
+		return err
 	}
-	if live && j.skipLive {
+	if live = live || master.Live; live && j.skipLive {
 		return errLiveEntry
 	}
 
 	// Restream mode: republish the stream over HTTP as live HLS instead of
 	// downloading it to a file.
 	if o.serve != "" {
-		return serve.Run(ctx, serve.Options{Addr: o.serve, Format: o.serveFormat, Transcode: o.serveTranscode, FFmpegPath: o.ffmpegPath, SpoolDir: o.spoolDir},
-			client, kind, selected, keys, bbtsKey, threadCeiling, logv)
+		if o.serveIdle != 0 && o.serveIdle < serve.MinIdle {
+			return fmt.Errorf("-serve-idle must be at least %s", serve.MinIdle)
+		}
+		// An on-demand restart loads the manifest again and takes the same
+		// streams by ID, so an interactive pick is never asked twice.
+		var ids []string
+		for _, st := range selected {
+			ids = append(ids, st.ID)
+		}
+		resolve := func(ctx context.Context) ([]*manifest.Stream, error) {
+			m, k, err := source.LoadManifest(ctx, client, inputURL, logv)
+			if err != nil {
+				return nil, err
+			}
+			var sel []*manifest.Stream
+			for _, id := range ids {
+				found := false
+				for _, st := range m.Streams {
+					if st.ID == id {
+						sel, found = append(sel, st), true
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("stream %s is no longer in the manifest", id)
+				}
+			}
+			if _, err := expandSelected(ctx, client, k, sel, keys, logv); err != nil {
+				return nil, err
+			}
+			return sel, nil
+		}
+		return serve.Run(ctx, serve.Options{Addr: o.serve, Format: o.serveFormat, Transcode: o.serveTranscode, FFmpegPath: o.ffmpegPath, SpoolDir: o.spoolDir, Idle: o.serveIdle},
+			client, kind, selected, resolve, keys, bbtsKey, threadCeiling, logv)
 	}
 
 	outPath := outputPath(o.output, inputURL, live)

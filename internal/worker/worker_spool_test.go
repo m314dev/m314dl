@@ -16,7 +16,7 @@ import (
 func TestAWorkerClearsItsSpoolOnStartup(t *testing.T) {
 	base := t.TempDir()
 
-	w := newWorkerServer("tok", 8, "", "test", nil)
+	w := newWorkerServer("tok", 8, "", "test", 0, nil)
 	if err := w.useSpool("127.0.0.1:7001", base); err != nil {
 		t.Fatalf("useSpool: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestAWorkerClearsItsSpoolOnStartup(t *testing.T) {
 	}
 
 	// The next start of the same worker reclaims it.
-	w2 := newWorkerServer("tok", 8, "", "test", nil)
+	w2 := newWorkerServer("tok", 8, "", "test", 0, nil)
 	if err := w2.useSpool("127.0.0.1:7001", base); err != nil {
 		t.Fatalf("useSpool: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestAWorkerClearsItsSpoolOnStartup(t *testing.T) {
 func TestWorkersOnDifferentPortsDoNotShareASpool(t *testing.T) {
 	base := t.TempDir()
 
-	a := newWorkerServer("tok", 8, "", "test", nil)
+	a := newWorkerServer("tok", 8, "", "test", 0, nil)
 	if err := a.useSpool("127.0.0.1:7001", base); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestWorkersOnDifferentPortsDoNotShareASpool(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b := newWorkerServer("tok", 8, "", "test", nil)
+	b := newWorkerServer("tok", 8, "", "test", 0, nil)
 	if err := b.useSpool("127.0.0.1:7002", base); err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestWorkersOnDifferentPortsDoNotShareASpool(t *testing.T) {
 // -spool-dir puts the spool exactly where the operator asked.
 func TestSpoolHonoursSpoolDir(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "fresh", "spool") // created on demand
-	w := newWorkerServer("tok", 8, "", "test", nil)
+	w := newWorkerServer("tok", 8, "", "test", 0, nil)
 	if err := w.useSpool("0.0.0.0:7001", base); err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestSpoolDefaultsToCurrentDir(t *testing.T) {
 	t.Chdir(cwd)
 	t.Setenv("TMPDIR", filepath.Join(cwd, "not-here"))
 
-	w := newWorkerServer("tok", 8, "", "test", nil)
+	w := newWorkerServer("tok", 8, "", "test", 0, nil)
 	if err := w.useSpool("0.0.0.0:7001", ""); err != nil {
 		t.Fatal(err)
 	}

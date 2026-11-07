@@ -47,6 +47,7 @@ type workerServer struct {
 	version     string
 	maxChannels int
 	ffmpegPath  string
+	defaultIdle time.Duration // on-demand idle period for channels that do not set one; 0 = always on
 	logv        func(string, ...any)
 
 	// spool is where channels stage their segments. Each worker instance owns
@@ -71,8 +72,11 @@ type channel struct {
 	cancel    context.CancelFunc
 	tmpDir    string
 
+	od   *serve.OnDemand // set for an on-demand channel; owns the source lifecycle
+	idle time.Duration
+
 	mu      sync.Mutex
-	state   string // running | done | error
+	state   string // running | done | error (on-demand: see OnDemand.State)
 	errMsg  string
 	live    bool
 	started time.Time
@@ -80,12 +84,12 @@ type channel struct {
 
 var idOK = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
 
-func newWorkerServer(secret string, maxChannels int, ffmpegPath, version string, logv func(string, ...any)) *workerServer {
+func newWorkerServer(secret string, maxChannels int, ffmpegPath, version string, defaultIdle time.Duration, logv func(string, ...any)) *workerServer {
 	if logv == nil {
 		logv = func(string, ...any) {}
 	}
 	return &workerServer{secret: secret, version: version, maxChannels: maxChannels, ffmpegPath: ffmpegPath,
-		logv: logv, channels: map[string]*channel{}}
+		defaultIdle: defaultIdle, logv: logv, channels: map[string]*channel{}}
 }
 
 // useSpool claims a staging directory for this worker and clears whatever a
@@ -121,7 +125,7 @@ func (w *workerServer) spoolDir() string {
 	return "" // os.MkdirTemp falls back to the system temp dir
 }
 
-func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, spoolDir, version string, logv func(string, ...any)) error {
+func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, spoolDir, version string, defaultIdle time.Duration, logv func(string, ...any)) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("-worker %q: %w", addr, err)
@@ -131,7 +135,7 @@ func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, spoolDir, ver
 			return fmt.Errorf("-worker on non-loopback %q requires -worker-secret", addr)
 		}
 	}
-	w := newWorkerServer(secret, maxChannels, ffmpegPath, version, logv)
+	w := newWorkerServer(secret, maxChannels, ffmpegPath, version, defaultIdle, logv)
 	if err := w.useSpool(addr, spoolDir); err != nil {
 		return err
 	}
@@ -184,6 +188,7 @@ type channelReq struct {
 	SA        string            `json:"sa"`
 	SS        string            `json:"ss"`
 	Transcode string            `json:"transcode"` // ts remux: ffmpeg output args
+	Idle      string            `json:"idle"`      // on demand: release the source after this long with no viewer, e.g. "30s" (default -worker-idle; "0" = always on)
 }
 
 func (w *workerServer) apiStart(rw http.ResponseWriter, r *http.Request) {
@@ -316,6 +321,15 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 	if err != nil {
 		return nil, err
 	}
+	idle := w.defaultIdle
+	if req.Idle != "" {
+		if idle, err = time.ParseDuration(req.Idle); err != nil {
+			return nil, fmt.Errorf("idle: %w (want a duration such as \"30s\")", err)
+		}
+	}
+	if idle != 0 && idle < serve.MinIdle {
+		return nil, fmt.Errorf("idle must be at least %s", serve.MinIdle)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	master, kind, err := source.LoadManifest(ctx, client, req.URL, w.logv)
@@ -335,12 +349,6 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		return nil, err
 	}
 	o := serve.Options{Format: req.Format, Transcode: req.Transcode, FFmpegPath: w.ffmpegPath}
-	pres, handler, path, jobs, err := serve.BuildOutputs(o, selected, tmpDir, w.logv)
-	if err != nil {
-		cancel()
-		os.RemoveAll(tmpDir)
-		return nil, err
-	}
 
 	live := false
 	for _, st := range selected {
@@ -350,8 +358,41 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 	}
 	ch := &channel{
 		id: req.ID, url: req.URL, format: normFormat(req.Format),
-		mediaPath: "/" + req.ID + path, handler: handler, pres: pres,
 		cancel: cancel, tmpDir: tmpDir, state: "running", live: live, started: time.Now(),
+	}
+
+	var jobs []serve.Job
+	if idle > 0 && live {
+		// On demand: the source was loaded and the selection checked, so a bad
+		// request fails here. Nothing is fetched until the first viewer asks,
+		// and each start loads the manifest again and selects by the same
+		// rules.
+		start := func(ctx context.Context) (serve.Presentation, http.Handler, []serve.Job, error) {
+			master, kind, err := source.LoadManifest(ctx, client, req.URL, w.logv)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			sel, err := selectAndExpand(ctx, client, kind, master, ve, ae, se, keys, w.logv)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			pres, h, _, jobs, err := serve.BuildOutputs(o, sel, tmpDir, w.logv)
+			return pres, h, jobs, err
+		}
+		run := func(ctx context.Context, jobs []serve.Job) error {
+			return serve.RunJobs(ctx, client, kind, jobs, keys, nil, 0, w.logv)
+		}
+		od := serve.NewOnDemand(idle, start, run, func(f string, a ...any) { w.logv("channel %s: "+f, append([]any{req.ID}, a...)...) })
+		ch.od, ch.idle, ch.handler, ch.pres = od, idle, od, od
+		ch.mediaPath = "/" + req.ID + serve.MediaPath(req.Format)
+	} else {
+		pres, handler, path, built, err := serve.BuildOutputs(o, selected, tmpDir, w.logv)
+		if err != nil {
+			cancel()
+			os.RemoveAll(tmpDir)
+			return nil, err
+		}
+		ch.handler, ch.pres, ch.mediaPath, jobs = handler, pres, "/"+req.ID+path, built
 	}
 
 	// Register the channel, checking again for a racing start of the same id
@@ -372,6 +413,16 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 	w.channels[req.ID] = ch
 	w.mu.Unlock()
 
+	if ch.od != nil {
+		// The OnDemand handler runs the source by itself. Deleting the channel
+		// cancels ctx, which closes it and drops the spool.
+		go func() {
+			<-ctx.Done()
+			ch.od.Close()
+			os.RemoveAll(ch.tmpDir)
+		}()
+		return ch, nil
+	}
 	go w.runChannel(ctx, ch, client, kind, keys, jobs)
 	return ch, nil
 }
@@ -424,24 +475,31 @@ func (w *workerServer) stopAll() {
 // ─── views ───────────────────────────────────────────────────────────────────
 
 type channelView struct {
-	ID      string    `json:"id"`
-	URL     string    `json:"url"`
-	Format  string    `json:"format"`
-	State   string    `json:"state"`
-	Error   string    `json:"error,omitempty"`
-	Live    bool      `json:"live"`
-	Media   string    `json:"media"`
-	Status  string    `json:"status,omitempty"`
-	Started time.Time `json:"started"`
+	ID        string    `json:"id"`
+	URL       string    `json:"url"`
+	Format    string    `json:"format"`
+	State     string    `json:"state"` // running | done | error | stopped, or for on demand: idle | starting | running
+	Error     string    `json:"error,omitempty"`
+	LastError string    `json:"last_error,omitempty"` // on demand: why the last start or run ended
+	Idle      string    `json:"idle,omitempty"`       // on demand: the idle period
+	Viewers   int       `json:"viewers"`
+	Live      bool      `json:"live"`
+	Media     string    `json:"media"`
+	Status    string    `json:"status,omitempty"`
+	Started   time.Time `json:"started"`
 }
 
 func (ch *channel) view() channelView {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	return channelView{
+	v := channelView{
 		ID: ch.id, URL: ch.url, Format: ch.format, State: ch.state, Error: ch.errMsg,
 		Live: ch.live, Media: ch.mediaPath, Status: ch.pres.StatusLine(), Started: ch.started,
 	}
+	if ch.od != nil {
+		v.State, v.LastError, v.Idle, v.Viewers = ch.od.State(), ch.od.LastError(), ch.idle.String(), ch.od.Viewers()
+	}
+	return v
 }
 
 func normFormat(f string) string {

@@ -94,6 +94,26 @@ func (p *Publisher) End() {
 	p.ver.Add(1)
 }
 
+// ContinueFrom makes this publisher carry on where prev, an earlier publisher
+// of the same channel, left off. Each track with the same ID takes over the
+// media sequence and the timeline position, so a player that kept the old
+// playlist sees the numbers keep climbing instead of jumping back to zero,
+// and its first new segment is marked as a discontinuity, since the content
+// jumped in time while the channel was idle. Call it before any segment is
+// published.
+func (p *Publisher) ContinueFrom(prev *Publisher) {
+	for _, t := range p.tracks {
+		pt, ok := prev.byID[t.ID]
+		if !ok {
+			continue
+		}
+		pt.mu.RLock()
+		t.seq, t.nextStartMS = pt.seq, pt.nextStartMS
+		pt.mu.RUnlock()
+		t.pendingDisc = true
+	}
+}
+
 // Ready reports whether every track has published at least one segment, that
 // is, whether the presentation can be played. Used to hold back the "serving
 // at ..." banner until there is actually something to serve.
@@ -192,6 +212,8 @@ type Track struct {
 	channelScheme string // DASH audio descriptor scheme, kept together with channels
 
 	ver *atomic.Int64 // shared publisher version; goes up on every segment, init or end
+
+	pendingDisc bool // the next segment starts a new run after a gap; mark it
 
 	mu          sync.RWMutex
 	init        []byte
@@ -327,7 +349,7 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 
 	seg := &segment{
 		name: name,
-		seq:  t.seq, dur: dur, startMS: t.nextStartMS, disc: info.Discontinuity,
+		seq:  t.seq, dur: dur, startMS: t.nextStartMS, disc: info.Discontinuity || t.pendingDisc,
 		initIdx: len(t.inits) - 1,
 		size:    int64(len(data)), at: time.Now(),
 	}
@@ -344,6 +366,7 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 	}
 	t.byName[name] = seg
 	t.segs = append(t.segs, seg)
+	t.pendingDisc = false
 	t.seq++
 	t.nextStartMS += int64(math.Round(dur * 1000))
 	t.published++
@@ -468,7 +491,9 @@ func (t *Track) mediaPlaylist() []byte {
 	if !t.live {
 		b.WriteString("#EXT-X-PLAYLIST-TYPE:EVENT\n")
 	}
-	seq := int64(0)
+	// An empty playlist still names the sequence its first segment will get,
+	// which matters after an on-demand restart carried the numbering on.
+	seq := t.seq
 	if len(visible) > 0 {
 		seq = visible[0].seq
 	}

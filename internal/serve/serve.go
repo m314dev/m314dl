@@ -33,11 +33,27 @@ import (
 // Options is the subset of the CLI flags that shapes a restream: where to
 // listen and what to publish.
 type Options struct {
-	Addr       string // listen address (-serve)
-	Format     string // hls | ts | dash (-serve-format)
-	Transcode  string // ffmpeg output args for the ts remux path (-serve-transcode)
-	FFmpegPath string // -ffmpeg
-	SpoolDir   string // -spool-dir; "" means the current directory (see SpoolBase)
+	Addr       string        // listen address (-serve)
+	Format     string        // hls | ts | dash (-serve-format)
+	Transcode  string        // ffmpeg output args for the ts remux path (-serve-transcode)
+	FFmpegPath string        // -ffmpeg
+	SpoolDir   string        // -spool-dir; "" means the current directory (see SpoolBase)
+	Idle       time.Duration // -serve-idle: release a live source after this long with no viewer; 0 = always on
+}
+
+// MinIdle is the smallest idle period accepted. Below one playlist poll
+// interval a channel would stop between two polls of a single healthy viewer.
+const MinIdle = 5 * time.Second
+
+// MediaPath is the path a format is served at under the channel root.
+func MediaPath(format string) string {
+	switch format {
+	case "ts", "mpegts":
+		return "/live.ts"
+	case "dash", "mpd":
+		return "/live.mpd"
+	}
+	return "/live.m3u8"
 }
 
 // SpoolBase picks the directory that restream spools are created under: the
@@ -91,10 +107,16 @@ type Job struct {
 	pace bool
 }
 
+// Resolver loads the source again and returns the same selection of streams
+// as the first time, for an on-demand restart.
+type Resolver func(ctx context.Context) ([]*manifest.Stream, error)
+
 // Run builds the output for the selected streams and hands over to the run
 // loop, which blocks until the restream ends (the one-shot `-serve` mode).
+// With o.Idle set and a live source, the source runs only while someone is
+// watching; resolve is how each restart finds the streams again.
 func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
-	selected []*manifest.Stream, keys map[[16]byte][]byte, bbtsKey []byte,
+	selected []*manifest.Stream, resolve Resolver, keys map[[16]byte][]byte, bbtsKey []byte,
 	threadCeiling int, logv func(string, ...any)) error {
 
 	base, err := SpoolBase(o.SpoolDir)
@@ -106,6 +128,25 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
+
+	if o.Idle > 0 && isLive(selected) {
+		say := func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+		start := func(ctx context.Context) (Presentation, http.Handler, []Job, error) {
+			sel, err := resolve(ctx)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			pres, h, _, jobs, err := BuildOutputs(o, sel, tmpDir, logv)
+			return pres, h, jobs, err
+		}
+		run := func(ctx context.Context, jobs []Job) error {
+			return RunJobs(ctx, client, kind, jobs, keys, bbtsKey, threadCeiling, logv)
+		}
+		for _, st := range selected {
+			fmt.Fprintf(os.Stderr, "restream track %s\n", st)
+		}
+		return serveOnDemand(ctx, o, NewOnDemand(o.Idle, start, run, say), MediaPath(o.Format))
+	}
 
 	pres, handler, path, jobs, err := BuildOutputs(o, selected, tmpDir, logv)
 	if err != nil {
@@ -209,23 +250,28 @@ func buildPublisherJobs(streams []*manifest.Stream, tmpDir string) (*restream.Pu
 	return pub, jobs
 }
 
-// serve runs the download jobs into their sinks while an HTTP server publishes
-// the result. It runs until the source ends or the operator interrupts it.
-func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
-	jobs []Job, pres Presentation, handler http.Handler, path string,
-	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
+func isLive(streams []*manifest.Stream) bool {
+	for _, st := range streams {
+		if st.Live {
+			return true
+		}
+	}
+	return false
+}
 
+// listen starts the HTTP server for a restream and turns the first interrupt
+// into a cancel of the returned context (a second one exits at once). The
+// returned shutdown stops the server with a short grace period.
+func listen(ctx context.Context, o Options, handler http.Handler, path string) (context.Context, context.CancelFunc, func(), error) {
 	ln, err := net.Listen("tcp", o.Addr)
 	if err != nil {
-		return fmt.Errorf("restream: listen on %s: %w", o.Addr, err)
+		return nil, nil, nil, fmt.Errorf("restream: listen on %s: %w", o.Addr, err)
 	}
 	srv := &http.Server{Handler: handler}
 	go srv.Serve(ln)
 	fmt.Fprintf(os.Stderr, "\nrestreaming live at http://%s%s\n\n", displayAddr(ln.Addr()), path)
 
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -235,6 +281,44 @@ func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
 		<-sigCh
 		os.Exit(130)
 	}()
+	shutdown := func() {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutCancel()
+		srv.Shutdown(shutCtx)
+	}
+	return ctx, cancel, shutdown, nil
+}
+
+// serveOnDemand publishes an on-demand channel until the operator interrupts
+// it. The OnDemand handler starts and stops the source by itself.
+func serveOnDemand(ctx context.Context, o Options, od *OnDemand, path string) error {
+	ctx, cancel, shutdown, err := listen(ctx, o, od, path)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	fmt.Fprintf(os.Stderr, "on demand: the source starts with the first viewer and stops after %s without one\n", o.Idle)
+	statusStop := make(chan struct{})
+	go statusLoop(od, statusStop)
+	<-ctx.Done()
+	close(statusStop)
+	od.Close()
+	shutdown()
+	fmt.Fprintln(os.Stderr, "restream stopped")
+	return nil
+}
+
+// serve runs the download jobs into their sinks while an HTTP server publishes
+// the result. It runs until the source ends or the operator interrupts it.
+func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
+	jobs []Job, pres Presentation, handler http.Handler, path string,
+	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
+
+	ctx, cancel, shutdown, err := listen(ctx, o, handler, path)
+	if err != nil {
+		return err
+	}
+	defer cancel()
 
 	statusStop := make(chan struct{})
 	go statusLoop(pres, statusStop)
@@ -251,12 +335,6 @@ func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
 	err = RunJobs(ctx, client, kind, jobs, keys, bbtsKey, threadCeiling, logv)
 	close(statusStop)
 	pres.End()
-
-	shutdown := func() {
-		shutCtx, shutCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer shutCancel()
-		srv.Shutdown(shutCtx)
-	}
 
 	// A real download error (not an interrupt) is fatal.
 	if err != nil && ctx.Err() == nil {

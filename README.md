@@ -490,7 +490,7 @@ m314dl -worker :7001 -worker-secret mytoken -worker-max-channels 32
 # start a channel (source to live HLS at /news/live.m3u8)
 curl -H 'Authorization: Bearer mytoken' -X POST http://server:7001/api/channels \
   -d '{"id":"news","url":"https://…/manifest.mpd","format":"hls","keys":["KID:KEY"],
-       "headers":{"Referer":"https://…"}}'
+       "headers":{"Referer":"https://…"},"idle":"30s"}'
 
 # ts / dash channels the same way (format: "ts" | "dash")
 # list / inspect / stop
@@ -510,6 +510,27 @@ under an id. The control plane has a bearer secret, an admission cap
 shutdown that stops every channel. State lives in memory on purpose: the worker
 is stateless, and the controller's own reconciliation restarts channels after a
 restart.
+
+### On-demand channels
+
+A channel can fetch from its source only while someone is watching. Pass
+`-serve-idle 30s` to `-serve`, or `"idle":"30s"` per channel in the worker
+API (`-worker-idle` sets the default for channels that don't say). Nothing is
+fetched until the first viewer asks for the playlist or the TS; that request
+waits for the first segment, up to 8 seconds, like any live join. Once no
+request has arrived for the idle period and no connection is open, the source
+is released. The URLs stay the same, and the next viewer starts it again: the
+manifest is loaded afresh, the same tracks are selected, the HLS media
+sequence carries on from where it stopped and the first new segment is marked
+as a discontinuity. Live sources only; a finite source spools once and is
+served complete regardless.
+
+A viewer is any request under the channel's path (playlists, manifest, init,
+segments) or an open `/live.ts` connection. The worker reports an on-demand
+channel's `state` as `idle`, `starting` or `running`, with `viewers` (distinct
+client addresses in the last 30 seconds) and `last_error` (why the last start
+or run ended; a failed start answers 503 and is retried by the next viewer).
+The idle period must be at least 5 seconds.
 
 ## RPC server
 
