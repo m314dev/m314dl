@@ -225,7 +225,15 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 				if live {
 					refresh := parseISODuration(doc.MinimumUpdatePeriod)
 					if refresh <= 0 {
+						// PT0S or absent: the MPD may change at any time, so
+						// poll once per segment. Half the DVR window was the
+						// old fallback, and on a four hour window that meant
+						// one refresh every two hours with the live edge
+						// frozen in between.
 						refresh = math.Max(tsbd/2, 2)
+						if n := len(segs); n > 0 && segs[n-1].Duration > 0 {
+							refresh = math.Min(refresh, math.Max(segs[n-1].Duration, 2))
+						}
 					}
 					st.Refresh = time.Duration(refresh * float64(time.Second))
 				}

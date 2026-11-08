@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/m314dev/m314dl/internal/manifest"
 )
@@ -495,5 +496,32 @@ func TestLiveRefreshesFromLocation(t *testing.T) {
 	}
 	if got := m.Streams[0].PlaylistURL; got != "https://origin.example.com/ch/x/dash.mpd" {
 		t.Fatalf("PlaylistURL = %s, want the MPD URL", got)
+	}
+}
+
+func TestLiveZeroUpdatePeriodPollsPerSegment(t *testing.T) {
+	// minimumUpdatePeriod="PT0S" with a four hour DVR window. The old fallback
+	// of half the window meant a refresh every two hours.
+	mpd := `<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" availabilityStartTime="1970-01-01T00:00:00Z" minimumUpdatePeriod="PT0S" timeShiftBufferDepth="PT4H0S">
+ <Period id="p0" start="PT0S">
+  <AdaptationSet mimeType="video/mp4">
+   <SegmentTemplate initialization="$RepresentationID$_init.mp4" media="$RepresentationID$_t$Time$.m4s" timescale="90000">
+    <SegmentTimeline><S t="161474528740304" d="360000" r="3599"/></SegmentTimeline>
+   </SegmentTemplate>
+   <Representation id="V0" bandwidth="5233000" codecs="avc1.640028" width="1920" height="1080"/>
+  </AdaptationSet>
+ </Period>
+</MPD>`
+	m, err := Parse([]byte(mpd), "https://ex.com/ch/x/dash.mpd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := m.Streams[0]
+	if len(st.Segments) != 3600 {
+		t.Fatalf("segments = %d, want 3600", len(st.Segments))
+	}
+	if st.Refresh != 4*time.Second {
+		t.Fatalf("Refresh = %s, want 4s (one segment)", st.Refresh)
 	}
 }
