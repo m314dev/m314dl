@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -64,6 +65,11 @@ type Config struct {
 	// restreaming gets every property the file path has (adaptive concurrency,
 	// CENC/AES-128/BBTS decryption, live refresh, hole tolerance).
 	Sink Sink
+	// Warn reports a live source that has stopped moving: refreshes that keep
+	// failing, or a window that keeps listing the same segments. Printed even
+	// without -v, since a viewer sees only a frozen stream. Falls back to
+	// Verbose when nil.
+	Warn func(format string, args ...any)
 
 	fileURL *fileURL // direct file behind an expiring redirect; set by DownloadFile
 }
@@ -119,6 +125,9 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	// cfg.Threads is the concurrency ceiling; 0 means auto (handled below).
 	if cfg.Verbose == nil {
 		cfg.Verbose = func(string, ...any) {}
+	}
+	if cfg.Warn == nil {
+		cfg.Warn = cfg.Verbose
 	}
 	// CENC: decryption happens in this process, with no external mp4decrypt.
 	//
@@ -422,6 +431,19 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 	if interval <= 0 {
 		interval = 4 * time.Second
 	}
+	// A live source that stops moving is worth a line on the console even
+	// without -v. Either the refresh keeps failing, or it succeeds and keeps
+	// listing the same segments (a manifest the server never updates, or one
+	// the CDN hands back from cache). Say which, once every 30 seconds.
+	lastNew, lastWarn := time.Now(), time.Time{}
+	stalled := func(format string, args ...any) {
+		if time.Since(lastWarn) < 30*time.Second {
+			cfg.Verbose(format, args...)
+			return
+		}
+		lastWarn = time.Now()
+		cfg.Warn(format, args...)
+	}
 	for {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			cfg.Verbose("live: recording limit reached")
@@ -437,11 +459,22 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 		}
 		cur, err := refresh(ctx)
 		if err != nil {
-			cfg.Verbose("live: refresh failed (will keep trying): %v", err)
+			stalled("live: %s: refresh failed (will keep trying): %v", st.ID, err)
 			continue
 		}
-		if _, ok := push(cur); !ok {
+		fresh, ok := push(cur)
+		if !ok {
 			return ctx.Err()
+		}
+		if fresh > 0 {
+			lastNew = time.Now()
+		} else if since := time.Since(lastNew); since > 30*time.Second {
+			last := ""
+			if n := len(cur.Segments); n > 0 {
+				last = path.Base(strings.SplitN(cur.Segments[n-1].URL, "?", 2)[0])
+			}
+			stalled("live: %s: no new segments for %s, source still lists %d ending at %s",
+				st.ID, since.Round(time.Second), len(cur.Segments), last)
 		}
 		if !cur.Live {
 			cfg.Verbose("live: stream ended")

@@ -28,6 +28,7 @@ type mpdXML struct {
 	AvailabilityStartTime     string      `xml:"availabilityStartTime,attr"`
 	TimeShiftBufferDepth      string      `xml:"timeShiftBufferDepth,attr"`
 	MinimumUpdatePeriod       string      `xml:"minimumUpdatePeriod,attr"`
+	Location                  []string    `xml:"Location"`
 	BaseURL                   []string    `xml:"BaseURL"`
 	Periods                   []periodXML `xml:"Period"`
 }
@@ -152,6 +153,13 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 	live := doc.Type == "dynamic"
 	m := &manifest.Master{URL: mpdURL, Live: live}
 	mpdBase := resolveChain(mpdURL, doc.BaseURL)
+	// A live MPD may name the URL to refresh it from. Fetching the original URL
+	// again can hand back a cached first copy that never moves, so the live
+	// window would stay stuck on its first segments.
+	refreshURL := mpdURL
+	if len(doc.Location) > 0 && strings.TrimSpace(doc.Location[0]) != "" {
+		refreshURL = resolveURL(mpdURL, strings.TrimSpace(doc.Location[0]))
+	}
 	mpdDur := parseISODuration(doc.MediaPresentationDuration)
 	tsbd := parseISODuration(doc.TimeShiftBufferDepth)
 	ast, _ := time.Parse(time.RFC3339, doc.AvailabilityStartTime)
@@ -176,7 +184,7 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 				rBase := resolveChain(aBase, rep.BaseURL)
 				st := buildStream(&as, &rep, ai, ri)
 				st.Live = live
-				st.PlaylistURL = mpdURL
+				st.PlaylistURL = refreshURL
 				ctx := segCtx{
 					base: rBase, rep: &rep, as: &as,
 					periodDur: pDur, periodStart: periodStart,

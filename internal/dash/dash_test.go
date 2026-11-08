@@ -468,3 +468,32 @@ func TestLiveSixPeriodsJoinOnce(t *testing.T) {
 		t.Fatalf("live=%v refresh=%s, want live with a 3s refresh", m.Live, m.Streams[0].Refresh)
 	}
 }
+
+const mpdLocation = `<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic" availabilityStartTime="1970-01-01T00:00:00Z" minimumUpdatePeriod="PT2S" timeShiftBufferDepth="PT12S">
+ <Location>https://edge.example.com/session/abc/dash.mpd</Location>
+ <Period id="1" start="PT0S">
+  <AdaptationSet mimeType="video/mp4">
+   <SegmentTemplate media="v-$Number$.m4s" initialization="v-init.mp4" timescale="1" duration="4" startNumber="1"/>
+   <Representation id="V0" bandwidth="5000000" width="1920" height="1080" codecs="avc1.640028"/>
+  </AdaptationSet>
+ </Period>
+</MPD>`
+
+func TestLiveRefreshesFromLocation(t *testing.T) {
+	m, err := Parse([]byte(mpdLocation), "https://origin.example.com/ch/x/dash.mpd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Streams[0].PlaylistURL; got != "https://edge.example.com/session/abc/dash.mpd" {
+		t.Fatalf("PlaylistURL = %s, want the Location element", got)
+	}
+	// without Location the MPD's own URL is kept
+	m, err = Parse([]byte(strings.Replace(mpdLocation, "<Location>https://edge.example.com/session/abc/dash.mpd</Location>", "", 1)), "https://origin.example.com/ch/x/dash.mpd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Streams[0].PlaylistURL; got != "https://origin.example.com/ch/x/dash.mpd" {
+		t.Fatalf("PlaylistURL = %s, want the MPD URL", got)
+	}
+}

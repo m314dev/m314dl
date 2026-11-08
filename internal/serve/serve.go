@@ -367,6 +367,7 @@ func RunJobs(ctx context.Context, client *httpx.Client, kind string, jobs []Job,
 			cfg := engine.Config{
 				Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey,
 				Verbose: logv, Sink: j.sink,
+				Warn: func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) },
 				// A finite TS broadcast source downloads as fast as it can. Pace it
 				// to real time so it does not flood the viewers' buffers. The
 				// publisher paths spool to disk instead and are never paced.
