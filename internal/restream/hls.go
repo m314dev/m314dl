@@ -68,6 +68,7 @@ type Publisher struct {
 	cacheMu   sync.Mutex
 	dashCache []byte
 	dashVer   int64
+	dashCut   int64 // the cutMS the cached body was rendered with
 }
 
 func NewPublisher() *Publisher {

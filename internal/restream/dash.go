@@ -84,11 +84,23 @@ func (p *Publisher) DASHManifest() []byte {
 		fmt.Fprintf(&b, ` mediaPresentationDuration="PT%.3fS"`, total)
 	}
 	b.WriteString(">\n")
-	// The Period body (adaptation sets and timelines) is the O(segments) part.
-	// It depends only on the tracks, not on the wall clock, so it is cached.
-	// The header above carries the per-request publishTime and the live/aired
-	// phase.
-	b.Write(p.dashBody())
+	// A finite source spools far faster than real time, so the timeline would
+	// list the whole asset minutes after the start. Clock based players
+	// (dash.js, Shaka) do not mind: their live edge is now minus AST. VLC does
+	// not look at the clock at all. With a SegmentTimeline it starts at the
+	// last listed segment minus the presentation delay, which on a fully
+	// spooled film is the final 18 seconds, after which it waits for more
+	// forever. So until the asset has aired, list only the segments a real
+	// live channel would have published by now: those that end before the
+	// wall clock. The cut moves once per target duration, so the cached body
+	// is rebuilt at that pace, not per request.
+	cutMS := int64(-1)
+	if !live && !aired {
+		tdMS := int64(td * 1000)
+		cutMS = now.Sub(p.start).Milliseconds()
+		cutMS -= cutMS % tdMS
+	}
+	b.Write(p.dashBody(cutMS))
 	b.WriteString("</MPD>\n")
 	return []byte(b.String())
 }
@@ -96,11 +108,11 @@ func (p *Publisher) DASHManifest() []byte {
 // dashBody renders (and caches) the <Period> body, rebuilding it only when a
 // segment is added, an init arrives, or the stream ends. Many pollers on a long
 // growing VOD then share one render instead of each re-walking every segment.
-func (p *Publisher) dashBody() []byte {
+func (p *Publisher) dashBody(cutMS int64) []byte {
 	v := p.ver.Load()
 	p.cacheMu.Lock()
 	defer p.cacheMu.Unlock()
-	if p.dashCache != nil && p.dashVer == v {
+	if p.dashCache != nil && p.dashVer == v && p.dashCut == cutMS {
 		return p.dashCache
 	}
 	var b strings.Builder
@@ -116,13 +128,13 @@ func (p *Publisher) dashBody() []byte {
 		}
 	}
 	for _, t := range video {
-		writeAdaptationSet(&b, t, "video", "video/mp4")
+		writeAdaptationSet(&b, t, "video", "video/mp4", cutMS)
 	}
 	for _, t := range audio {
-		writeAdaptationSet(&b, t, "audio", "audio/mp4")
+		writeAdaptationSet(&b, t, "audio", "audio/mp4", cutMS)
 	}
 	b.WriteString("  </Period>\n")
-	p.dashCache, p.dashVer = []byte(b.String()), v
+	p.dashCache, p.dashVer, p.dashCut = []byte(b.String()), v, cutMS
 	return p.dashCache
 }
 
@@ -181,7 +193,10 @@ func (p *Publisher) totalDur() float64 {
 	return max
 }
 
-func writeAdaptationSet(b *strings.Builder, t *Track, contentType, mime string) {
+// cutMS, when not negative, hides the segments that end after that
+// presentation time (see DASHManifest). At least one segment always stays: an
+// empty SegmentTimeline wedges dash.js for good.
+func writeAdaptationSet(b *strings.Builder, t *Track, contentType, mime string, cutMS int64) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -218,6 +233,13 @@ func writeAdaptationSet(b *strings.Builder, t *Track, contentType, mime string) 
 	}
 
 	visible := t.visibleLocked()
+	if cutMS >= 0 {
+		n := len(visible)
+		for n > 1 && visible[n-1].startMS+int64(math.Round(visible[n-1].dur*1000)) > cutMS {
+			n--
+		}
+		visible = visible[:n]
+	}
 	startNum := int64(0)
 	if len(visible) > 0 {
 		startNum = visible[0].seq

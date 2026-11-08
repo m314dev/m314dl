@@ -466,7 +466,12 @@ VOD is presented like a live broadcast for now. The MPD stays `dynamic` until
 the download has finished and the full published duration has passed since the
 publisher started; only then does it turn `static` and fully seekable. This is
 on purpose, for player compatibility: downloading a two-hour film in five
-minutes doesn't make its MPD static after five minutes. DASH output needs an
+minutes doesn't make its MPD static after five minutes. While it is dynamic,
+the timeline lists only the segments a live channel would have published by
+now, however far ahead the download is. Players that pick their start from the
+end of the timeline (VLC) and players that use the clock (dash.js, Shaka) then
+land in the same place; a timeline listing the whole film sent VLC to the
+closing credits. DASH output needs an
 fMP4 source; a TS source has to be remuxed first, which isn't built yet.
 
 The first MPD request waits briefly for every track's first segment. If a track
