@@ -83,10 +83,14 @@ func TestProgressLogClearsStatusLine(t *testing.T) {
 }
 
 // On a terminal the line has a bar, the projected size, the connection count
-// and the file name. Piped, it keeps the parseable shape unchanged.
+// and the file name. Piped, it keeps the parseable shape unchanged. The
+// percentage is bytes over the projected size, so it moves inside a segment.
 func TestProgressTerminalLine(t *testing.T) {
 	p := NewProgress(false, 0)
 	p.AddTotal(20)
+	for i := 0; i < 10; i++ {
+		p.AddSized(1 << 20)
+	}
 	p.AddDone(10)
 	p.AddBytes(10 << 20)
 	p.AddConns(4)
@@ -104,6 +108,12 @@ func TestProgressTerminalLine(t *testing.T) {
 	if strings.Contains(got, "\x1b") {
 		t.Fatal("colors emitted with ui.Color off")
 	}
+	// half of the eleventh segment has arrived: the bar moves before the commit
+	p.AddBytes(1 << 19)
+	if got := p.Line(); !strings.Contains(got, " 52.5% | 10/20 segs | 10.5MiB/~20.0MiB | ") {
+		t.Fatalf("mid segment line %q", got)
+	}
+	p.AddBytes(-(1 << 19))
 	// the final line at 100% has a full bar, no projection and no "ETA ?"
 	p.AddDone(10)
 	if got := p.Line(); !strings.Contains(got, "[████████████████████] 100.0% | 20/20 segs | 10.0MiB | ") || !strings.Contains(got, "ETA 0s") {
@@ -111,6 +121,20 @@ func TestProgressTerminalLine(t *testing.T) {
 	}
 	if s := p.Summary(-1); s != "10.0MiB, 0s at 0B/s" && !strings.HasPrefix(s, "10.0MiB, ") {
 		t.Fatalf("summary %q", s)
+	}
+}
+
+// 64 fetches in flight and none finished: the bar must still move once the
+// headers have said how long the segments are, instead of sitting at 0.0%.
+func TestProgressMovesBeforeFirstCommit(t *testing.T) {
+	p := NewProgress(false, 0)
+	p.AddTotal(64)
+	for i := 0; i < 64; i++ {
+		p.AddSized(10 << 20)
+	}
+	p.AddBytes(48 << 20)
+	if got := p.Line(); !strings.HasPrefix(got, "  7.5% | 0/64 segs | 48.0MiB | ") {
+		t.Fatalf("line %q", got)
 	}
 }
 

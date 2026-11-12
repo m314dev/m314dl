@@ -22,6 +22,13 @@ type Progress struct {
 	bytes      atomic.Int64
 	knownBytes atomic.Int64
 	conns      atomic.Int64 // segment fetches in flight right now
+	// Segments whose size is known (from the response headers as soon as the
+	// fetch starts, or from the byte count when it ends) and their combined
+	// size give the per segment average the percentage and ETA are projected
+	// from. bytes alone would not do: it only holds what has arrived so far,
+	// and with 64 fetches in flight that is 64 half segments and no average.
+	sizedSegs  atomic.Int64
+	sizedBytes atomic.Int64
 
 	mu       sync.Mutex
 	samples  []sample // ring of (time, bytes) samples for the windowed speed
@@ -61,6 +68,9 @@ func (p *Progress) SetName(name string) {
 	p.name = name
 	p.mu.Unlock()
 }
+
+// AddSized records that one segment is known to be n bytes long.
+func (p *Progress) AddSized(n int64) { p.sizedSegs.Add(1); p.sizedBytes.Add(n) }
 
 func (p *Progress) AddBytes(n int64) {
 	cur := p.bytes.Add(n)
@@ -162,30 +172,39 @@ func (p *Progress) Line() string {
 }
 
 // estimate computes the percentage, the ETA string ("?" when unknown) and the
-// projected total size (0 when unknown) from the counters. Both projections
-// assume the segments seen so far are typical, so they wait until a handful
-// have finished.
+// projected total size (0 when unknown) from the counters. The percentage is
+// bytes over the projected total, so the bar keeps moving inside a long
+// segment instead of stepping once per commit. It uses the projection as soon
+// as one segment's size is known, a rough bar being better than one stuck at
+// 0 while 64 fetches run. The shown total and the ETA assume the segments
+// sized so far are typical, so they wait until a handful have been seen.
 func (p *Progress) estimate(done, total, bytes int64, speed float64) (pct float64, eta string, estTotal int64) {
-	if total > 0 {
+	eta = "?"
+	ss, sb := p.sizedSegs.Load(), p.sizedBytes.Load()
+	proj := p.knownBytes.Load()
+	if proj == 0 && total > 0 && ss > 0 {
+		proj = int64(float64(sb) / float64(ss) * float64(total))
+	}
+	if p.knownBytes.Load() > 0 || enoughDone(ss, total) {
+		estTotal = proj
+	}
+	switch {
+	case total > 0 && done >= total:
+		pct = 100
+	case proj > 0:
+		pct = min(100, float64(bytes)/float64(proj)*100)
+	case total > 0:
 		pct = float64(done) / float64(total) * 100
 	}
-	eta = "?"
-	if known := p.knownBytes.Load(); known > 0 {
-		estTotal = known
-	} else if total > 0 && enoughDone(done, total) {
-		estTotal = int64(float64(bytes) / float64(done) * float64(total))
-	}
-	if speed > 1 && total > done && enoughDone(done, total) {
-		perSeg := float64(bytes) / float64(done)
-		etaSec := perSeg * float64(total-done) / speed
-		if etaSec < 360000 {
+	if speed > 1 && estTotal > bytes && done < total {
+		if etaSec := float64(estTotal-bytes) / speed; etaSec < 360000 {
 			eta = (time.Duration(etaSec) * time.Second).Round(time.Second).String()
 		}
 	}
 	return pct, eta, estTotal
 }
 
-// enoughDone says whether enough segments have finished for a projection to
+// enoughDone says whether enough segments have been sized for a projection to
 // mean something: nine of them, or a quarter of a short playlist, so a 7-segment
 // download still shows an ETA instead of "?" until it is over.
 func enoughDone(done, total int64) bool {

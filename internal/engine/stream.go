@@ -66,6 +66,7 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 	pressure := 0
 	backoff := 500 * time.Millisecond
 	u, refreshed := it.url, false
+	sized := false // this segment's length has been reported to Progress
 	for attempt := 0; ; attempt++ {
 		if cfg.fileURL != nil {
 			u = cfg.fileURL.get() // another worker may have re-resolved it
@@ -159,6 +160,18 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			continue
 		}
 
+		// Tell the progress bar how long this segment is as soon as the headers
+		// say, so its projection does not wait for a whole segment to land.
+		if !sized && cfg.Progress != nil {
+			switch {
+			case segLen >= 0:
+				cfg.Progress.AddSized(segLen)
+				sized = true
+			case resp.ContentLength > 0:
+				cfg.Progress.AddSized(have + resp.ContentLength)
+				sized = true
+			}
+		}
 		// 2xx: stream the body to disk, counting bytes as they arrive. Every
 		// byte received resets the watchdog, so a slow transfer that is still
 		// alive is never cut.
@@ -176,6 +189,9 @@ func downloadSegment(ctx context.Context, cfg Config, ctl *controller, it item, 
 			rerr = io.ErrUnexpectedEOF
 		}
 		if rerr == nil {
+			if !sized && cfg.Progress != nil {
+				cfg.Progress.AddSized(have) // chunked body: size known only now
+			}
 			return pressure, nil // complete
 		}
 		// The body failed part way through (a watchdog cancel counts): retry,
