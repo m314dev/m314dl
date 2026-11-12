@@ -138,6 +138,15 @@ func urlBase(s string) string {
 func fileMaster(ctx context.Context, client *httpx.Client, resp *http.Response, inputURL, finalURL string, logv func(string, ...any)) *manifest.Master {
 	st := &manifest.Stream{Type: manifest.Unknown, ID: "file", Name: fileName(resp, inputURL, finalURL), PlaylistURL: inputURL}
 	size := resp.ContentLength
+	if size <= 0 {
+		ct := resp.Header.Get("Content-Type")
+		if ct == "video/mp2t" || ct == "video/MP2T" || ct == "application/octet-stream" {
+			st.Live = true
+			st.Segments = []manifest.Segment{{URL: finalURL}}
+			logv("file: live MPEG-TS stream (no Content-Length)")
+			return &manifest.Master{URL: finalURL, Live: true, Streams: []*manifest.Stream{st}}
+		}
+	}
 	var chunks []manifest.ByteRange
 	if size > fileChunk && rangesHonored(ctx, client, finalURL, size) {
 		chunks = planChunks(size)

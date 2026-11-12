@@ -374,6 +374,8 @@ func Select(streams []*manifest.Stream, ve, ae, se *Expr) []*manifest.Stream {
 	} else {
 		out = append(out, se.Apply(subPool)...)
 	}
+	// Direct files (MPEG-TS, MP4, etc.) have type Unknown; include them as-is.
+	out = append(out, byType[manifest.Unknown]...)
 	return out
 }
 

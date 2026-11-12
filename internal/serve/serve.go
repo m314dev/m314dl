@@ -409,7 +409,7 @@ func singleMuxedTS(streams []*manifest.Stream) *manifest.Stream {
 		return nil // separate audio (or more tracks) must be muxed together, so remux
 	}
 	st := streams[0]
-	if st.Type != manifest.Video {
+	if st.Type != manifest.Video && st.Type != manifest.Unknown {
 		return nil
 	}
 	if st.Init != nil || segmentIsFMP4TS(st) {
