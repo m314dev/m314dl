@@ -5,7 +5,9 @@
 //   - HLS (-serve-format hls, the default): a multivariant playlist plus a
 //     rolling window of segments, with one media playlist per track.
 //   - MPEG-TS (-serve-format ts): a single continuous transport stream that is
-//     copied out to every viewer. It needs one muxed TS source track.
+//     copied out to every viewer. It needs one muxed TS source track. It is
+//     the only output for a live MPEG-TS source (source.LiveTSKind), which is
+//     piped in as it arrives instead of downloaded segment by segment.
 package serve
 
 import (
@@ -111,6 +113,22 @@ type Job struct {
 // as the first time, for an on-demand restart.
 type Resolver func(ctx context.Context) ([]*manifest.Stream, error)
 
+// CheckFormat refuses an output format that a source of this kind cannot be
+// published in. A live MPEG-TS source goes out only as TS: it has no segments,
+// and the HLS and DASH packagers are built on them.
+func CheckFormat(kind, format string) error {
+	if kind != source.LiveTSKind {
+		return nil
+	}
+	switch format {
+	case "ts", "mpegts":
+		return nil
+	case "":
+		format = "hls"
+	}
+	return fmt.Errorf("a live MPEG-TS source can only be restreamed as ts, not %s", format)
+}
+
 // Run builds the output for the selected streams and hands over to the run
 // loop, which blocks until the restream ends (the one-shot `-serve` mode).
 // With o.Idle set and a live source, the source runs only while someone is
@@ -119,6 +137,9 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 	selected []*manifest.Stream, resolve Resolver, keys map[[16]byte][]byte, bbtsKey []byte,
 	threadCeiling int, logv func(string, ...any)) error {
 
+	if err := CheckFormat(kind, o.Format); err != nil {
+		return err
+	}
 	base, err := SpoolBase(o.SpoolDir)
 	if err != nil {
 		return err
@@ -364,6 +385,13 @@ func RunJobs(ctx context.Context, client *httpx.Client, kind string, jobs []Job,
 	for _, j := range jobs {
 		j := j
 		g.Go(func() error {
+			if kind == source.LiveTSKind {
+				// One endless body, no segments: it goes straight into the sink.
+				if err := source.PipeLiveTS(gctx, client, j.st, j.sink, logv); err != nil {
+					return fmt.Errorf("track %s: %w", j.st.ID, err)
+				}
+				return nil
+			}
 			cfg := engine.Config{
 				Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey,
 				Verbose: logv, Sink: j.sink,

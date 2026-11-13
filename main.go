@@ -475,12 +475,16 @@ func expandSelected(ctx context.Context, client *httpx.Client, kind string, sele
 }
 
 // download turns one loaded input into its output. A direct file is written
-// as it is. A manifest goes through track selection, download and mux.
+// as it is, and so is a live MPEG-TS stream, which -serve restreams instead. A
+// manifest goes through track selection, download and mux.
 func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL string, master *manifest.Master, kind string) error {
 	o, client, threadCeiling, logv := j.o, j.client, j.threads, j.logv
 	keys, bbtsKey, adFilters := j.keys, j.bbtsKey, j.adFilters
 	stopLive := make(chan struct{})
-	if kind == source.FileKind {
+	if kind == source.LiveTSKind && o.serve != "" && !o.listOnly {
+		return j.serveLiveTS(ctx, inputURL, master)
+	}
+	if kind == source.FileKind || kind == source.LiveTSKind {
 		return j.downloadFile(ctx, cancel, master.Streams[0])
 	}
 
@@ -832,6 +836,28 @@ func installInterruptHandler(live bool, stopLive chan struct{}, cancel context.C
 		cancel()
 		os.Exit(130)
 	}()
+}
+
+// serveLiveTS restreams a live MPEG-TS source. There is nothing to select: the
+// source is one muxed transport stream, and an on-demand restart only loads
+// the URL again.
+func (j job) serveLiveTS(ctx context.Context, inputURL string, master *manifest.Master) error {
+	o := j.o
+	if o.serveIdle != 0 && o.serveIdle < serve.MinIdle {
+		return fmt.Errorf("-serve-idle must be at least %s", serve.MinIdle)
+	}
+	resolve := func(ctx context.Context) ([]*manifest.Stream, error) {
+		m, kind, err := source.LoadManifest(ctx, j.client, inputURL, j.logv)
+		if err != nil {
+			return nil, err
+		}
+		if kind != source.LiveTSKind {
+			return nil, fmt.Errorf("the source changed from %s to %s", source.LiveTSKind, kind)
+		}
+		return []*manifest.Stream{source.LiveTSTrack(m)}, nil
+	}
+	return serve.Run(ctx, serve.Options{Addr: o.serve, Format: o.serveFormat, Transcode: o.serveTranscode, FFmpegPath: o.ffmpegPath, SpoolDir: o.spoolDir, Idle: o.serveIdle},
+		j.client, source.LiveTSKind, []*manifest.Stream{source.LiveTSTrack(master)}, resolve, nil, nil, j.threads, j.logv)
 }
 
 // downloadFile writes a direct file straight to its output path. There is no
