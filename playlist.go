@@ -149,7 +149,7 @@ func (j job) downloadEntry(ctx context.Context, cancel context.CancelFunc, u, ba
 		return fmt.Errorf("entry is itself an M3U playlist")
 	}
 	out := base + ".mp4"
-	if kind == source.FileKind {
+	if kind == source.FileKind || kind == source.LiveTSKind {
 		out = base + filepath.Ext(master.Streams[0].Name) // the file download handles resume and "already complete"
 	} else if _, err := os.Stat(out); err == nil {
 		return errExists // the muxed output exists only once the title is done

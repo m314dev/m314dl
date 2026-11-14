@@ -337,6 +337,10 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		cancel()
 		return nil, err
 	}
+	if err := serve.CheckFormat(kind, req.Format); err != nil {
+		cancel()
+		return nil, err
+	}
 	selected, err := selectAndExpand(ctx, client, kind, master, ve, ae, se, keys, w.logv)
 	if err != nil {
 		cancel()
@@ -368,11 +372,16 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		// and each start loads the manifest again and selects by the same
 		// rules.
 		start := func(ctx context.Context) (serve.Presentation, http.Handler, []serve.Job, error) {
-			master, kind, err := source.LoadManifest(ctx, client, req.URL, w.logv)
+			master, k, err := source.LoadManifest(ctx, client, req.URL, w.logv)
 			if err != nil {
 				return nil, nil, nil, err
 			}
-			sel, err := selectAndExpand(ctx, client, kind, master, ve, ae, se, keys, w.logv)
+			// run keeps the kind of the first load. A live MPEG-TS source cannot
+			// run in the segment engine, nor a manifest through the pipe.
+			if (k == source.LiveTSKind) != (kind == source.LiveTSKind) {
+				return nil, nil, nil, fmt.Errorf("the source changed from %s to %s since the channel was created", kind, k)
+			}
+			sel, err := selectAndExpand(ctx, client, k, master, ve, ae, se, keys, w.logv)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -540,6 +549,9 @@ func parseSelection(sv, sa, ss string) (ve, ae, se *pick.Expr, err error) {
 // track with no key, so a channel that is set up wrong reports the reason at
 // start.
 func selectAndExpand(ctx context.Context, client *httpx.Client, kind string, master *manifest.Master, ve, ae, se *pick.Expr, keys map[[16]byte][]byte, logv func(string, ...any)) ([]*manifest.Stream, error) {
+	if kind == source.LiveTSKind {
+		return []*manifest.Stream{source.LiveTSTrack(master)}, nil // one muxed stream: nothing to pick or expand
+	}
 	selected := pick.Select(master.Streams, ve, ae, se)
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("no streams matched the selection")

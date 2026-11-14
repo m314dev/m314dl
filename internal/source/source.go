@@ -85,7 +85,9 @@ func ParseKeys(vals []string) (map[[16]byte][]byte, error) {
 // falls back to scraping when the input is a web page. A direct file (anything
 // binary, or anything served as an attachment) comes back as a one-stream
 // master of kind FileKind whose segments are the file's byte ranges; see
-// file.go. An IPTV M3U list comes back as kind PlaylistKind; see playlist.go.
+// file.go. A live MPEG-TS stream comes back with that same master as kind
+// LiveTSKind; see livets.go. An IPTV M3U list comes back as kind PlaylistKind;
+// see playlist.go.
 func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, logv func(string, ...any)) (*manifest.Master, string, error) {
 	// Local manifest file (a path or file://): some providers sign the playlist
 	// per request and hand it over as text instead of a URL.
@@ -113,7 +115,12 @@ func LoadManifest(ctx context.Context, client *httpx.Client, inputURL string, lo
 	head, err := io.ReadAll(io.LimitReader(resp.Body, 512))
 	if err == nil && isDirectFile(resp, head) {
 		logv("input is a direct file (%s)", resp.Header.Get("Content-Type"))
-		return fileMaster(ctx, client, resp, inputURL, finalURL, logv), FileKind, nil
+		kind := FileKind
+		if isLiveTS(resp, head) {
+			logv("input is a live MPEG-TS stream")
+			kind = LiveTSKind
+		}
+		return fileMaster(ctx, client, resp, inputURL, finalURL, logv), kind, nil
 	}
 	var rest []byte
 	if err == nil {
