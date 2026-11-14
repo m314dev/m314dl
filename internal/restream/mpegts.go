@@ -23,9 +23,12 @@ import (
 // client that falls a byte budget behind is dropped, and no one else ever
 // waits on it.
 //
-// Publishing whole segments instead of arbitrary byte chunks is deliberate:
-// each HLS TS segment begins with PAT/PMT and can be decoded on its own, so a
-// client that joins mid-stream always starts on a clean, playable boundary.
+// A publish unit is whatever the producer hands over. From the segment engine
+// that is a whole HLS segment, which begins with PAT/PMT and decodes on its
+// own, so a joiner starts on a clean boundary. The remux pump and the raw live
+// TS pipe publish a few KB at a time instead, so a joiner there starts at an
+// arbitrary packet and its player waits for the next PAT/PMT and keyframe, as
+// it would on any raw transport stream.
 
 // maxSubQueuedBytes is how many bytes a subscriber may have queued (published
 // but not yet written to its socket) before it is dropped. Slack must be
