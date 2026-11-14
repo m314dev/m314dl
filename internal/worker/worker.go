@@ -337,10 +337,12 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		cancel()
 		return nil, err
 	}
-	if err := serve.CheckFormat(kind, req.Format); err != nil {
+	format, err := serve.CheckFormat(kind, req.Format)
+	if err != nil {
 		cancel()
 		return nil, err
 	}
+	req.Format = format
 	selected, err := selectAndExpand(ctx, client, kind, master, ve, ae, se, keys, w.logv)
 	if err != nil {
 		cancel()

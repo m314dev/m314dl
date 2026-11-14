@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -72,5 +73,22 @@ func TestListLiveTSWithServe(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("-list with -serve started a restream instead of listing")
+	}
+}
+
+// An M3U list's raw live TS channel is skipped like any other live entry. The
+// list run sets skipLive; recording it would never end.
+func TestPlaylistSkipsLiveTS(t *testing.T) {
+	u := tsSource(t, bytes.Repeat(append([]byte{0x47, 0x01, 0x00, 0x10}, make([]byte, 184)...), 100))
+	client, _ := httpx.New(httpx.Options{Retries: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m, kind, err := source.LoadManifest(ctx, client, u, func(string, ...any) {})
+	if err != nil || kind != source.LiveTSKind {
+		t.Fatalf("kind %q, err %v", kind, err)
+	}
+	j := job{o: &options{output: filepath.Join(t.TempDir(), "x.ts")}, client: client, logv: func(string, ...any) {}, skipLive: true}
+	if err := j.download(ctx, cancel, u, m, kind); !errors.Is(err, errLiveEntry) {
+		t.Fatalf("download = %v, want errLiveEntry", err)
 	}
 }

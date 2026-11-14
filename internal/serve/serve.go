@@ -113,20 +113,21 @@ type Job struct {
 // as the first time, for an on-demand restart.
 type Resolver func(ctx context.Context) ([]*manifest.Stream, error)
 
-// CheckFormat refuses an output format that a source of this kind cannot be
-// published in. A live MPEG-TS source goes out only as TS: it has no segments,
-// and the HLS and DASH packagers are built on them.
-func CheckFormat(kind, format string) error {
+// CheckFormat settles the output format for a source of this kind. A live
+// MPEG-TS source goes out only as TS: it has no segments, and the HLS and DASH
+// packagers are built on them. So for that kind an unset format means ts, not
+// the usual hls, and anything else is refused.
+func CheckFormat(kind, format string) (string, error) {
 	if kind != source.LiveTSKind {
-		return nil
+		return format, nil
 	}
 	switch format {
 	case "ts", "mpegts":
-		return nil
+		return format, nil
 	case "":
-		format = "hls"
+		return "ts", nil
 	}
-	return fmt.Errorf("a live MPEG-TS source can only be restreamed as ts, not %s", format)
+	return "", fmt.Errorf("a live MPEG-TS source can only be restreamed as ts, not %s", format)
 }
 
 // Run builds the output for the selected streams and hands over to the run
@@ -137,9 +138,11 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 	selected []*manifest.Stream, resolve Resolver, keys map[[16]byte][]byte, bbtsKey []byte,
 	threadCeiling int, logv func(string, ...any)) error {
 
-	if err := CheckFormat(kind, o.Format); err != nil {
+	format, err := CheckFormat(kind, o.Format)
+	if err != nil {
 		return err
 	}
+	o.Format = format
 	base, err := SpoolBase(o.SpoolDir)
 	if err != nil {
 		return err

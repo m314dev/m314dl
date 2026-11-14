@@ -240,7 +240,9 @@ func run() error {
 	flag.IntVar(&o.rpcMaxJobs, "rpc-max-jobs", 64, "-rpc: max concurrent jobs; further /add requests get 503 until a slot frees (0 = unlimited)")
 	flag.DurationVar(&o.rpcRetain, "rpc-retain", time.Hour, "-rpc: keep finished jobs queryable at least this long before reaping (bounds memory)")
 	flag.StringVar(&o.serve, "serve", "", "restream: republish the selected streams live on this address (e.g. :8314) instead of downloading to a file")
-	flag.StringVar(&o.serveFormat, "serve-format", "hls", "restream output: hls (/live.m3u8), ts (continuous MPEG-TS at /live.ts), or dash (/live.mpd; needs an fMP4 source)")
+	// Unset rather than "hls": the restream picks hls for an unset format, except
+	// for a raw live MPEG-TS source, whose only output is ts.
+	flag.StringVar(&o.serveFormat, "serve-format", "", "restream output: hls (/live.m3u8), ts (continuous MPEG-TS at /live.ts), or dash (/live.mpd; needs an fMP4 source) (default hls; ts for a raw MPEG-TS source)")
 	flag.StringVar(&o.serveTranscode, "serve-transcode", "", "restream ts remux: ffmpeg output codec args to transcode instead of copy, e.g. '-c:v libx264 -preset veryfast -c:a aac' (implies the ffmpeg remux path)")
 	flag.DurationVar(&o.serveIdle, "serve-idle", 0, "restream: on demand; start the live source with the first viewer and release it after this long with no viewer (e.g. 30s; 0 = always on, minimum 5s)")
 	flag.DurationVar(&o.workerIdle, "worker-idle", 0, "-worker: default on-demand idle period for channels that do not set \"idle\" (0 = always on)")
@@ -483,6 +485,9 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	stopLive := make(chan struct{})
 	if kind == source.LiveTSKind && o.serve != "" && !o.listOnly {
 		return j.serveLiveTS(ctx, inputURL, master)
+	}
+	if kind == source.LiveTSKind && j.skipLive {
+		return errLiveEntry // an M3U list's live channel: there is no end to record
 	}
 	if kind == source.FileKind || kind == source.LiveTSKind {
 		return j.downloadFile(ctx, cancel, master.Streams[0])

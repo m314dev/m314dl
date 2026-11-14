@@ -398,6 +398,9 @@ m314dl -serve :8314 -key KID:KEY https://example.com/manifest.mpd
 m314dl -serve :8314 -serve-format ts https://example.com/live.m3u8
 # → http://localhost:8314/live.ts
 
+# a raw live MPEG-TS URL (no playlist) is piped straight through as TS
+m314dl -serve :8314 http://example.com/channel.ts
+
 # serve live DASH (dash.js, Shaka, ExoPlayer)
 m314dl -serve :8314 -serve-format dash https://example.com/manifest.mpd
 # → http://localhost:8314/live.mpd
@@ -439,6 +442,12 @@ client.)
   on a segment boundary, which gives a clean, decodable start (PAT/PMT and a
   keyframe), and continuity counters are renumbered into one unbroken sequence
   per PID across boundaries.
+- A raw live MPEG-TS URL, one endless body with no playlist, is the only input
+  that skips the segment engine. Its packets are piped to the viewers as they
+  arrive, the connection is reopened when the source drops it, and TS is the
+  only output it can take (`-serve-format` defaults to it). Without `-serve`
+  such a URL is recorded like any direct file; in an M3U list it is skipped
+  like other live entries.
 - An fMP4 source, or separate video and audio, goes through one FFmpeg remux.
   m314dl runs a single long-lived FFmpeg that copies the decrypted tracks into
   TS and muxes in separate audio. It's one process for the whole stream, not one
