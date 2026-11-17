@@ -438,10 +438,13 @@ viewer waits for it. (A naive broadcaster stalls everyone on the slowest
 client.)
 
 - A TS source needs no FFmpeg. The segments are already MPEG-TS, so they
-  concatenate into a valid continuous stream without a remux. Each viewer joins
+  concatenate into a valid continuous stream without a remux. A viewer joins
   on a segment boundary, which gives a clean, decodable start (PAT/PMT and a
   keyframe), and continuity counters are renumbered into one unbroken sequence
-  per PID across boundaries.
+  per PID across boundaries. The raw TS pipe and the FFmpeg remux publish a
+  few KB at a time instead, so a viewer joining there starts at whatever packet
+  is current and the player waits for the next PAT/PMT and keyframe before it
+  shows a picture.
 - A raw live MPEG-TS URL, one endless body with no playlist, is the only input
   that skips the segment engine. Its packets are piped to the viewers as they
   arrive, the connection is reopened when the source drops it, and TS is the
