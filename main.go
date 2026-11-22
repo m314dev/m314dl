@@ -609,7 +609,17 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	}
 	var results []done
 	for _, st := range selected {
-		results = append(results, done{st: st, path: engine.TempStreamPath(tempDir, st, source.RawExt(st))})
+		ext := source.RawExt(st)
+		path := engine.TempStreamPath(tempDir, st, ext)
+		if ext == ".mp4" {
+			// Older downloads key their checkpoint and part files to the .mp4 path.
+			if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+				path += ".track"
+			} else if err != nil {
+				return err
+			}
+		}
+		results = append(results, done{st: st, path: path})
 	}
 	// How the streams are scheduled. Small segments (subtitles: thousands of tiny
 	// segments, a few bytes each) are bound by latency, the time one request
@@ -717,6 +727,16 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	logv("phase subtitle-convert: %s", time.Since(tFinalize).Round(time.Millisecond))
 
 	if o.noMux {
+		for i := range results {
+			r := &results[i]
+			if strings.HasSuffix(r.path, ".mp4.track") {
+				final := strings.TrimSuffix(r.path, ".track")
+				if err := os.Rename(r.path, final); err != nil {
+					return err
+				}
+				r.path = final
+			}
+		}
 		j.say("%s (raw streams kept):", ui.Paint(ui.Green, "done"))
 		for _, r := range results {
 			if !wentExternal[r.path] {
