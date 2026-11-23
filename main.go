@@ -916,10 +916,27 @@ func (j job) downloadFile(ctx context.Context, cancel context.CancelFunc, st *ma
 	if j.prog == nil {
 		prog.SetName(filepath.Base(outPath))
 	}
-	err := engine.DownloadFile(ctx, engine.Config{Client: j.client, Threads: j.threads, Progress: prog, Verbose: j.logv, PartDir: tempDir}, st, outPath)
+	// An MP4 grows under a .track name and takes its real name only once it is
+	// whole, so nothing watching the folder picks up a half written file. The
+	// checkpoint is keyed to the path being written, so a download that
+	// started as .mp4 under an older build keeps that name to resume.
+	writePath := outPath
+	if filepath.Ext(outPath) == ".mp4" {
+		if _, err := os.Stat(outPath); errors.Is(err, os.ErrNotExist) {
+			writePath += ".track"
+		} else if err != nil {
+			return err
+		}
+	}
+	err := engine.DownloadFile(ctx, engine.Config{Client: j.client, Threads: j.threads, Progress: prog, Verbose: j.logv, PartDir: tempDir}, st, writePath)
 	stopProg()
 	if err != nil {
 		return err
+	}
+	if writePath != outPath {
+		if err := os.Rename(writePath, outPath); err != nil {
+			return err
+		}
 	}
 	os.Remove(tempDir)
 	j.say("%s %s%s", ui.Paint(ui.Green, "done:"), outPath, j.summary(prog, outPath))
