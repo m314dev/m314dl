@@ -19,6 +19,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,9 +35,53 @@ type Options struct {
 }
 
 type Client struct {
+	// The transport, headers and retry count live behind one pointer so that
+	// Replace can swap all three at once under requests in flight: a request
+	// that has started keeps the set it started with, the next one takes the
+	// new set. That is how a restream follows a source whose headers, cookies
+	// or proxy change without stopping.
+	s atomic.Pointer[clientState]
+
+	// Traffic counters for the life of the Client, across any Replace.
+	bytes, requests, errors atomic.Int64
+}
+
+type clientState struct {
 	hc      *http.Client
 	headers map[string]string
 	retries int
+}
+
+// Replace makes c behave like n from now on: n's transport, headers, proxy,
+// cookies and retry count. Requests already running finish on the old
+// transport, whose idle connections are then closed. n itself is left as it
+// was, so the caller may drop it.
+func (c *Client) Replace(n *Client) {
+	old := c.s.Swap(n.s.Load())
+	if old != nil && old.hc != nil {
+		old.hc.CloseIdleConnections()
+	}
+}
+
+// Traffic reports what this client has moved since it was made: response body
+// bytes read by callers, requests sent, and requests that failed (a transport
+// error or a 4xx/5xx status).
+func (c *Client) Traffic() (bytes, requests, errors int64) {
+	return c.bytes.Load(), c.requests.Load(), c.errors.Load()
+}
+
+// countingBody adds every byte a caller reads from a response body to the
+// client's byte counter. Counting at the read, not from Content-Length, is
+// what makes a chunked live body count as well as a sized segment.
+type countingBody struct {
+	io.ReadCloser
+	n *atomic.Int64
+}
+
+func (b countingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.n.Add(int64(n))
+	return n, err
 }
 
 func New(o Options) (*Client, error) {
@@ -104,7 +149,9 @@ func New(o Options) (*Client, error) {
 	if r <= 0 {
 		r = 5
 	}
-	return &Client{hc: hc, headers: headers, retries: r}, nil
+	c := &Client{}
+	c.s.Store(&clientState{hc: hc, headers: headers, retries: r})
+	return c, nil
 }
 
 // dataTransport serves data:[<mediatype>][;base64],<payload> URLs (RFC 2397)
@@ -173,16 +220,27 @@ func noReferer(req *http.Request, via []*http.Request) error {
 
 // Do sends a request after filling in the default headers.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	for k, v := range c.headers {
+	s := c.s.Load()
+	for k, v := range s.headers {
 		if req.Header.Get(k) == "" {
 			req.Header.Set(k, v)
 		}
 	}
-	return c.hc.Do(req)
+	c.requests.Add(1)
+	resp, err := s.hc.Do(req)
+	if err != nil {
+		c.errors.Add(1)
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		c.errors.Add(1)
+	}
+	resp.Body = countingBody{resp.Body, &c.bytes}
+	return resp, nil
 }
 
 // Retries returns the configured number of retries per request.
-func (c *Client) Retries() int { return c.retries }
+func (c *Client) Retries() int { return c.s.Load().retries }
 
 // Retriable reports whether a status is worth retrying. It is exported for
 // streaming callers that run their own retry loop.
@@ -283,7 +341,7 @@ func (c *Client) retry(ctx context.Context, op func() error) (pressure int, err 
 			pressure++ // the server pushed back; count it even if we recover
 		}
 		permanent := isStatus && !retriable(se.Code)
-		if permanent || attempt >= c.retries || ctx.Err() != nil {
+		if permanent || attempt >= c.Retries() || ctx.Err() != nil {
 			return pressure, err
 		}
 		wait := backoff + time.Duration(rand.Int64N(int64(backoff/2)))

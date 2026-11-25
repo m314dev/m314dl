@@ -596,7 +596,7 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	}
 
 	cfg := engine.Config{
-		Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey, AdFilters: adFilters,
+		Client: client, Threads: threadCeiling, Keys: engine.NewKeyring(keys), BBTSKey: bbtsKey, AdFilters: adFilters,
 		LiveLimit: o.liveLimit, Progress: prog, Verbose: logv, Stop: stopLive,
 		Warn:      func(format string, args ...any) { prog.Log(fmt.Sprintf(format, args...)) },
 		FromStart: o.liveFromStart,

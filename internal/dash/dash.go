@@ -189,6 +189,7 @@ func Parse(body []byte, mpdURL string) (*manifest.Master, error) {
 					base: rBase, rep: &rep, as: &as,
 					periodDur: pDur, periodStart: periodStart,
 					live: live, tsbd: tsbd, ast: ast,
+					period: firstNonEmpty(p.ID, fmt.Sprintf("%.3f", periodStart)),
 				}
 				segs, init, err := buildSegments(ctx)
 				if err != nil {
@@ -320,6 +321,9 @@ type segCtx struct {
 	live        bool
 	tsbd        float64
 	ast         time.Time
+	// period tags each segment's Identity, since numbers and times start over
+	// in every period: the Period id when the MPD gives one, else its start.
+	period string
 }
 
 func buildSegments(c segCtx) ([]manifest.Segment, *manifest.InitMap, error) {
@@ -429,6 +433,10 @@ func segmentsFromTemplate(c segCtx, t *tmplXML) ([]manifest.Segment, *manifest.I
 					URL:      resolveURL(c.base, u),
 					Duration: float64(s.D) / float64(ts),
 					Seq:      int64(num),
+					// The time, not the number: a timeline's numbering starts at
+					// startNumber on every parse, so it says where in the list a
+					// segment sits, not which segment it is.
+					Identity: fmt.Sprintf("%s/t:%d", c.period, cur),
 				})
 				cur += s.D
 				num++
@@ -467,6 +475,7 @@ func segmentsFromTemplate(c segCtx, t *tmplXML) ([]manifest.Segment, *manifest.I
 			URL:      resolveURL(c.base, u),
 			Duration: segDur,
 			Seq:      int64(num),
+			Identity: fmt.Sprintf("%s/n:%d", c.period, num),
 		})
 	}
 	return segs, init, nil

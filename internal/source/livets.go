@@ -123,20 +123,29 @@ var (
 // PipeLiveTS copies a live MPEG-TS source into sink, whole packets at a time,
 // until ctx ends. One connection's body is the stream, so nothing goes to
 // disk and nothing waits for the body to end. When the connection ends or
-// stalls, PipeLiveTS opens the source again by the URL as given. When that URL
-// redirects to an expiring token, this also fetches a fresh token. The sink
-// sees one stream with a jump at the seam, and the TS output's continuity
+// stalls, PipeLiveTS opens the source again by the track's URL as in holds it
+// at that moment. So a URL replaced with in.Replace is picked up at the next
+// reconnect, not before: the connection that is working is left alone, and a
+// URL that redirects to an expiring token fetches a fresh one each time. The
+// sink sees one stream with a jump at the seam, and the TS output's continuity
 // counters carry on across it, as across an HLS segment boundary. PipeLiveTS
 // returns an error once pipeAttempts connections in a row have brought no
 // media, and at once when the sink fails.
-func PipeLiveTS(ctx context.Context, client *httpx.Client, st *manifest.Stream, sink engine.Sink, logv func(string, ...any)) error {
+func PipeLiveTS(ctx context.Context, in *Live, st *manifest.Stream, sink engine.Sink, logv func(string, ...any)) error {
 	if logv == nil {
 		logv = func(string, ...any) {}
 	}
 	failed, backoff := 0, pipeBackoff
-	for {
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			in.Reconnects.Add(1)
+		}
 		start := time.Now()
-		n, err := pipeOnce(ctx, client, st.PlaylistURL, sink)
+		cur := in.Track(st.ID)
+		if cur == nil {
+			cur = st
+		}
+		n, err := pipeOnce(ctx, in.Client, cur.PlaylistURL, sink)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

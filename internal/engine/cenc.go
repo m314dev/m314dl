@@ -74,7 +74,7 @@ func newCencDecryptor(ctx context.Context, cfg Config, st *manifest.Stream, init
 		return nil, nil
 	}
 
-	key := resolveKey(cfg.Keys, info.DefaultKID, manifestKID(st))
+	key := resolveKey(cfg.Keys.Map(), info.DefaultKID, manifestKID(st))
 	if key == nil {
 		// SAMPLE-AES (cbcs) may hand out its raw key through a URI we can
 		// fetch, the same way AES-128 does, instead of needing -key.

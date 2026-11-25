@@ -158,9 +158,19 @@ func (p *Publisher) WaitReady(ctx context.Context, timeout time.Duration) {
 type Stats struct {
 	ID        string
 	Type      string
-	Published int64 // total segments published over the run
+	Published int64 // total segments published over the run (publish units for a TS fan-out)
 	Window    int   // segments currently visible
 	Bitrate   int64 // bits/sec (declared or measured)
+	Bytes     int64 // bytes published over the run
+	Seq       int64 // output media sequence of the newest segment; -1 before the first
+	Width     int
+	Height    int
+	TargetDur float64 // seconds; 0 when unknown
+	// Realtime is media seconds published per wall second over the segments
+	// still in the window: 1.0 keeps pace with the source, under 1.0 falls
+	// behind, 0 means there is not enough yet to say.
+	Realtime float64
+	LastAt   time.Time // when the newest unit was published; zero before the first
 }
 
 // StatusLine implements the presentation status contract: one line summarizing
@@ -181,11 +191,23 @@ func (p *Publisher) Stats() []Stats {
 	out := make([]Stats, 0, len(p.tracks))
 	for _, t := range p.tracks {
 		t.mu.RLock()
-		out = append(out, Stats{
+		s := Stats{
 			ID: t.ID, Type: t.typ.String(),
 			Published: t.published, Window: len(t.segs), Bitrate: t.bitrateLocked(),
-		})
+			Bytes: t.bytes, Seq: t.seq - 1, Width: t.width, Height: t.height, TargetDur: t.targetDur,
+		}
+		if n := len(t.segs); n > 0 {
+			s.LastAt = t.segs[n-1].at
+			if wall := s.LastAt.Sub(t.segs[0].at).Seconds(); n > 1 && wall > 0 {
+				var media float64
+				for _, seg := range t.segs[1:] {
+					media += seg.dur
+				}
+				s.Realtime = media / wall
+			}
+		}
 		t.mu.RUnlock()
+		out = append(out, s)
 	}
 	return out
 }
@@ -234,6 +256,7 @@ type Track struct {
 	seq         int64 // output media sequence of the next segment (only ever goes up; never reset)
 	nextStartMS int64 // running presentation time in ms for the next segment (DASH timeline)
 	published   int64 // total ever published (for stats)
+	bytes       int64 // total bytes ever published (for stats)
 	ended       bool
 
 	plCache []byte // media playlist cached by plVer
@@ -382,6 +405,7 @@ func (t *Track) Segment(info engine.SegmentInfo, data []byte) error {
 	t.seq++
 	t.nextStartMS += int64(math.Round(dur * 1000))
 	t.published++
+	t.bytes += int64(len(data))
 	t.bumpVer()
 
 	// Live: trim beyond window+tail. The tail keeps just-evicted segments

@@ -220,7 +220,7 @@ func TestE2ERestream(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := serve.RunJobs(context.Background(), client, "mss", jobs, nil, nil, 0, logv); err != nil {
+			if err := serve.RunJobs(context.Background(), source.NewLive("mss", client, nil, selected), jobs, nil, 0, logv, nil); err != nil {
 				t.Fatal(err)
 			}
 			pres.End()
@@ -305,7 +305,7 @@ func TestE2ERestream(t *testing.T) {
 			}
 			viewer <- nil
 		}()
-		if err := serve.RunJobs(context.Background(), client, "mss", jobs, nil, nil, 0, logv); err != nil {
+		if err := serve.RunJobs(context.Background(), source.NewLive("mss", client, nil, selected), jobs, nil, 0, logv, nil); err != nil {
 			t.Fatal(err)
 		}
 		pres.End()
@@ -406,7 +406,7 @@ func TestE2ECENC(t *testing.T) {
 	if err := engine.DownloadStream(context.Background(), engine.Config{Client: client}, video, raw, nil); err == nil || !strings.Contains(err.Error(), "no key") {
 		t.Fatalf("keyless download: %v", err)
 	}
-	cfg := engine.Config{Client: client, Keys: map[[16]byte][]byte{kid: key}}
+	cfg := engine.Config{Client: client, Keys: engine.NewKeyring(map[[16]byte][]byte{kid: key})}
 	if err := engine.DownloadStream(context.Background(), cfg, video, raw, nil); err != nil {
 		t.Fatal(err)
 	}

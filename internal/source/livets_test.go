@@ -225,7 +225,7 @@ func TestPipeLiveTS(t *testing.T) {
 	defer cancel()
 	sink := &chunkSink{want: 1500, enough: cancel}
 
-	err := PipeLiveTS(ctx, client, liveTrack(srv.URL+"/live.ts"), sink, nil)
+	err := PipeLiveTS(ctx, liveIn(client), liveTrack(srv.URL+"/live.ts"), sink, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("PipeLiveTS = %v, want context.Canceled", err)
 	}
@@ -254,7 +254,7 @@ func TestPipeLiveTSResync(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sink := &chunkSink{want: 200, enough: cancel}
-	PipeLiveTS(ctx, client, liveTrack(srv.URL), sink, nil)
+	PipeLiveTS(ctx, liveIn(client), liveTrack(srv.URL), sink, nil)
 	wantRun(t, packetNumbers(t, sink.bytes()), 0, 200)
 }
 
@@ -277,7 +277,7 @@ func TestPipeLiveTSStall(t *testing.T) {
 	defer cancel()
 	sink := &chunkSink{want: 60, enough: cancel}
 	done := make(chan error, 1)
-	go func() { done <- PipeLiveTS(ctx, client, liveTrack(srv.URL), sink, nil) }()
+	go func() { done <- PipeLiveTS(ctx, liveIn(client), liveTrack(srv.URL), sink, nil) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -305,7 +305,7 @@ func TestPipeLiveTSShortConnections(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	sink := &chunkSink{}
-	if err := PipeLiveTS(ctx, client, liveTrack(srv.URL), sink, nil); !errors.Is(err, context.DeadlineExceeded) {
+	if err := PipeLiveTS(ctx, liveIn(client), liveTrack(srv.URL), sink, nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("PipeLiveTS = %v, want it to keep going until the deadline", err)
 	}
 	// Waits of 20, 40, 80, 160 ms (plus jitter) fit about five connections in
@@ -334,7 +334,7 @@ func TestPipeLiveTSSinkError(t *testing.T) {
 	defer srv.Close()
 	client, _ := httpx.New(httpx.Options{Retries: 1})
 	broken := errors.New("pipe to the muxer closed")
-	err := PipeLiveTS(context.Background(), client, liveTrack(srv.URL), failingSink{broken}, nil)
+	err := PipeLiveTS(context.Background(), liveIn(client), liveTrack(srv.URL), failingSink{broken}, nil)
 	if !errors.Is(err, broken) {
 		t.Fatalf("PipeLiveTS = %v, want the sink's error", err)
 	}
@@ -365,7 +365,7 @@ func TestPipeLiveTSGivesUp(t *testing.T) {
 			c.handler(w, r)
 		}))
 		client, _ := httpx.New(httpx.Options{Retries: 1})
-		err := PipeLiveTS(context.Background(), client, liveTrack(srv.URL), &chunkSink{}, nil)
+		err := PipeLiveTS(context.Background(), liveIn(client), liveTrack(srv.URL), &chunkSink{}, nil)
 		srv.Close()
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err = %v, want it to mention %q", c.name, err, c.want)
@@ -375,3 +375,7 @@ func TestPipeLiveTSGivesUp(t *testing.T) {
 		}
 	}
 }
+
+// liveIn wraps a client the way the restream modes do, with no tracks: the
+// pipe then falls back to the track it was given.
+func liveIn(c *httpx.Client) *Live { return NewLive(LiveTSKind, c, nil, nil) }

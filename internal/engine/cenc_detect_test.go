@@ -115,7 +115,7 @@ func TestKnownKeyDecryptsAnInitDetectedStream(t *testing.T) {
 	client, _ := httpx.New(httpx.Options{Retries: 1})
 	key := make([]byte, 16)
 	err := DownloadStream(context.Background(),
-		Config{Client: client, Keys: map[[16]byte][]byte{kid: key}},
+		Config{Client: client, Keys: NewKeyring(map[[16]byte][]byte{kid: key})},
 		st, filepath.Join(t.TempDir(), "out.mp4"), nil)
 	if err != nil && strings.Contains(err.Error(), "no key for stream") {
 		t.Fatalf("the supplied key was not used: %v", err)
@@ -168,7 +168,7 @@ func TestSampleAESfMP4RoutesToCBCS(t *testing.T) {
 	client, _ := httpx.New(httpx.Options{Retries: 1})
 	var zero [16]byte
 	err := DownloadStream(context.Background(),
-		Config{Client: client, Keys: map[[16]byte][]byte{zero: make([]byte, 16)}},
+		Config{Client: client, Keys: NewKeyring(map[[16]byte][]byte{zero: make([]byte, 16)})},
 		st, filepath.Join(t.TempDir(), "out.mp4"), nil)
 	if err != nil {
 		if strings.Contains(err.Error(), "not supported") || strings.Contains(err.Error(), "no key") {

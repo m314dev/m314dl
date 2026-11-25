@@ -8,11 +8,14 @@
 //
 // Control API (Bearer -worker-secret):
 //
-//	POST   /api/channels        {"id":"news","url":"...","format":"hls","keys":["KID:KEY"],"headers":{...}}
-//	GET    /api/channels        -> [{"id":...,"state":"running",...}, ...]
-//	GET    /api/channels/{id}   -> one channel's status
-//	DELETE /api/channels/{id}   -> stop and remove
-//	GET    /api/health          -> {"status":"ok","channels":3,"max":32,"version":..,cpu/ram/disk/net}
+//	POST   /api/channels          {"id":"news","url":"...","format":"hls","keys":["KID:KEY"],"headers":{...}}
+//	GET    /api/channels          -> [channel, ...] with every channel's full view
+//	GET    /api/channels/{id}     -> one channel: state, health, source, output and track numbers
+//	PATCH  /api/channels/{id}     {"url":"...","keys":[...],"headers":{...},"proxy":"...","insecure":false}
+//	                              replaces the input of a running channel without restarting it
+//	DELETE /api/channels/{id}     -> stop and remove
+//	GET    /api/channels/{id}/log -> the channel's last lines, plain text
+//	GET    /api/health            -> {"status":"ok","channels":3,"max":32,"version":..}
 //
 // Media is served without authentication, like any origin; access control is
 // the controller's job. GET /{id}/... routes to that channel's HLS/TS/DASH
@@ -31,6 +34,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -62,24 +66,43 @@ type workerServer struct {
 	channels map[string]*channel
 }
 
+// channel is one running restream. Its input (URL, headers, proxy, keys) can
+// change over its life through PATCH; its output never does, so the packager,
+// handler and media path are fixed at creation.
 type channel struct {
-	id        string
-	url       string
-	format    string
-	mediaPath string // "/{id}/live.m3u8"
-	handler   http.Handler
-	pres      serve.Presentation
-	cancel    context.CancelFunc
-	tmpDir    string
+	id         string
+	format     string
+	kind       string
+	logv       func(string, ...any) // the worker's -v output
+	mediaPath  string               // "/{id}/live.m3u8"
+	handler    http.Handler
+	pres       serve.Presentation
+	cancel     context.CancelFunc
+	tmpDir     string
+	client     *httpx.Client // the channel's one client; a PATCH swaps its insides in place
+	ve, ae, se *pick.Expr
+	viewers    *serve.Viewers // always-on channels; an on-demand channel counts its own
 
 	od   *serve.OnDemand // set for an on-demand channel; owns the source lifecycle
 	idle time.Duration
 
-	mu      sync.Mutex
-	state   string // running | done | error (on-demand: see OnDemand.State)
-	errMsg  string
-	live    bool
-	started time.Time
+	// in is what the download loops read while they run. It is replaced on
+	// every on-demand session start and nil before the first one.
+	in    atomic.Pointer[source.Live]
+	out   atomic.Int64 // bytes sent to viewers
+	meter meter
+	log   logRing
+
+	mu       sync.Mutex
+	req      channelReq          // the input as last set: URL, headers, proxy, keys, insecure
+	keys     map[[16]byte][]byte // parsed req.Keys
+	selected []*manifest.Stream  // the tracks chosen at the last resolve, for a PATCH to compare against
+	state    string              // running | done | error | stopped (on-demand: see OnDemand.State)
+	errMsg   string
+	lastWarn string // the newest line about the source not moving
+	live     bool
+	started  time.Time
+	swaps    int
 }
 
 var idOK = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,64}$`)
@@ -88,8 +111,10 @@ func newWorkerServer(secret string, maxChannels int, ffmpegPath, version string,
 	if logv == nil {
 		logv = func(string, ...any) {}
 	}
-	return &workerServer{secret: secret, version: version, maxChannels: maxChannels, ffmpegPath: ffmpegPath,
+	w := &workerServer{secret: secret, version: version, maxChannels: maxChannels, ffmpegPath: ffmpegPath,
 		defaultIdle: defaultIdle, logv: logv, channels: map[string]*channel{}}
+	go w.sampler()
+	return w
 }
 
 // useSpool claims a staging directory for this worker and clears whatever a
@@ -168,7 +193,9 @@ func (w *workerServer) handler() http.Handler {
 	mux.HandleFunc("POST /api/channels", httpx.BearerAuth(w.secret, w.apiStart))
 	mux.HandleFunc("GET /api/channels", httpx.BearerAuth(w.secret, w.apiList))
 	mux.HandleFunc("GET /api/channels/{id}", httpx.BearerAuth(w.secret, w.apiStatus))
+	mux.HandleFunc("PATCH /api/channels/{id}", httpx.BearerAuth(w.secret, w.apiPatch))
 	mux.HandleFunc("DELETE /api/channels/{id}", httpx.BearerAuth(w.secret, w.apiStop))
+	mux.HandleFunc("GET /api/channels/{id}/log", httpx.BearerAuth(w.secret, w.apiLog))
 	mux.HandleFunc("GET /api/health", httpx.BearerAuth(w.secret, w.apiHealth))
 	mux.HandleFunc("/{id}/", w.media) // media: unauthenticated, routed to the channel
 	return mux
@@ -243,6 +270,16 @@ func (w *workerServer) apiStatus(rw http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(rw, ch.view())
 }
 
+func (w *workerServer) apiLog(rw http.ResponseWriter, r *http.Request) {
+	ch := w.channel(r.PathValue("id"))
+	if ch == nil {
+		http.Error(rw, "no such channel", http.StatusNotFound)
+		return
+	}
+	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	rw.Write([]byte(ch.log.text()))
+}
+
 func (w *workerServer) apiStop(rw http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	w.mu.Lock()
@@ -300,16 +337,33 @@ func (w *workerServer) channel(id string) *channel {
 
 // ─── channel lifecycle ───────────────────────────────────────────────────────
 
+// newClient builds the HTTP client a channel's input calls for.
+func newClient(req channelReq) (*httpx.Client, error) {
+	headers := req.Headers
+	if headers == nil {
+		headers = map[string]string{}
+	}
+	return httpx.New(httpx.Options{Headers: headers, Proxy: req.Proxy, Insecure: req.Insecure, Retries: 5})
+}
+
+// resolve loads a source and picks its tracks by the channel's selection. It
+// is the one path from a URL to a selection, run at creation, at each
+// on-demand start and when a PATCH checks a new URL before taking it.
+func (w *workerServer) resolve(ctx context.Context, client *httpx.Client, url string, keys map[[16]byte][]byte, ve, ae, se *pick.Expr) (kind string, sel []*manifest.Stream, err error) {
+	master, kind, err := source.LoadManifest(ctx, client, url, w.logv)
+	if err != nil {
+		return "", nil, err
+	}
+	sel, err = selectAndExpand(ctx, client, kind, master, ve, ae, se, keys, w.logv)
+	return kind, sel, err
+}
+
 // startChannel loads the source, selects the streams, builds the output, and
 // starts the downloads in the background. It blocks only for the manifest
 // fetch and the selection, so a start error (a bad URL, DRM without a key)
 // shows up in the response. A channel that started is served right away.
 func (w *workerServer) startChannel(req channelReq) (*channel, error) {
-	headers := req.Headers
-	if headers == nil {
-		headers = map[string]string{}
-	}
-	client, err := httpx.New(httpx.Options{Headers: headers, Proxy: req.Proxy, Insecure: req.Insecure, Retries: 5})
+	client, err := newClient(req)
 	if err != nil {
 		return nil, err
 	}
@@ -332,7 +386,7 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	master, kind, err := source.LoadManifest(ctx, client, req.URL, w.logv)
+	kind, selected, err := w.resolve(ctx, client, req.URL, keys, ve, ae, se)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -343,11 +397,6 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		return nil, err
 	}
 	req.Format = format
-	selected, err := selectAndExpand(ctx, client, kind, master, ve, ae, se, keys, w.logv)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
 
 	tmpDir, err := os.MkdirTemp(w.spoolDir(), "m314dl-ch-"+req.ID+"-*")
 	if err != nil {
@@ -356,25 +405,23 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 	}
 	o := serve.Options{Format: req.Format, Transcode: req.Transcode, FFmpegPath: w.ffmpegPath}
 
-	live := false
-	for _, st := range selected {
-		if st.Live {
-			live = true
-		}
-	}
 	ch := &channel{
-		id: req.ID, url: req.URL, format: normFormat(req.Format),
-		cancel: cancel, tmpDir: tmpDir, state: "running", live: live, started: time.Now(),
+		id: req.ID, format: normFormat(req.Format), kind: kind, logv: w.logv, client: client, ve: ve, ae: ae, se: se,
+		cancel: cancel, tmpDir: tmpDir, req: req, keys: keys, selected: selected,
+		state: "running", live: isLive(selected), started: time.Now(),
 	}
 
 	var jobs []serve.Job
-	if idle > 0 && live {
+	if idle > 0 && ch.live {
 		// On demand: the source was loaded and the selection checked, so a bad
 		// request fails here. Nothing is fetched until the first viewer asks,
-		// and each start loads the manifest again and selects by the same
-		// rules.
+		// and each start loads the manifest again, by whatever input the
+		// channel has by then, and selects by the same rules.
 		start := func(ctx context.Context) (serve.Presentation, http.Handler, []serve.Job, error) {
-			master, k, err := source.LoadManifest(ctx, client, req.URL, w.logv)
+			ch.mu.Lock()
+			url, keys := ch.req.URL, ch.keys
+			ch.mu.Unlock()
+			k, sel, err := w.resolve(ctx, client, url, keys, ve, ae, se)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -383,28 +430,33 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 			if (k == source.LiveTSKind) != (kind == source.LiveTSKind) {
 				return nil, nil, nil, fmt.Errorf("the source changed from %s to %s since the channel was created", kind, k)
 			}
-			sel, err := selectAndExpand(ctx, client, k, master, ve, ae, se, keys, w.logv)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			pres, h, _, jobs, err := serve.BuildOutputs(o, sel, tmpDir, w.logv)
+			ch.mu.Lock()
+			ch.selected = sel
+			ch.mu.Unlock()
+			ch.in.Store(source.NewLive(kind, client, keys, sel))
+			pres, h, _, jobs, err := serve.BuildOutputs(o, sel, tmpDir, ch.verbose)
 			return pres, h, jobs, err
 		}
 		run := func(ctx context.Context, jobs []serve.Job) error {
-			return serve.RunJobs(ctx, client, kind, jobs, keys, nil, 0, w.logv)
+			return serve.RunJobs(ctx, ch.in.Load(), jobs, nil, 0, ch.verbose, ch.warnf)
 		}
-		od := serve.NewOnDemand(idle, start, run, func(f string, a ...any) { w.logv("channel %s: "+f, append([]any{req.ID}, a...)...) })
-		ch.od, ch.idle, ch.handler, ch.pres = od, idle, od, od
+		od := serve.NewOnDemand(idle, start, run, ch.logf)
+		ch.od, ch.idle, ch.pres = od, idle, od
+		ch.handler = countBytes(od, &ch.out)
 		ch.mediaPath = "/" + req.ID + serve.MediaPath(req.Format)
 	} else {
-		pres, handler, path, built, err := serve.BuildOutputs(o, selected, tmpDir, w.logv)
+		pres, handler, path, built, err := serve.BuildOutputs(o, selected, tmpDir, ch.verbose)
 		if err != nil {
 			cancel()
 			os.RemoveAll(tmpDir)
 			return nil, err
 		}
-		ch.handler, ch.pres, ch.mediaPath, jobs = handler, pres, "/"+req.ID+path, built
+		ch.in.Store(source.NewLive(kind, client, keys, selected))
+		ch.viewers = serve.NewViewers(viewerWindow)
+		ch.handler = ch.viewers.Wrap(countBytes(handler, &ch.out))
+		ch.pres, ch.mediaPath, jobs = pres, "/"+req.ID+path, built
 	}
+	ch.logf("created: %s source, %s output", kind, ch.format)
 
 	// Register the channel, checking again for a racing start of the same id
 	// or a full table.
@@ -434,13 +486,13 @@ func (w *workerServer) startChannel(req channelReq) (*channel, error) {
 		}()
 		return ch, nil
 	}
-	go w.runChannel(ctx, ch, client, kind, keys, jobs)
+	go w.runChannel(ctx, ch, jobs)
 	return ch, nil
 }
 
 // runChannel downloads every track into its sink until the source ends or the
 // channel is stopped, then records the final state and cleans up.
-func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *httpx.Client, kind string, keys map[[16]byte][]byte, jobs []serve.Job) {
+func (w *workerServer) runChannel(ctx context.Context, ch *channel, jobs []serve.Job) {
 	// End the presentation on cancel too, so an ffmpeg remux writer stuck on a
 	// stalled pipe gets EPIPE and the errgroup can return.
 	go func() {
@@ -448,7 +500,7 @@ func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *http
 		ch.pres.End()
 	}()
 
-	err := serve.RunJobs(ctx, client, kind, jobs, keys, nil, 0, w.logv)
+	err := serve.RunJobs(ctx, ch.in.Load(), jobs, nil, 0, ch.verbose, ch.warnf)
 	ch.pres.End()
 
 	ch.mu.Lock()
@@ -457,8 +509,10 @@ func (w *workerServer) runChannel(ctx context.Context, ch *channel, client *http
 		ch.state = "stopped"
 	case err != nil:
 		ch.state, ch.errMsg = "error", err.Error()
+		ch.logf("source failed: %v", err)
 	default:
 		ch.state = "done" // a finite source finished; it is still served (ENDLIST)
+		ch.logf("source ended")
 	}
 	ch.mu.Unlock()
 
@@ -483,34 +537,141 @@ func (w *workerServer) stopAll() {
 	}
 }
 
+// logf writes one line to the channel's own log and to the worker's verbose
+// output: lifecycle, swaps, on-demand starts and stops, warnings.
+func (ch *channel) logf(format string, args ...any) {
+	ch.log.add(fmtLine(format, args...))
+	ch.logv("channel %s: "+format, append([]any{ch.id}, args...)...)
+}
+
+// verbose is for the download loops' running commentary (concurrency changes,
+// skipped ads), which goes to the worker's -v output only. In the channel log
+// it would bury the lines that matter within minutes.
+func (ch *channel) verbose(format string, args ...any) {
+	ch.logv("channel %s: "+format, append([]any{ch.id}, args...)...)
+}
+
+// warnf is logf for the engine's warnings: a source that stopped moving. The
+// newest one is also shown in the channel view as the source's last error.
+func (ch *channel) warnf(format string, args ...any) {
+	ch.mu.Lock()
+	ch.lastWarn = fmt.Sprintf(format, args...)
+	ch.mu.Unlock()
+	ch.logf(format, args...)
+}
+
 // ─── views ───────────────────────────────────────────────────────────────────
 
+// channelView is what GET /api/channels/{id} returns and what each element of
+// GET /api/channels is. Rates are averaged over the last ten seconds, error
+// counts over the last minute.
 type channelView struct {
-	ID        string    `json:"id"`
-	URL       string    `json:"url"`
-	Format    string    `json:"format"`
-	State     string    `json:"state"` // running | done | error | stopped, or for on demand: idle | starting | running
-	Error     string    `json:"error,omitempty"`
-	LastError string    `json:"last_error,omitempty"` // on demand: why the last start or run ended
-	Idle      string    `json:"idle,omitempty"`       // on demand: the idle period
-	Viewers   int       `json:"viewers"`
-	Live      bool      `json:"live"`
-	Media     string    `json:"media"`
-	Status    string    `json:"status,omitempty"`
-	Started   time.Time `json:"started"`
+	ID      string    `json:"id"`
+	URL     string    `json:"url"`
+	Format  string    `json:"format"`
+	State   string    `json:"state"`  // running | done | error | stopped, or for on demand: idle | starting | running
+	Health  string    `json:"health"` // ok | degraded | stalled | down | idle
+	Error   string    `json:"error,omitempty"`
+	Idle    string    `json:"idle,omitempty"` // on demand: the idle period
+	Media   string    `json:"media"`
+	Started time.Time `json:"started"`
+	UptimeS int64     `json:"uptime_s"`
+	Status  string    `json:"status,omitempty"` // one line for a person; never parse it
+
+	Source sourceView  `json:"source"`
+	Output outputView  `json:"output"`
+	Tracks []trackView `json:"tracks"`
+}
+
+// sourceView is the input side: what is being pulled and how it is doing.
+type sourceView struct {
+	Kind         string `json:"kind"` // hls | dash | mss | livets
+	Live         bool   `json:"live"`
+	Swaps        int    `json:"swaps"`      // inputs replaced through PATCH
+	Restarts     int64  `json:"restarts"`   // on-demand starts after the first, plus raw TS reconnects
+	LastError    string `json:"last_error"` // why the last start or run ended, or the newest stall warning
+	Bytes        int64  `json:"bytes"`
+	BPS          int64  `json:"bps"`
+	ErrorsPerMin int64  `json:"errors_per_min"` // requests that failed or came back 4xx/5xx
+}
+
+// outputView is the output side: what viewers are getting.
+type outputView struct {
+	Publishing       bool  `json:"publishing"` // at least one segment has gone out
+	Bytes            int64 `json:"bytes"`
+	BPS              int64 `json:"bps"`
+	Viewers          int   `json:"viewers"`
+	LastSegmentAgeMS int64 `json:"last_segment_age_ms"` // across all tracks; -1 until something is published
+}
+
+type trackView struct {
+	ID               string  `json:"id"`
+	Type             string  `json:"type"` // video | audio
+	Bitrate          int64   `json:"bitrate"`
+	Width            int     `json:"width,omitempty"`
+	Height           int     `json:"height,omitempty"`
+	Seq              int64   `json:"seq"`       // output media sequence of the newest segment; -1 before the first
+	Published        int64   `json:"published"` // segments over the run (publish units for a TS fan-out)
+	Window           int     `json:"window"`    // segments visible (viewers for a TS fan-out)
+	Realtime         float64 `json:"realtime"`  // media seconds per wall second; 0 unknown
+	LastSegmentAgeMS int64   `json:"last_segment_age_ms"`
+
+	targetDur float64 // for health; not serialised
 }
 
 func (ch *channel) view() channelView {
+	now := time.Now()
+	tracks := trackViews(ch.pres.Stats(), now)
+	inBps, outBps, errs := ch.meter.rates(now)
+	bytesIn, _, _ := ch.client.Traffic()
+
 	ch.mu.Lock()
-	defer ch.mu.Unlock()
 	v := channelView{
-		ID: ch.id, URL: ch.url, Format: ch.format, State: ch.state, Error: ch.errMsg,
-		Live: ch.live, Media: ch.mediaPath, Status: ch.pres.StatusLine(), Started: ch.started,
+		ID: ch.id, URL: ch.req.URL, Format: ch.format, State: ch.state, Error: ch.errMsg,
+		Media: ch.mediaPath, Status: ch.pres.StatusLine(), Started: ch.started, UptimeS: int64(now.Sub(ch.started).Seconds()),
+		Source: sourceView{Kind: ch.kind, Live: ch.live, Swaps: ch.swaps, LastError: ch.lastWarn,
+			Bytes: bytesIn, BPS: inBps, ErrorsPerMin: errs},
+		Output: outputView{Bytes: ch.out.Load(), BPS: outBps, LastSegmentAgeMS: -1},
+		Tracks: tracks,
+	}
+	ch.mu.Unlock()
+
+	if in := ch.in.Load(); in != nil {
+		v.Source.Restarts += in.Reconnects.Load()
 	}
 	if ch.od != nil {
-		v.State, v.LastError, v.Idle, v.Viewers = ch.od.State(), ch.od.LastError(), ch.idle.String(), ch.od.Viewers()
+		v.State, v.Idle, v.Output.Viewers = ch.od.State(), ch.idle.String(), ch.od.Viewers()
+		if e := ch.od.LastError(); e != "" {
+			v.Source.LastError = e
+		}
+		if n := ch.od.Starts(); n > 1 {
+			v.Source.Restarts += int64(n - 1)
+		}
+	} else {
+		v.Output.Viewers = ch.viewers.Count()
 	}
+	if v.Error != "" {
+		v.Source.LastError = v.Error
+	}
+	for _, t := range tracks {
+		if t.Published > 0 {
+			v.Output.Publishing = true
+		}
+		if t.LastSegmentAgeMS >= 0 && (v.Output.LastSegmentAgeMS < 0 || t.LastSegmentAgeMS < v.Output.LastSegmentAgeMS) {
+			v.Output.LastSegmentAgeMS = t.LastSegmentAgeMS
+		}
+	}
+	v.Health = health(v.State, ch.kind, now.Sub(v.Started), tracks, errs)
 	return v
+}
+
+func isLive(streams []*manifest.Stream) bool {
+	for _, st := range streams {
+		if st.Live {
+			return true
+		}
+	}
+	return false
 }
 
 func normFormat(f string) string {

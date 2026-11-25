@@ -231,6 +231,7 @@ func ParseMedia(body []byte, baseURL string, st *manifest.Stream) error {
 				Key:           curKey,
 				Init:          curInit,
 				Seq:           seq,
+				Identity:      "seq:" + strconv.FormatInt(seq, 10),
 				Discontinuity: disc,
 			}
 			if haveRng {

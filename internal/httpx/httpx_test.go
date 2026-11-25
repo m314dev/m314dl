@@ -137,3 +137,36 @@ func TestCarriesManifestCookieToSegments(t *testing.T) {
 		t.Fatalf("segment 403 — cookie not carried: %v", err)
 	}
 }
+
+// Replace points a client at a new transport and headers under its callers,
+// and the traffic counters span both.
+func TestClientReplaceAndTraffic(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("X-Who"))
+		if r.URL.Path == "/missing" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte("0123456789"))
+	}))
+	defer srv.Close()
+
+	c, _ := New(Options{Headers: map[string]string{"X-Who": "old"}})
+	if _, _, err := c.FetchBytes(context.Background(), srv.URL+"/a", ""); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := New(Options{Headers: map[string]string{"X-Who": "new"}})
+	c.Replace(n)
+	if _, _, err := c.FetchBytes(context.Background(), srv.URL+"/b", ""); err != nil {
+		t.Fatal(err)
+	}
+	c.FetchBytes(context.Background(), srv.URL+"/missing", "")
+	if len(seen) < 3 || seen[0] != "old" || seen[1] != "new" {
+		t.Fatalf("headers seen: %v", seen)
+	}
+	bytes, reqs, errs := c.Traffic()
+	if bytes < 20 || reqs < 3 || errs < 1 { // the 404 body is read too, to drain it
+		t.Fatalf("traffic: bytes %d reqs %d errs %d", bytes, reqs, errs)
+	}
+}

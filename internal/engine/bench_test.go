@@ -82,7 +82,7 @@ func BenchmarkPipelineCENC(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sink := &discardSink{}
-		cfg := Config{Client: client, Threads: 16, Keys: keys, Sink: sink}
+		cfg := Config{Client: client, Threads: 16, Keys: NewKeyring(keys), Sink: sink}
 		if err := DownloadStream(context.Background(), cfg, st, filepath.Join(b.TempDir(), "o"), nil); err != nil {
 			b.Fatal(err)
 		}

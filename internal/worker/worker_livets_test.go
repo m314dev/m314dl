@@ -97,7 +97,7 @@ func TestWorkerLiveTSChannel(t *testing.T) {
 	}
 	var v channelView
 	json.Unmarshal(rec.Body.Bytes(), &v)
-	if v.State != "running" || !v.Live || v.Media != "/tv/live.ts" {
+	if v.State != "running" || !v.Source.Live || v.Media != "/tv/live.ts" {
 		t.Fatalf("channel view: %+v", v)
 	}
 
@@ -129,7 +129,7 @@ func TestWorkerLiveTSOnDemand(t *testing.T) {
 	}
 	var v channelView
 	json.Unmarshal(rec.Body.Bytes(), &v)
-	if v.State != "idle" || !v.Live {
+	if v.State != "idle" || !v.Source.Live {
 		t.Fatalf("new on-demand channel: %+v", v)
 	}
 	waitOpen(t, &open, 0) // the probe is closed again

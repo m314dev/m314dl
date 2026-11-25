@@ -523,6 +523,13 @@ curl -H 'Authorization: Bearer mytoken' http://server:7001/api/channels/news
 curl -H 'Authorization: Bearer mytoken' -X DELETE http://server:7001/api/channels/news
 curl -H 'Authorization: Bearer mytoken' http://server:7001/api/health
 
+# the source URL expired? hand the channel a fresh one; viewers notice nothing
+curl -H 'Authorization: Bearer mytoken' -X PATCH http://server:7001/api/channels/news \
+  -d '{"url":"https://…/manifest.mpd?token=NEW","keys":["KID:KEY"]}'
+
+# the channel's own log, last 500 lines
+curl -H 'Authorization: Bearer mytoken' http://server:7001/api/channels/news/log
+
 # viewers play the media URL (unauthenticated, like any origin)
 mpv http://server:7001/news/live.m3u8
 ```
@@ -534,6 +541,69 @@ under an id. The control plane has a bearer secret, an admission cap
 shutdown that stops every channel. State lives in memory on purpose: the worker
 is stateless, and the controller's own reconciliation restarts channels after a
 restart.
+
+### Replacing a channel's source
+
+Providers sign manifest URLs with a short expiry and rotate content keys on a
+timer. Stopping the channel and starting another one at the same id would
+publish a new presentation from media sequence zero, and every player would see
+its numbering jump back and stall. `PATCH /api/channels/{id}` changes the input
+and nothing else: `url`, `keys`, `headers`, `proxy`, `insecure`, each optional,
+an omitted one keeps its value. The worker loads the new source first, selects
+by the channel's own rules and checks that every track that is playing is still
+there with the same codec and picture size (409 otherwise, with the reason).
+Then the download loops are pointed at it and pick it up on their next refresh.
+The packager, its media sequence and the viewers' URLs are untouched.
+
+What makes that seamless is how segments are told apart. A refresh of a signed
+source lists the same segments under new URLs, so going by URL alone would
+download and publish the whole window again. The engine keys them by what the
+format says identifies a segment instead: the HLS media sequence, the DASH
+number or presentation time within its period, and only falls back to the URL
+where a format gives nothing (MSS, SegmentList). A raw MPEG-TS pipe takes the
+new URL at its next reconnect, so a connection that is still working is left
+alone. Output settings (`format`, `transcode`, `sv`/`sa`/`ss`, `idle`) cannot
+be patched: they are the presentation viewers are playing, and a different one
+is a new channel. A channel that has failed or stopped answers 409; an idle
+on-demand channel takes the new input for its next start.
+
+### What a channel reports
+
+`GET /api/channels/{id}` (and each element of `GET /api/channels`) carries the
+numbers a controller needs, so it never has to parse a playlist or the `status`
+line, which is for people:
+
+```json
+{"id":"news","url":"…","format":"hls","state":"running","health":"ok",
+ "media":"/news/live.m3u8","started":"…","uptime_s":8412,
+ "source":{"kind":"dash","live":true,"swaps":2,"restarts":0,"last_error":"",
+           "bytes":1234567890,"bps":6100000,"errors_per_min":0},
+ "output":{"publishing":true,"bytes":9876543210,"bps":48000000,"viewers":8,
+           "last_segment_age_ms":1187},
+ "tracks":[{"id":"video","type":"video","bitrate":6000000,"width":1920,"height":1080,
+            "seq":1204,"published":1204,"window":6,"realtime":1.0,"last_segment_age_ms":1187},
+           {"id":"audio","type":"audio","bitrate":128000,"seq":1204,"published":1204,
+            "window":6,"realtime":1.0,"last_segment_age_ms":1190}]}
+```
+
+`source` is the input side: bytes pulled and the rate over the last ten
+seconds, requests that failed or came back 4xx/5xx over the last minute, how
+many times the input was replaced (`swaps`) and how many times the source had
+to be reopened (`restarts`: on-demand starts after the first plus raw TS
+reconnects). `output` is what viewers get: bytes and rate, distinct client
+addresses active in the last 30 seconds, and how old the newest published
+segment is, the stall signal. Each track reports its output media sequence
+(`seq`, monotonic for the channel's life and unaffected by a swap, which is how
+a controller tells "still producing" from "restarted"), `realtime` (media
+seconds published per wall second: 1.0 keeps pace, under 1.0 falls behind) and
+its own segment age.
+
+`health` folds that into one word: `ok`; `stalled` when the newest segment is
+older than three target durations (15 s for a raw TS pipe); `degraded` when it
+is still moving but realtime is under 0.9 or fetch errors exceed 10 a minute;
+`down` when nothing has come out for a minute while the source keeps failing,
+or a channel never published in its first minute, or it has failed or stopped;
+`idle` for an on-demand channel with nobody watching.
 
 ### On-demand channels
 
@@ -551,10 +621,10 @@ served complete regardless.
 
 A viewer is any request under the channel's path (playlists, manifest, init,
 segments) or an open `/live.ts` connection. The worker reports an on-demand
-channel's `state` as `idle`, `starting` or `running`, with `viewers` (distinct
-client addresses in the last 30 seconds) and `last_error` (why the last start
-or run ended; a failed start answers 503 and is retried by the next viewer).
-The idle period must be at least 5 seconds.
+channel's `state` as `idle`, `starting` or `running`, with `output.viewers`
+(distinct client addresses in the last 30 seconds) and `source.last_error`
+(why the last start or run ended; a failed start answers 503 and is retried by
+the next viewer). The idle period must be at least 5 seconds.
 
 ## RPC server
 

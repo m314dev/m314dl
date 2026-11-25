@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -25,30 +24,25 @@ type Starter func(ctx context.Context) (Presentation, http.Handler, []Job, error
 // sequence on from the one before so a player that kept polling sees one
 // stream with a discontinuity, not a stream that started over.
 //
-// A viewer is any request under the channel's path, or an open connection
-// (the TS output holds one for the whole view). The viewer count is the
-// number of distinct client addresses seen in the last 30 seconds or the idle
-// period, whichever is shorter, which is approximate behind a shared proxy
-// but honest for a status line.
+// Viewers are counted by Viewers over 30 seconds or the idle period, whichever
+// is shorter.
 type OnDemand struct {
-	idle  time.Duration
-	start Starter
-	run   func(ctx context.Context, jobs []Job) error
-	log   func(string, ...any)
-	now   func() time.Time
+	idle    time.Duration
+	start   Starter
+	run     func(ctx context.Context, jobs []Job) error
+	log     func(string, ...any)
+	viewers *Viewers
 
-	mu       sync.Mutex
-	state    string        // idle | starting | running | stopping | closed
-	change   chan struct{} // closed when a starting or stopping state ends
-	handler  http.Handler
-	pres     Presentation
-	cancel   context.CancelFunc
-	done     chan struct{} // closed when the session's run returns
-	lastErr  string
-	prevPub  *restream.Publisher
-	lastSeen time.Time
-	active   map[string]int       // open requests per client address
-	recent   map[string]time.Time // last request per client address
+	mu      sync.Mutex
+	state   string        // idle | starting | running | stopping | closed
+	change  chan struct{} // closed when a starting or stopping state ends
+	handler http.Handler
+	pres    Presentation
+	cancel  context.CancelFunc
+	done    chan struct{} // closed when the session's run returns
+	lastErr string
+	prevPub *restream.Publisher
+	starts  int // sessions started so far
 }
 
 // NewOnDemand returns a channel handler that starts the source with start and
@@ -58,32 +52,22 @@ func NewOnDemand(idle time.Duration, start Starter, run func(context.Context, []
 	if log == nil {
 		log = func(string, ...any) {}
 	}
-	return &OnDemand{
-		idle: idle, start: start, run: run, log: log, now: time.Now,
-		state: "idle", active: map[string]int{}, recent: map[string]time.Time{},
+	window := 30 * time.Second
+	if idle < window {
+		window = idle
 	}
+	return &OnDemand{idle: idle, start: start, run: run, log: log, state: "idle", viewers: NewViewers(window)}
 }
 
 func (od *OnDemand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
 	od.mu.Lock()
 	if od.state == "closed" {
 		od.mu.Unlock()
 		http.NotFound(w, r)
 		return
 	}
-	od.active[ip]++
-	od.recent[ip] = od.now()
-	od.lastSeen = od.now()
 	od.mu.Unlock()
-	defer func() {
-		od.mu.Lock()
-		if od.active[ip]--; od.active[ip] <= 0 {
-			delete(od.active, ip)
-		}
-		od.lastSeen = od.now() // a long connection that just ended counts as seen now
-		od.mu.Unlock()
-	}()
+	defer od.viewers.Enter(r)()
 
 	h, err := od.session(r.Context())
 	if err != nil {
@@ -155,7 +139,8 @@ func (od *OnDemand) startSession() error {
 	done := make(chan struct{})
 	od.handler, od.pres, od.cancel, od.done = h, pres, cancel, done
 	od.state, od.lastErr = "running", ""
-	od.lastSeen = od.now()
+	od.starts++
+	od.viewers.Touch()
 	go func() {
 		// End the presentation on cancel too, so a remux writer stuck on a
 		// stalled ffmpeg gets an error and the run can return.
@@ -208,7 +193,7 @@ func (od *OnDemand) watch(done chan struct{}) {
 		case <-tick.C:
 		}
 		od.mu.Lock()
-		quiet := od.state == "running" && len(od.active) == 0 && od.now().Sub(od.lastSeen) >= od.idle
+		quiet := od.state == "running" && od.viewers.Quiet(od.idle)
 		if !quiet {
 			od.mu.Unlock()
 			continue
@@ -265,27 +250,25 @@ func (od *OnDemand) LastError() string {
 
 // Viewers counts distinct client addresses with an open request or a request
 // within the viewer window.
-func (od *OnDemand) Viewers() int {
+func (od *OnDemand) Viewers() int { return od.viewers.Count() }
+
+// Starts is how many sessions have been started so far. Every one after the
+// first is a restart of the source.
+func (od *OnDemand) Starts() int {
 	od.mu.Lock()
 	defer od.mu.Unlock()
-	return od.viewersLocked()
+	return od.starts
 }
 
-func (od *OnDemand) viewersLocked() int {
-	window := 30 * time.Second
-	if od.idle < window {
-		window = od.idle
+// Stats implements Presentation: the running session's stats, or none.
+func (od *OnDemand) Stats() []restream.Stats {
+	od.mu.Lock()
+	pres := od.pres
+	od.mu.Unlock()
+	if pres == nil {
+		return nil
 	}
-	cutoff := od.now().Add(-window)
-	n := 0
-	for ip, at := range od.recent {
-		if od.active[ip] > 0 || at.After(cutoff) {
-			n++
-		} else {
-			delete(od.recent, ip) // ponytail: pruned on read; fine for the handful of viewers a channel has
-		}
-	}
-	return n
+	return pres.Stats()
 }
 
 // StatusLine implements Presentation.
@@ -298,7 +281,7 @@ func (od *OnDemand) StatusLine() string {
 		if od.pres != nil {
 			inner = " | " + od.pres.StatusLine()
 		}
-		return fmt.Sprintf("%d viewers%s", od.viewersLocked(), inner)
+		return fmt.Sprintf("%d viewers%s", od.viewers.Count(), inner)
 	case "starting":
 		return "starting"
 	case "closed":
@@ -308,11 +291,4 @@ func (od *OnDemand) StatusLine() string {
 		return "idle (last error: " + od.lastErr + ")"
 	}
 	return "idle (no viewers)"
-}
-
-func clientIP(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
 }

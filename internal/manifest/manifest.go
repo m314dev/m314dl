@@ -72,6 +72,13 @@ type Segment struct {
 	Init          *InitMap
 	Seq           int64 // media sequence or $Number$; IV fallback and ordering
 	Discontinuity bool
+	// Identity names the segment independently of its URL, when the format
+	// gives one: the HLS media sequence, or the DASH number or presentation
+	// time within its period. A live source that signs its URLs hands the same
+	// segment out under a new URL every time the token changes, so the
+	// download loop tells segments apart by this and not by the URL. Empty
+	// means the URL is all there is.
+	Identity string
 	// Index, when set, marks a placeholder: the segment is a whole on-demand
 	// media file, and its SegmentIndexBox (sidx, the table of where each piece
 	// of the file starts) sits at this byte range. source.ExpandIndexed splits

@@ -175,7 +175,7 @@ func TestWorkerOnDemandChannel(t *testing.T) {
 		t.Fatal("on-demand channel never served segments")
 	}
 	json.Unmarshal(workerReq(t, w, "GET", "/api/channels/od", "", "").Body.Bytes(), &v)
-	if v.State != "running" || v.Viewers != 1 {
+	if v.State != "running" || v.Output.Viewers != 1 {
 		t.Fatalf("running view: %+v", v)
 	}
 	if rec := workerReq(t, w, "DELETE", "/api/channels/od", "", ""); rec.Code != 200 {

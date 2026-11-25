@@ -36,9 +36,9 @@ import (
 
 type Config struct {
 	Client    *httpx.Client
-	Threads   int                 // concurrency ceiling; 0 = auto (up to adaptiveMax)
-	Keys      map[[16]byte][]byte // CENC content keys by KID (zero KID = bare key)
-	BBTSKey   []byte              // 16-byte AES key; when set, every .ts segment is BBTS-decrypted
+	Threads   int      // concurrency ceiling; 0 = auto (up to adaptiveMax)
+	Keys      *Keyring // CENC content keys by KID (zero KID = bare key); nil = none
+	BBTSKey   []byte   // 16-byte AES key; when set, every .ts segment is BBTS-decrypted
 	AdFilters []*regexp.Regexp
 	LiveLimit time.Duration   // stop live recording after this long (0 = until end)
 	Stop      <-chan struct{} // graceful live stop: feeder exits, pipeline drains, mux proceeds
@@ -161,7 +161,7 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 	// CENC. Fail fast with a clear message instead of downloading every segment
 	// and only then failing to decrypt.
 	if dec == nil {
-		if k := firstSampleAESKey(st); k != nil && !fetchableKeyURI(k.URI) && resolveKey(cfg.Keys, k.KID) == nil {
+		if k := firstSampleAESKey(st); k != nil && !fetchableKeyURI(k.URI) && resolveKey(cfg.Keys.Map(), k.KID) == nil {
 			return fmt.Errorf("stream %s uses SAMPLE-AES encryption; supply the content key with -key <hex-key>", st.ID)
 		}
 	}
@@ -366,7 +366,7 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 		curKeys := make(map[string]struct{}, len(cur.Segments))
 		for i := range cur.Segments {
 			seg := &cur.Segments[i]
-			key := seg.URL + rangeKey(seg.Range)
+			key := segKey(seg)
 			curKeys[key] = struct{}{}
 			if seen[key] {
 				continue
@@ -414,8 +414,7 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 		keep := 3
 		if n := len(st.Segments); n > keep {
 			for i := 0; i < n-keep; i++ {
-				seg := &st.Segments[i]
-				seen[seg.URL+rangeKey(seg.Range)] = true
+				seen[segKey(&st.Segments[i])] = true
 			}
 		}
 	}
@@ -436,6 +435,7 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 	// listing the same segments (a manifest the server never updates, or one
 	// the CDN hands back from cache). Say which, once every 30 seconds.
 	lastNew, lastWarn := time.Now(), time.Time{}
+	lastMediaSeq := st.MediaSeq
 	stalled := func(format string, args ...any) {
 		if time.Since(lastWarn) < 30*time.Second {
 			cfg.Verbose(format, args...)
@@ -462,6 +462,14 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 			stalled("live: %s: refresh failed (will keep trying): %v", st.ID, err)
 			continue
 		}
+		// A playlist whose numbering went backwards comes from a packager that
+		// started over. Its identities now name different content, so what
+		// was seen under the old numbering must not hide the new segments.
+		if cur.MediaSeq < lastMediaSeq {
+			cfg.Verbose("live: %s: media sequence went back from %d to %d; forgetting the seen window", st.ID, lastMediaSeq, cur.MediaSeq)
+			seen = map[string]bool{}
+		}
+		lastMediaSeq = cur.MediaSeq
 		fresh, ok := push(cur)
 		if !ok {
 			return ctx.Err()
@@ -491,6 +499,17 @@ func segInit(seg *manifest.Segment, st *manifest.Stream) *manifest.InitMap {
 		return seg.Init
 	}
 	return st.Init
+}
+
+// segKey is how the feeder tells a segment it has already fetched from a new
+// one across refreshes: the segment's Identity when the manifest gives one,
+// else its URL. The URL alone would make a live channel republish its whole
+// window the moment the source URL is replaced with a freshly signed one.
+func segKey(seg *manifest.Segment) string {
+	if seg.Identity != "" {
+		return seg.Identity + rangeKey(seg.Range)
+	}
+	return seg.URL + rangeKey(seg.Range)
 }
 
 func rangeKey(r *manifest.ByteRange) string {
@@ -963,7 +982,7 @@ func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecrypt
 	if cfg.Verbatim {
 		return data, nil
 	}
-	return decryptSegment(ctx, kc, dec, trackID, cfg.BBTSKey, cfg.Keys, it, data)
+	return decryptSegment(ctx, kc, dec, trackID, cfg.BBTSKey, cfg.Keys.Map(), it, data)
 }
 
 // ---- plain file ----

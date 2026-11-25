@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -96,6 +97,8 @@ func SpoolBase(override string) (string, error) {
 type Presentation interface {
 	End()
 	StatusLine() string
+	// Stats describes each output track: what has been published and when.
+	Stats() []restream.Stats
 }
 
 // Job is one source stream wired to the sink that publishes it. pace slows a
@@ -155,16 +158,21 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 
 	if o.Idle > 0 && isLive(selected) {
 		say := func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }
+		// Each session resolves the source again and runs on its own input.
+		// start always completes before run is called, so the pointer is
+		// enough to hand one to the other.
+		var in atomic.Pointer[source.Live]
 		start := func(ctx context.Context) (Presentation, http.Handler, []Job, error) {
 			sel, err := resolve(ctx)
 			if err != nil {
 				return nil, nil, nil, err
 			}
+			in.Store(source.NewLive(kind, client, keys, sel))
 			pres, h, _, jobs, err := BuildOutputs(o, sel, tmpDir, logv)
 			return pres, h, jobs, err
 		}
 		run := func(ctx context.Context, jobs []Job) error {
-			return RunJobs(ctx, client, kind, jobs, keys, bbtsKey, threadCeiling, logv)
+			return RunJobs(ctx, in.Load(), jobs, bbtsKey, threadCeiling, logv, nil)
 		}
 		for _, st := range selected {
 			fmt.Fprintf(os.Stderr, "restream track %s\n", st)
@@ -179,7 +187,7 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 	for _, j := range jobs {
 		fmt.Fprintf(os.Stderr, "restream track %s\n", j.st)
 	}
-	return serve(ctx, o, client, kind, jobs, pres, handler, path, keys, bbtsKey, threadCeiling, logv)
+	return serve(ctx, o, source.NewLive(kind, client, keys, selected), jobs, pres, handler, path, bbtsKey, threadCeiling, logv)
 }
 
 // BuildOutputs turns the selected streams into an output that is ready to run:
@@ -335,9 +343,9 @@ func serveOnDemand(ctx context.Context, o Options, od *OnDemand, path string) er
 
 // serve runs the download jobs into their sinks while an HTTP server publishes
 // the result. It runs until the source ends or the operator interrupts it.
-func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
+func serve(ctx context.Context, o Options, in *source.Live,
 	jobs []Job, pres Presentation, handler http.Handler, path string,
-	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
+	bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
 
 	ctx, cancel, shutdown, err := listen(ctx, o, handler, path)
 	if err != nil {
@@ -357,7 +365,7 @@ func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
 		pres.End()
 	}()
 
-	err = RunJobs(ctx, client, kind, jobs, keys, bbtsKey, threadCeiling, logv)
+	err = RunJobs(ctx, in, jobs, bbtsKey, threadCeiling, logv, nil)
 	close(statusStop)
 	pres.End()
 
@@ -380,31 +388,36 @@ func serve(ctx context.Context, o Options, client *httpx.Client, kind string,
 
 // RunJobs downloads every job's stream into its sink until the sources end or
 // ctx is cancelled. It is the run loop that the one-shot `-serve` mode and the
-// worker's per-channel goroutine share.
-func RunJobs(ctx context.Context, client *httpx.Client, kind string, jobs []Job,
-	keys map[[16]byte][]byte, bbtsKey []byte, threadCeiling int, logv func(string, ...any)) error {
+// worker's per-channel goroutine share. in is the input the loops read as they
+// go: its client, keys and track playlists. Replace them there and the loops
+// follow without a restart. warn gets a line when a live source stops moving;
+// nil prints it to stderr.
+func RunJobs(ctx context.Context, in *source.Live, jobs []Job, bbtsKey []byte, threadCeiling int,
+	logv, warn func(string, ...any)) error {
 
+	if warn == nil {
+		warn = func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
+	}
 	g, gctx := errgroup.WithContext(ctx)
 	for _, j := range jobs {
 		j := j
 		g.Go(func() error {
-			if kind == source.LiveTSKind {
+			if in.Kind == source.LiveTSKind {
 				// One endless body, no segments: it goes straight into the sink.
-				if err := source.PipeLiveTS(gctx, client, j.st, j.sink, logv); err != nil {
+				if err := source.PipeLiveTS(gctx, in, j.st, j.sink, logv); err != nil {
 					return fmt.Errorf("track %s: %w", j.st.ID, err)
 				}
 				return nil
 			}
 			cfg := engine.Config{
-				Client: client, Threads: threadCeiling, Keys: keys, BBTSKey: bbtsKey,
-				Verbose: logv, Sink: j.sink,
-				Warn: func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) },
+				Client: in.Client, Threads: threadCeiling, Keys: in.Keys, BBTSKey: bbtsKey,
+				Verbose: logv, Sink: j.sink, Warn: warn,
 				// A finite TS broadcast source downloads as fast as it can. Pace it
 				// to real time so it does not flood the viewers' buffers. The
 				// publisher paths spool to disk instead and are never paced.
 				PaceRealtime: j.pace,
 			}
-			refresh := source.RefreshFunc(client, kind, j.st, logv)
+			refresh := in.Refresh(j.st.ID, logv)
 			if !j.st.Live {
 				refresh = nil // finite source: publish it once, then finish
 			}

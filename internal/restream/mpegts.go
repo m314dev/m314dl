@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/m314dev/m314dl/internal/engine"
 )
@@ -56,6 +57,7 @@ type TSBroadcaster struct {
 
 	segments atomic.Int64
 	bytes    atomic.Int64
+	lastAt   atomic.Int64 // unix nanoseconds of the newest publish
 }
 
 // tsSub is one connected client. data carries whole publish units (shared,
@@ -101,6 +103,7 @@ func (b *TSBroadcaster) Unsubscribe(s *tsSub) {
 func (b *TSBroadcaster) publish(seg []byte) {
 	b.segments.Add(1)
 	b.bytes.Add(int64(len(seg)))
+	b.lastAt.Store(time.Now().UnixNano())
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.last = seg
@@ -156,6 +159,17 @@ func (b *TSBroadcaster) Viewers() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return len(b.subs)
+}
+
+// Stats describes the one output stream: publish units and bytes so far, and
+// when the last went out. Bitrate and realtime are not known here; a TS fan-out
+// has no segment durations to measure them with.
+func (b *TSBroadcaster) Stats() []Stats {
+	s := Stats{ID: "ts", Type: "video", Published: b.segments.Load(), Bytes: b.bytes.Load(), Seq: -1, Window: b.Viewers()}
+	if ns := b.lastAt.Load(); ns > 0 {
+		s.LastAt = time.Unix(0, ns)
+	}
+	return []Stats{s}
 }
 
 // StatusLine implements the presentation status contract.

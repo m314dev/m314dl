@@ -171,6 +171,9 @@ func (rm *RemuxTS) End() {
 
 func (rm *RemuxTS) StatusLine() string { return rm.b.StatusLine() }
 
+// Stats reports the broadcast this remux feeds.
+func (rm *RemuxTS) Stats() []Stats { return rm.b.Stats() }
+
 // remuxTrackSink writes one track's init and segments into its FFmpeg input
 // pipe. For fMP4 the init (ftyp+moov) is written first, then the fragments.
 // That is exactly a fragmented-MP4 byte stream, which FFmpeg demuxes from the
