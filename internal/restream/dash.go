@@ -117,14 +117,18 @@ func (p *Publisher) dashBody(cutMS int64) []byte {
 	}
 	var b strings.Builder
 	b.WriteString(`  <Period id="0" start="PT0S">` + "\n")
-	// One AdaptationSet per media type, in a stable order (video, then audio).
-	var video, audio []*Track
+	// One AdaptationSet per media type, in a stable order (video, audio, then
+	// text). Text tracks are fMP4 here, wvtt or stpp; BuildOutputs leaves
+	// plain WebVTT out of a DASH output.
+	var video, audio, text []*Track
 	for _, t := range p.tracks {
 		switch t.typ {
 		case manifest.Audio:
 			audio = append(audio, t)
 		case manifest.Video:
 			video = append(video, t)
+		case manifest.Subtitles:
+			text = append(text, t)
 		}
 	}
 	for _, t := range video {
@@ -132,6 +136,9 @@ func (p *Publisher) dashBody(cutMS int64) []byte {
 	}
 	for _, t := range audio {
 		writeAdaptationSet(&b, t, "audio", "audio/mp4", cutMS)
+	}
+	for _, t := range text {
+		writeAdaptationSet(&b, t, "text", "application/mp4", cutMS)
 	}
 	b.WriteString("  </Period>\n")
 	p.dashCache, p.dashVer, p.dashCut = []byte(b.String()), v, cutMS
@@ -205,10 +212,16 @@ func writeAdaptationSet(b *strings.Builder, t *Track, contentType, mime string, 
 		fmt.Fprintf(b, ` lang=%q`, t.language)
 	}
 	b.WriteString(">\n")
+	if contentType == "text" {
+		b.WriteString(`      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="subtitle"/>` + "\n")
+	}
 
 	bw := t.bitrateLocked()
 	if bw == 0 {
 		bw = 2_000_000
+		if contentType == "text" {
+			bw = 1_000
+		}
 	}
 	fmt.Fprintf(b, `      <Representation id=%q bandwidth="%d"`, t.ID, bw)
 	if t.codecs != "" {

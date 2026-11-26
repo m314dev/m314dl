@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -122,19 +123,26 @@ func (p *Publisher) ContinueFrom(prev *Publisher) {
 	}
 }
 
-// Ready reports whether every track has published at least one segment, that
-// is, whether the presentation can be played. Used to hold back the "serving
-// at ..." banner until there is actually something to serve.
+// Ready reports whether every video and audio track has published at least
+// one segment, that is, whether the presentation can be played. Used to hold
+// back the "serving at ..." banner until there is actually something to serve.
+// Subtitles do not count: a text track is sparse and must not hold the
+// picture back.
 func (p *Publisher) Ready() bool {
+	n := 0
 	for _, t := range p.tracks {
+		if t.typ == manifest.Subtitles {
+			continue
+		}
 		t.mu.RLock()
-		n := len(t.segs)
+		segs := len(t.segs)
 		t.mu.RUnlock()
-		if n == 0 {
+		if segs == 0 {
 			return false
 		}
+		n++
 	}
-	return len(p.tracks) > 0
+	return n > 0
 }
 
 // WaitReady blocks until Ready (or until every track has ended, or ctx or the
@@ -283,8 +291,11 @@ type segment struct {
 func TrackFromStream(id string, st *manifest.Stream, live bool, spoolDir string) *Track {
 	fmp4 := st.Init != nil || segmentIsFMP4(st)
 	ext := "ts"
-	if fmp4 {
+	switch {
+	case fmp4:
 		ext = "m4s"
+	case st.Type == manifest.Subtitles:
+		ext = subsExt(st)
 	}
 	return &Track{
 		ID: id, typ: st.Type,
@@ -300,6 +311,23 @@ func TrackFromStream(id string, st *manifest.Stream, live bool, spoolDir string)
 // the track id so every track can share the run's tmpDir.
 func (t *Track) spoolPath(name string) string {
 	return filepath.Join(t.spoolDir, t.ID+"-"+name)
+}
+
+// subsExt is the file extension for a plain (not fMP4) subtitle segment: what
+// the source used, so a player sees the format it expects. HLS subtitles are
+// WebVTT unless the segments say TTML.
+func subsExt(st *manifest.Stream) string {
+	if len(st.Segments) > 0 {
+		u := st.Segments[0].URL
+		if i := strings.IndexByte(u, '?'); i >= 0 {
+			u = u[:i]
+		}
+		switch strings.ToLower(path.Ext(u)) {
+		case ".ttml", ".xml", ".dfxp":
+			return "ttml"
+		}
+	}
+	return "vtt"
 }
 
 func segmentIsFMP4(st *manifest.Stream) bool {
@@ -605,6 +633,11 @@ func (p *Publisher) masterPlaylist() []byte {
 		v.mu.RUnlock()
 		if haveAudio && audio[0].codecs != "" && codecs != "" {
 			codecs = codecs + "," + audio[0].codecs
+		}
+		// An fMP4 text track (IMSC1 as stpp.ttml.im1t) is named in CODECS;
+		// plain WebVTT renditions are not.
+		if haveSubs && subs[0].fmp4 && subs[0].codecs != "" && codecs != "" {
+			codecs = codecs + "," + subs[0].codecs
 		}
 
 		var attrs []string

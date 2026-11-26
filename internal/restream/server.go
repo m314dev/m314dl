@@ -214,8 +214,13 @@ func NewTSServer(b *TSBroadcaster) http.Handler {
 }
 
 func segmentMIME(name string) string {
-	if strings.HasSuffix(name, ".ts") {
+	switch {
+	case strings.HasSuffix(name, ".ts"):
 		return "video/mp2t"
+	case strings.HasSuffix(name, ".vtt"):
+		return "text/vtt"
+	case strings.HasSuffix(name, ".ttml"):
+		return "application/ttml+xml"
 	}
 	return "video/mp4" // .m4s and friends
 }

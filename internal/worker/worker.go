@@ -15,11 +15,15 @@
 //	                              replaces the input of a running channel without restarting it
 //	DELETE /api/channels/{id}     -> stop and remove
 //	GET    /api/channels/{id}/log -> the channel's last lines, plain text
-//	GET    /api/health            -> {"status":"ok","channels":3,"max":32,"version":..}
+//	POST   /api/probe             {"url":"...","headers":{...},"proxy":"...","insecure":false}
+//	                              -> the tracks a channel would see, grouped by kind; nothing is started
+//	GET    /api/health            -> {"status":"ok","channels":3,"max":32,"version":..} plus the
+//	                              host's cpu, ram, disk, network and this process's rss
 //
-// Media is served without authentication, like any origin; access control is
-// the controller's job. GET /{id}/... routes to that channel's HLS/TS/DASH
-// handler.
+// GET /{id}/... routes to that channel's HLS/TS/DASH handler. Media is served
+// to anyone who has the URL unless -worker-media-secret is set; then every
+// media URL must carry exp and sig (see mediasign.go) and the worker signs the
+// URIs in the playlists it serves.
 package worker
 
 import (
@@ -32,6 +36,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +53,7 @@ import (
 
 type workerServer struct {
 	secret      string
+	mediaSecret string // signs media URLs; "" serves media to anyone who has the URL
 	version     string
 	maxChannels int
 	ffmpegPath  string
@@ -61,6 +67,9 @@ type workerServer struct {
 	// restarts left 1430 directories and 43GB behind, on the same disk the live
 	// segments were being written to.
 	spool string
+
+	hm   hostMeter                 // read by the sampler goroutine only
+	host atomic.Pointer[hostStats] // the newest sample, for GET /api/health
 
 	mu       sync.RWMutex
 	channels map[string]*channel
@@ -150,7 +159,7 @@ func (w *workerServer) spoolDir() string {
 	return "" // os.MkdirTemp falls back to the system temp dir
 }
 
-func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, spoolDir, version string, defaultIdle time.Duration, logv func(string, ...any)) error {
+func ServeWorker(addr, secret, mediaSecret string, maxChannels int, ffmpegPath, spoolDir, version string, defaultIdle time.Duration, logv func(string, ...any)) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("-worker %q: %w", addr, err)
@@ -161,6 +170,7 @@ func ServeWorker(addr, secret string, maxChannels int, ffmpegPath, spoolDir, ver
 		}
 	}
 	w := newWorkerServer(secret, maxChannels, ffmpegPath, version, defaultIdle, logv)
+	w.mediaSecret = mediaSecret
 	if err := w.useSpool(addr, spoolDir); err != nil {
 		return err
 	}
@@ -196,6 +206,7 @@ func (w *workerServer) handler() http.Handler {
 	mux.HandleFunc("PATCH /api/channels/{id}", httpx.BearerAuth(w.secret, w.apiPatch))
 	mux.HandleFunc("DELETE /api/channels/{id}", httpx.BearerAuth(w.secret, w.apiStop))
 	mux.HandleFunc("GET /api/channels/{id}/log", httpx.BearerAuth(w.secret, w.apiLog))
+	mux.HandleFunc("POST /api/probe", httpx.BearerAuth(w.secret, w.apiProbe))
 	mux.HandleFunc("GET /api/health", httpx.BearerAuth(w.secret, w.apiHealth))
 	mux.HandleFunc("/{id}/", w.media) // media: unauthenticated, routed to the channel
 	return mux
@@ -300,21 +311,26 @@ func (w *workerServer) apiHealth(rw http.ResponseWriter, r *http.Request) {
 	w.mu.RLock()
 	n := len(w.channels)
 	w.mu.RUnlock()
-	httpx.WriteJSON(rw, healthOut{
+	out := healthOut{
 		Status: "ok", Channels: n, Max: w.maxChannels,
 		// The version is how a panel knows the worker is deployed at all. When
 		// none was reported, its server list showed every node as "not
 		// deployed", no matter how healthy the node was.
 		Version: w.version,
-	})
+	}
+	if h := w.host.Load(); h != nil {
+		out.hostStats = *h
+	}
+	httpx.WriteJSON(rw, out)
 }
 
-// healthOut is the reply to GET /api/health.
+// healthOut is the reply to GET /api/health: the worker, then the machine.
 type healthOut struct {
 	Status   string `json:"status"`
 	Channels int    `json:"channels"`
 	Max      int    `json:"max"`
 	Version  string `json:"version"`
+	hostStats
 }
 
 // ─── media routing ───────────────────────────────────────────────────────────
@@ -324,6 +340,21 @@ func (w *workerServer) media(rw http.ResponseWriter, r *http.Request) {
 	if ch == nil {
 		http.NotFound(rw, r)
 		return
+	}
+	if w.mediaSecret != "" {
+		exp, status, reason := checkSigned(w.mediaSecret, ch.id, r)
+		if status != 0 {
+			http.Error(rw, reason, status)
+			return
+		}
+		if isPlaylistPath(r.URL.Path) {
+			// The body is rewritten, so its length changes: no Range replies.
+			r.Header.Del("Range")
+			sw := &signingWriter{ResponseWriter: rw,
+				query: "exp=" + strconv.FormatInt(exp, 10) + "&sig=" + signPath(w.mediaSecret, "/"+ch.id+"/", exp)}
+			defer sw.finish(r.URL.Path)
+			rw = sw
+		}
 	}
 	// Strip the /{id} prefix so the channel's own handler sees /live.m3u8 etc.
 	http.StripPrefix("/"+ch.id, ch.handler).ServeHTTP(rw, r)

@@ -100,6 +100,7 @@ type options struct {
 	spoolDir         string
 	worker           string
 	workerSecret     string
+	workerMediaKey   string
 	workerMaxChan    int
 	pick             string
 	titles           int
@@ -168,7 +169,7 @@ func printUsage(w io.Writer) {
 	})
 	printUsageSection(w, "Run as a server", []helpOption{
 		{"rpc", "ADDRESS"}, {"rpc-secret", "TOKEN"}, {"rpc-max-jobs", "N"}, {"rpc-retain", "DURATION"},
-		{"worker", "ADDRESS"}, {"worker-secret", "TOKEN"}, {"worker-max-channels", "N"},
+		{"worker", "ADDRESS"}, {"worker-secret", "TOKEN"}, {"worker-media-secret", "SECRET"}, {"worker-max-channels", "N"},
 	})
 	printUsageSection(w, "Other", []helpOption{{"no-color", ""}, {"no-update-check", ""}, {"version", ""}})
 }
@@ -249,6 +250,7 @@ func run() error {
 	flag.StringVar(&o.spoolDir, "spool-dir", "", "restream (-serve/-worker): directory for spooled segments and temp part files (default: current directory). Must be real disk — a seekable VOD spools the whole asset here, and /tmp is usually RAM-backed tmpfs on Linux")
 	flag.StringVar(&o.worker, "worker", "", "run as a multi-channel restream worker on this address (e.g. :7001); drive it via POST /api/channels, serve /{id}/live.m3u8. See internal/worker")
 	flag.StringVar(&o.workerSecret, "worker-secret", "", "bearer token for -worker control API (required when binding a non-loopback address)")
+	flag.StringVar(&o.workerMediaKey, "worker-media-secret", os.Getenv("M314_WORKER_MEDIA_SECRET"), "-worker: require exp and sig on media URLs, sig = hex(HMAC-SHA256(secret, path+\"\\n\"+exp)); default $M314_WORKER_MEDIA_SECRET (empty = media is open)")
 	flag.IntVar(&o.workerMaxChan, "worker-max-channels", 32, "-worker: max concurrent channels; further starts get 503 (0 = unlimited)")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Usage = func() { printUsage(flag.CommandLine.Output()) }
@@ -292,7 +294,7 @@ func run() error {
 		if o.workerIdle != 0 && o.workerIdle < serve.MinIdle {
 			return fmt.Errorf("-worker-idle must be at least %s", serve.MinIdle)
 		}
-		return worker.ServeWorker(o.worker, o.workerSecret, o.workerMaxChan, o.ffmpegPath, o.spoolDir, version, o.workerIdle, logv)
+		return worker.ServeWorker(o.worker, o.workerSecret, o.workerMediaKey, o.workerMaxChan, o.ffmpegPath, o.spoolDir, version, o.workerIdle, logv)
 	}
 	// Concurrency adapts on its own unless the user set -t by hand.
 	tPinned := false

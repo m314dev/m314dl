@@ -194,17 +194,30 @@ func Run(ctx context.Context, o Options, client *httpx.Client, kind string,
 // the Presentation (End/StatusLine), the HTTP handler that serves it, the media
 // path, and one download job per stream (with part files under tmpDir). It is
 // the one place that maps -serve-format onto a packager, and both the one-shot
-// `-serve` mode and the multi-channel worker use it. Subtitles are skipped
-// (there is no live WebVTT segmentation yet).
+// `-serve` mode and the multi-channel worker use it.
+//
+// Subtitles pass through as they come: WebVTT or TTML segments into an HLS
+// rendition, fMP4 text tracks (wvtt, stpp) into an HLS rendition or a DASH
+// adaptation set. A TS output has nowhere to put them, and a DASH timeline
+// cannot list bare WebVTT files, so those are left out with a note.
 func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv func(string, ...any)) (Presentation, http.Handler, string, []Job, error) {
 	if logv == nil {
 		logv = func(string, ...any) {}
 	}
 	var streams []*manifest.Stream
+	media := 0
 	for _, st := range selected {
 		if st.Type == manifest.Subtitles {
-			logv("restream: skipping subtitle track %s (not supported yet)", st.ID)
-			continue
+			switch {
+			case isTSFormat(o.Format):
+				logv("restream: skipping subtitle track %s (no subtitles in a TS output)", st.ID)
+				continue
+			case isDASHFormat(o.Format) && st.Init == nil && !segmentIsFMP4TS(st):
+				logv("restream: skipping subtitle track %s (DASH output needs fMP4 subtitles)", st.ID)
+				continue
+			}
+		} else {
+			media++
 		}
 		// Both -serve and worker mode run this, so both log the selected audio
 		// as well as the video. No source URL, headers or content keys are
@@ -212,7 +225,7 @@ func BuildOutputs(o Options, selected []*manifest.Stream, tmpDir string, logv fu
 		logv("restream: selected track %s: %s", st.ID, st)
 		streams = append(streams, st)
 	}
-	if len(streams) == 0 {
+	if media == 0 {
 		return nil, nil, "", nil, fmt.Errorf("no video/audio streams selected")
 	}
 
@@ -472,6 +485,9 @@ func requireFMP4(streams []*manifest.Stream) error {
 	}
 	return nil
 }
+
+func isTSFormat(f string) bool   { return f == "ts" || f == "mpegts" }
+func isDASHFormat(f string) bool { return f == "dash" || f == "mpd" }
 
 func segmentIsFMP4TS(st *manifest.Stream) bool {
 	if len(st.Segments) == 0 {

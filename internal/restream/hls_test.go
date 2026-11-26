@@ -345,3 +345,58 @@ func TestInitChangeKeepsBothInits(t *testing.T) {
 		t.Fatalf("init2.mp4 should 404, got %d", rec.Code)
 	}
 }
+
+// A plain WebVTT rendition is listed as SUBTITLES and served as .vtt; an fMP4
+// text track goes into the DASH manifest as a text adaptation set. Neither
+// holds readiness back.
+func TestSubtitleTracks(t *testing.T) {
+	pub := NewPublisher()
+	v := &manifest.Stream{Type: manifest.Video, ID: "v", Width: 1280, Height: 720, Codecs: "avc1.64001f", Init: &manifest.InitMap{URL: "i"}}
+	vtt := &manifest.Stream{Type: manifest.Subtitles, ID: "s", Language: "en", Name: "English",
+		Segments: []manifest.Segment{{URL: "http://x/c0.vtt?tok=1"}}}
+	vs := pub.AddTrack(TrackFromStream("video", v, true, ""))
+	ss := pub.AddTrack(TrackFromStream("sub-en", vtt, true, ""))
+	vs.Init([]byte("i"))
+	feed(vs, 2, 6)
+	if !pub.Ready() {
+		t.Fatal("an empty subtitle track held readiness back")
+	}
+	feed(ss, 1, 6)
+	m := string(pub.masterPlaylist())
+	for _, want := range []string{`#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English"`, `LANGUAGE="en"`, `URI="sub-en/index.m3u8"`, `SUBTITLES="subs"`} {
+		if !strings.Contains(m, want) {
+			t.Fatalf("master missing %q\n%s", want, m)
+		}
+	}
+	if strings.Contains(m, `CODECS="avc1.64001f,`) {
+		t.Fatalf("WebVTT must not be named in CODECS\n%s", m)
+	}
+	sub, _ := pub.Track("sub-en")
+	pl := string(sub.mediaPlaylist())
+	if !strings.Contains(pl, "000000.vtt") || strings.Contains(pl, "EXT-X-MAP") || !strings.Contains(pl, "#EXT-X-VERSION:3") {
+		t.Fatalf("subtitle playlist\n%s", pl)
+	}
+	if segmentMIME("000000.vtt") != "text/vtt" || segmentMIME("000000.ttml") != "application/ttml+xml" {
+		t.Fatal("subtitle segment MIME")
+	}
+
+	dash := NewPublisher()
+	dv := dash.AddTrack(TrackFromStream("video", v, true, ""))
+	wv := &manifest.Stream{Type: manifest.Subtitles, ID: "w", Language: "ar", Codecs: "wvtt", Init: &manifest.InitMap{URL: "i"}}
+	ws := dash.AddTrack(TrackFromStream("sub-ar", wv, true, ""))
+	dv.Init([]byte("i"))
+	ws.Init([]byte("i"))
+	feed(dv, 2, 6)
+	feed(ws, 2, 6)
+	mpd := string(dash.DASHManifest())
+	for _, want := range []string{`<AdaptationSet contentType="text" mimeType="application/mp4" segmentAlignment="true" lang="ar">`,
+		`value="subtitle"`, `<Representation id="sub-ar" bandwidth="6" codecs="wvtt">`} {
+		if !strings.Contains(mpd, want) {
+			t.Fatalf("mpd missing %q\n%s", want, mpd)
+		}
+	}
+	hm := string(dash.masterPlaylist())
+	if !strings.Contains(hm, `CODECS="avc1.64001f,wvtt"`) {
+		t.Fatalf("fMP4 text codec should be in CODECS\n%s", hm)
+	}
+}

@@ -93,6 +93,8 @@ func (w *workerServer) sampler() {
 			in, _, errs := ch.client.Traffic()
 			ch.meter.add(sample{at: now, in: in, out: ch.out.Load(), err: errs})
 		}
+		h := w.hm.sample(now, w.spoolDir())
+		w.host.Store(&h)
 	}
 }
 

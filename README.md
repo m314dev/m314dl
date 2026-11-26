@@ -497,7 +497,13 @@ logs list the selected video and audio tracks, in `-serve` and in worker mode.
 HLS and DASH output only copy (same container family, no FFmpeg). MPEG-TS
 output copies a TS source in pure Go and remuxes an fMP4 or separate-audio
 source through one FFmpeg, with optional transcoding. TS to fMP4 for DASH and
-HLS-fMP4 output isn't wired up yet, and neither is serving subtitles.
+HLS-fMP4 output isn't wired up yet.
+
+Subtitles selected with `-ss` pass through as they come: WebVTT or TTML
+segments become a SUBTITLES rendition of the HLS output, fMP4 text tracks
+(wvtt, stpp) go into an HLS rendition or a DASH text adaptation set. A TS
+output has nowhere to carry them and a DASH timeline cannot list bare WebVTT
+files, so those combinations drop the track with a note in the log.
 
 ## Worker mode
 
@@ -523,6 +529,10 @@ curl -H 'Authorization: Bearer mytoken' http://server:7001/api/channels/news
 curl -H 'Authorization: Bearer mytoken' -X DELETE http://server:7001/api/channels/news
 curl -H 'Authorization: Bearer mytoken' http://server:7001/api/health
 
+# what would a channel see? the tracks of a source, grouped, nothing started
+curl -H 'Authorization: Bearer mytoken' -X POST http://server:7001/api/probe \
+  -d '{"url":"https://…/master.m3u8","headers":{"Referer":"https://…"}}'
+
 # the source URL expired? hand the channel a fresh one; viewers notice nothing
 curl -H 'Authorization: Bearer mytoken' -X PATCH http://server:7001/api/channels/news \
   -d '{"url":"https://…/manifest.mpd?token=NEW","keys":["KID:KEY"]}'
@@ -530,9 +540,42 @@ curl -H 'Authorization: Bearer mytoken' -X PATCH http://server:7001/api/channels
 # the channel's own log, last 500 lines
 curl -H 'Authorization: Bearer mytoken' http://server:7001/api/channels/news/log
 
-# viewers play the media URL (unauthenticated, like any origin)
+# viewers play the media URL (open, like any origin, unless -worker-media-secret is set)
 mpv http://server:7001/news/live.m3u8
 ```
+
+`/api/health` reports the worker (`status`, `channels`, `max`, `version`) and
+the machine it runs on, so a fleet manager can see how loaded a node is:
+`cpu_percent`, `ram_percent`, `ram_used_mb`, `ram_total_mb`, `disk_used_gb`,
+`disk_total_gb` (the filesystem holding the spool), `net_in_mbps`,
+`net_out_mbps`, `link_speed_mbps` (0 when unknown) and `rss_mb` for the worker
+process itself. MB and GB are binary. Linux only; elsewhere the fields are zero.
+
+`/api/probe` reads the source the way a start would and returns `kind`, `url`,
+`live` and three lists, `video`, `audio` and `subtitles`, best first, each
+track with its `id` (what `sv`, `sa` and `ss` match with `id=…`), plus
+`width`, `height`, `bandwidth`, `codecs`, `fps` for video; `language`,
+`name`, `codecs`, `channels`, `default` for audio; `language`, `name`,
+`format` (`webvtt`, `ttml`, or the fMP4 codec) for subtitles. Only the master
+is fetched. A source that cannot be read is a 502.
+
+#### Signed media URLs
+
+Media faces the players and the control API never does. With
+`-worker-media-secret SECRET` (or `M314_WORKER_MEDIA_SECRET`) every media
+request must carry `exp` (Unix seconds) and `sig` in its query:
+
+```
+sig = hex(HMAC-SHA256(secret, path + "\n" + exp))      # path as requested, e.g. /news/live.m3u8
+http://server:7001/news/live.m3u8?exp=1790000000&sig=9f2c…
+```
+
+Expired, unsigned or mismatched requests get a 403. The controller signs only
+the entry URL it hands a player; the worker signs every URI inside the
+playlists it serves (variants, init, segments, DASH templates) with the same
+`exp` and a signature over the channel prefix `/news/`, which any request under
+the channel may present. A leaked link is therefore worth one channel until its
+expiry and nothing more.
 
 Each channel uses the whole engine: selection, native decryption, live refresh
 and the HLS, TS and DASH packagers above. A channel is exactly a `-serve` stream
