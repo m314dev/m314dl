@@ -79,10 +79,26 @@ func resolve(base, ref string) string {
 		return ref
 	}
 	out := b.ResolveReference(r)
-	if AppendURLParams && out.RawQuery == "" && b.RawQuery != "" {
-		out.RawQuery = b.RawQuery
+	// Only onto a same-host child, so a token is never leaked to another
+	// origin a playlist points at.
+	if AppendURLParams && out.RawQuery == "" && b.RawQuery != "" && out.Host == b.Host {
+		out.RawQuery = carryQuery(b.RawQuery)
 	}
 	return out.String()
+}
+
+// carryQuery is the parent query to copy onto a bare child, minus
+// aws.manifestfilter: an AWS MediaPackage parameter that is valid only on the
+// master request and answers HTTP 400 on a variant or segment playlist. The
+// auth token (auth_key, hdnts, ...) is kept so the CDN still authorises the
+// child.
+func carryQuery(raw string) string {
+	v, err := url.ParseQuery(raw)
+	if err != nil || v.Get("aws.manifestfilter") == "" {
+		return raw
+	}
+	v.Del("aws.manifestfilter")
+	return v.Encode()
 }
 
 // ParseMaster parses a master playlist. If body is a media playlist, it

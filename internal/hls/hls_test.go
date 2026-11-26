@@ -166,3 +166,22 @@ func TestBareMediaAsMaster(t *testing.T) {
 		t.Fatalf("bare media wrap failed: %+v", m.Streams[0])
 	}
 }
+
+// TestAppendURLParamsScope: the master's query is carried onto bare same-host
+// children only, without aws.manifestfilter (MediaPackage answers 400 to it on a
+// variant). Seen on Thmanyah's servers8.com edges: every m314dl start failed
+// with "fetch media playlist for v1: HTTP 400".
+func TestAppendURLParamsScope(t *testing.T) {
+	AppendURLParams = true
+	defer func() { AppendURLParams = false }()
+	base := "https://a.example/live/index.m3u8?aws.manifestfilter=video_height%3A1-360&hdnts=exp%3D1~hmac%3Dx"
+	if got := resolve(base, "v1.m3u8"); got != "https://a.example/live/v1.m3u8?hdnts=exp%3D1~hmac%3Dx" {
+		t.Fatalf("same-host child: %s", got)
+	}
+	if got := resolve(base, "https://b.example/live/v1.m3u8"); got != "https://b.example/live/v1.m3u8" {
+		t.Fatalf("other-host child carried the token: %s", got)
+	}
+	if got := resolve("https://a.example/m.m3u8?token=t", "seg.ts"); got != "https://a.example/seg.ts?token=t" {
+		t.Fatalf("plain token not carried: %s", got)
+	}
+}
