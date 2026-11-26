@@ -259,6 +259,10 @@ H.264) works too when you supply the key.
 - Retries use exponential backoff with jitter and also cover failures halfway
   through a response body. They look at the status: 404 fails fast, 5xx and 429
   retry.
+- A source track with one damaged frame (a TS packet the origin lost) makes
+  ffmpeg stop the mux after writing most of the file. When that happens the
+  mux runs once more with the corrupt packets dropped, and a warning says so;
+  a few milliseconds of audio go missing instead of the whole title.
 
 ### Live
 

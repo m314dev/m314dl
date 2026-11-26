@@ -25,24 +25,24 @@ func TestFindFFmpegExplicit(t *testing.T) {
 func TestMuxArgsDolbyVision(t *testing.T) {
 	video := Input{Path: "v.ts", Type: manifest.Video, Codecs: "dvh1.05.06"}
 	audio := Input{Path: "a.ts", Type: manifest.Audio, Codecs: "mp4a.40.2"}
-	args := strings.Join(muxArgs([]Input{video, audio}, "out.mp4"), " ")
+	args := strings.Join(muxArgs([]Input{video, audio}, "out.mp4", false), " ")
 	for _, want := range []string{"-tag:v dvh1", "-strict unofficial"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("mp4 args miss %q: %s", want, args)
 		}
 	}
 	// dvhe is the other sample entry name for the same profiles.
-	if a := strings.Join(muxArgs([]Input{{Type: manifest.Video, Codecs: "dvhe.05.06"}}, "o.mp4"), " "); !strings.Contains(a, "-tag:v dvh1") {
+	if a := strings.Join(muxArgs([]Input{{Type: manifest.Video, Codecs: "dvhe.05.06"}}, "o.mp4", false), " "); !strings.Contains(a, "-tag:v dvh1") {
 		t.Errorf("dvhe should be tagged dvh1: %s", a)
 	}
 	// Profile 8 and plain HEVC keep ffmpeg's own tag.
 	for _, c := range []string{"hvc1.2.4.L153.B0", "hev1.2.4.L150.B0", "avc1.640028", ""} {
-		if a := strings.Join(muxArgs([]Input{{Type: manifest.Video, Codecs: c}}, "o.mp4"), " "); strings.Contains(a, "-tag:v") {
+		if a := strings.Join(muxArgs([]Input{{Type: manifest.Video, Codecs: c}}, "o.mp4", false), " "); strings.Contains(a, "-tag:v") {
 			t.Errorf("codecs %q should not force a tag: %s", c, a)
 		}
 	}
 	// Matroska has its own Dolby Vision signalling; dvh1 there is wrong.
-	if a := strings.Join(muxArgs([]Input{video}, "o.mkv"), " "); strings.Contains(a, "-tag:v") {
+	if a := strings.Join(muxArgs([]Input{video}, "o.mkv", false), " "); strings.Contains(a, "-tag:v") {
 		t.Errorf("mkv should not force a tag: %s", a)
 	}
 }
@@ -77,7 +77,7 @@ func TestMuxKeepsDolbyVisionFromTS(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "out.mp4")
-	if err := Mux(ffmpeg, []Input{{Path: dv, Type: manifest.Video, Codecs: "dvh1.05.06"}}, out); err != nil {
+	if _, err := Mux(ffmpeg, []Input{{Path: dv, Type: manifest.Video, Codecs: "dvh1.05.06"}}, out); err != nil {
 		t.Fatal(err)
 	}
 	probe, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_tag_string:stream_side_data_list", "-of", "flat", out).Output()
@@ -173,3 +173,63 @@ func mpegCRC(b []byte) uint32 {
 	}
 	return crc
 }
+
+// One lost TS packet in an audio track breaks an AAC frame, and ffmpeg stops
+// the mux on it. The retry drops that packet and the title still muxes.
+func TestMuxSurvivesOneLostTSPacket(t *testing.T) {
+	ffmpeg, err := FindFFmpeg("")
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	dir := "../../bench/fixtures/hls-ts"
+	names, _ := filepath.Glob(filepath.Join(dir, "seg*.ts"))
+	if len(names) == 0 {
+		t.Skip("fixtures not present")
+	}
+	var ts []byte
+	for _, n := range names {
+		b, _ := os.ReadFile(n)
+		ts = append(ts, b...)
+	}
+	// The two busiest PIDs are the video and the audio; the audio is the
+	// quieter one. Drop one of its packets from the middle of the stream.
+	count := map[int]int{}
+	for off := 0; off+188 <= len(ts); off += 188 {
+		count[pid(ts[off:])]++
+	}
+	var vid, aud int
+	for p, n := range count {
+		if n > count[vid] {
+			vid, aud = p, vid
+		} else if n > count[aud] {
+			aud = p
+		}
+	}
+	seen, dropped := 0, false
+	for off := 0; off+188 <= len(ts) && !dropped; off += 188 {
+		if pid(ts[off:]) == aud {
+			if seen++; seen == count[aud]/2 {
+				ts = append(ts[:off:off], ts[off+188:]...)
+				dropped = true
+			}
+		}
+	}
+	if !dropped {
+		t.Fatal("no audio packet found to drop")
+	}
+	in := filepath.Join(t.TempDir(), "broken.ts")
+	os.WriteFile(in, ts, 0o644)
+	out := filepath.Join(t.TempDir(), "out.mkv")
+	warning, err := Mux(ffmpeg, []Input{{Path: in, Type: manifest.Video}}, out)
+	if err != nil {
+		t.Fatalf("mux with one lost packet: %v", err)
+	}
+	if warning == "" {
+		t.Log("this ffmpeg muxed the broken track on the first try; the retry was not needed")
+	}
+	if fi, err := os.Stat(out); err != nil || fi.Size() == 0 {
+		t.Fatal("no output written")
+	}
+}
+
+func pid(pkt []byte) int { return int(pkt[1]&0x1f)<<8 | int(pkt[2]) }

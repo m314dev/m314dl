@@ -189,7 +189,7 @@ func TestE2EClearDownloadAndMux(t *testing.T) {
 		}
 		inputs = append(inputs, mux.Input{Path: raw, Type: st.Type, Language: st.Language})
 	}
-	if err := mux.Mux(ffmpeg, inputs, out); err != nil {
+	if _, err := mux.Mux(ffmpeg, inputs, out); err != nil {
 		t.Fatal(err)
 	}
 	if got := probe(t, ffprobe, out, "v:0", "stream=codec_name,width,height"); got != "h264,320,180" {

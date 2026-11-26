@@ -81,11 +81,29 @@ func dolbyVisionTag(codecs string) string {
 // Mux merges inputs into outPath. The container type comes from the file
 // extension. Streams are copied as they are, with no re-encoding. On failure
 // the error carries the last part of ffmpeg's stderr output.
-func Mux(ffmpeg string, inputs []Input, outPath string) error {
+//
+// A source track now and then carries one damaged frame, from a TS packet the
+// origin lost, and ffmpeg stops the whole mux on it after writing most of the
+// file. A 22 minute episode with seven audio tracks was failing on a single
+// AAC frame 30 seconds before the end. So when the first run fails, a second
+// one drops the packets the demuxer flags as corrupt, and the returned warning
+// says so; the few milliseconds lost beat a title that never muxes.
+func Mux(ffmpeg string, inputs []Input, outPath string) (warning string, err error) {
 	if len(inputs) == 0 {
-		return fmt.Errorf("mux: no inputs")
+		return "", fmt.Errorf("mux: no inputs")
 	}
-	cmd := exec.Command(ffmpeg, muxArgs(inputs, outPath)...)
+	first := runFFmpeg(ffmpeg, muxArgs(inputs, outPath, false))
+	if first == nil {
+		return "", nil
+	}
+	if err := runFFmpeg(ffmpeg, muxArgs(inputs, outPath, true)); err != nil {
+		return "", first
+	}
+	return "a damaged frame in a source track stopped ffmpeg; muxed again with the corrupt packets dropped", nil
+}
+
+func runFFmpeg(ffmpeg string, args []string) error {
+	cmd := exec.Command(ffmpeg, args...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -98,11 +116,16 @@ func Mux(ffmpeg string, inputs []Input, outPath string) error {
 	return nil
 }
 
-// muxArgs builds the ffmpeg command line for Mux.
-func muxArgs(inputs []Input, outPath string) []string {
+// muxArgs builds the ffmpeg command line for Mux. With dropCorrupt, every
+// input discards the packets its demuxer marks corrupt (a continuity break in
+// a TS) instead of handing them to the muxer.
+func muxArgs(inputs []Input, outPath string, dropCorrupt bool) []string {
 	ext := strings.ToLower(filepath.Ext(outPath))
 	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
 	for _, in := range inputs {
+		if dropCorrupt {
+			args = append(args, "-fflags", "+discardcorrupt")
+		}
 		args = append(args, "-i", in.Path)
 	}
 	haveAudioInput := false

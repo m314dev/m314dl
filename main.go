@@ -763,9 +763,13 @@ func (j job) download(ctx context.Context, cancel context.CancelFunc, inputURL s
 	}
 
 	tMux := time.Now()
-	if err := mux.Mux(ffmpeg, muxInputs, outPath); err != nil {
+	muxWarning, err := mux.Mux(ffmpeg, muxInputs, outPath)
+	if err != nil {
 		j.warn("mux failed; raw stream files kept in %s", tempDir)
 		return err
+	}
+	if muxWarning != "" {
+		j.warn("%s", muxWarning)
 	}
 	logv("phase mux: %s (%d inputs)", time.Since(tMux).Round(time.Millisecond), len(muxInputs))
 	if !o.keepTemp {
